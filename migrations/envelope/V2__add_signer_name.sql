@@ -1,0 +1,11 @@
+-- V2: a persisted signer display name on each slot.
+--
+-- Captured from the person's OWN authenticated session the first time they participate
+-- (open the envelope) — the portal supplies the authenticated name. It is never derived
+-- from an identity code someone else typed (that would be an enumeration oracle) nor from
+-- the signed-document validation answer. Bound to the slot, deleted with the envelope
+-- (a workflow-scoped snapshot, not a durable identity profile).
+--
+-- Nullable + no default → a metadata-only add (no table rewrite): existing rows read NULL
+-- until their signer next opens the envelope.
+ALTER TABLE envelope.signer_slot ADD COLUMN IF NOT EXISTS signer_name text;

@@ -1,0 +1,82 @@
+name: pull request CI
+on:
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  migration-immutability:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        fetch-depth: 0
+    - name: No edits/deletes to already-applied versioned migrations
+      run: |
+        # A versioned migration becomes immutable the moment a real database has
+        # applied it — Flyway checksums it, and the checksum covers comments too.
+        #
+        # TWO bases are checked and BOTH must be clean, because neither alone is enough:
+        #
+        #   schema-baseline — a tag pushed once the first databases run on this repo.
+        #     Being FIXED, it still catches a V file edited several pushes ago, which a
+        #     previous-push window silently misses.
+        #   the pull request's base — catches an edit made in THIS pull request.
+        #
+        # Before the baseline tag exists the second base is the only one there is, so the
+        # gate keeps enforcing instead of passing quietly — the window when files are
+        # edited most freely is exactly the wrong time to stop checking. It skips only
+        # when there is genuinely nothing to compare against, and says so loudly: a skip
+        # must never read as a pass.
+        set -u
+        bases=""
+        if git rev-parse -q --verify refs/tags/schema-baseline >/dev/null 2>&1; then
+          bases="$bases schema-baseline"
+        else
+          echo "::warning::no schema-baseline tag yet — only this pull request is being compared. Tag it once the first databases run on this repo:  git tag schema-baseline && git push origin schema-baseline"
+        fi
+        base_pr="${{ github.event.pull_request.base.sha }}"
+        if [ -n "$base_pr" ] && git cat-file -e "${base_pr}^{commit}" 2>/dev/null; then
+          bases="$bases $base_pr"
+        fi
+        if [ -z "$(echo "$bases" | tr -d ' ')" ]; then
+          echo "::warning::NOT ENFORCED on this run — no schema-baseline tag and no pull-request base, so there is nothing to compare against. This is normal only on a repository's first push, where no database has applied anything yet."
+          exit 0
+        fi
+        rc=0
+        for base in $bases; do
+          changed=$(git diff --diff-filter=MD --name-only "$base" "${{ github.sha }}" -- migrations/ \
+                    | grep -E '/V[0-9][^/]*\.sql$' || true)
+          if [ -n "$changed" ]; then
+            echo "::error::Modifying or deleting an already-applied versioned migration is not allowed — add a NEW V*.sql instead. Offending file(s) since ${base}:"
+            echo "$changed"
+            rc=1
+          fi
+        done
+        if [ "$rc" -ne 0 ]; then
+          echo "Do NOT reach for 'flyway repair' to make this go away: it re-stamps the recorded"
+          echo "checksum WITHOUT re-running the SQL, so the database keeps the old objects while the"
+          echo "ledger claims the new file. Roll forward instead."
+          exit 1
+        fi
+        echo "OK: no versioned migration modified or deleted (bases compared:${bases})"
+
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    - name: End-to-end verify (all deployment shapes + fail-closed proofs)
+      run: bash testing/verify.sh
+
+  sql-quality:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    - name: Unit tests + role-leak + plpgsql_check
+      run: bash testing/sql-tests.sh

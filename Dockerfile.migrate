@@ -1,0 +1,11 @@
+# ONE migration image for the whole platform — every schema location baked into
+# the stock Flyway image; a deployment applies only what it declares:
+#   docker build -f Dockerfile.migrate -t platform-migrate:dev .
+#   docker run --rm -e LOCATIONS="util identity estimating grants" \
+#     -e PGDATABASE=... -e PGUSER=... -e PGPASSWORD=... platform-migrate:dev
+# Connection + identity come from the environment at run time (PGHOST/PGPORT/
+# PGDATABASE/PGUSER/PGPASSWORD or PGPASSWORD_FILE); migrate.sh applies the
+# LOCATIONS list in order and fails closed on a missing location.
+FROM flyway/flyway:11-alpine
+COPY migrations/ /flyway/db/
+ENTRYPOINT ["/bin/sh", "/flyway/db/migrate.sh"]
