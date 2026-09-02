@@ -128,6 +128,12 @@ jobs:
         image: ${{ env.IMAGE }}:${{ github.sha }}
         artifact-name: sbom-database-${{ github.sha }}.spdx.json
         output-file: sbom-database-${{ github.sha }}.spdx.json
+        # This workflow runs with contents: read. On a run whose tag has a GitHub
+        # release, the action's default tries to attach the SBOM to that release,
+        # which needs contents: write and fails the job with "Resource not
+        # accessible by integration" — and everything after it (push, sign) is
+        # skipped. The SBOM ships as a run artifact instead.
+        upload-release-assets: false
 
     # Report-only: the base is the upstream Flyway image we do not rebuild, so a
     # base finding surfaces here without blocking. Promote to a blocking gate
