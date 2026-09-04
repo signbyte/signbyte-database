@@ -834,47 +834,6 @@ EXCEPTION
 END
 $$;
 
--- document.set_preservation_class — set/upgrade the preservation class on an
--- owned document. pi_data = { id, caller, preservation_class }.
-CREATE OR REPLACE PROCEDURE document.set_preservation_class(pi_data jsonb, INOUT po_data jsonb)
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = document, util, pg_temp
-AS $$
-DECLARE
-    v_id     text := pi_data->>'id';
-    v_caller text := pi_data->>'caller';
-    v_presv  text := pi_data->>'preservation_class';
-    v_found  text;
-BEGIN
-    IF v_id IS NULL OR v_id = '' OR v_caller IS NULL OR v_caller = '' THEN
-        po_data := util.result_error('document:invalid', 'id and caller are required');
-        RETURN;
-    END IF;
-    IF v_presv IS NULL OR v_presv NOT IN ('none', 'b_lt', 'preservation') THEN
-        po_data := util.result_error('document:invalid', 'invalid preservation_class');
-        RETURN;
-    END IF;
-
-    UPDATE document.document
-       SET preservation_class = v_presv
-     WHERE id = v_id AND owner = v_caller
-    RETURNING id INTO v_found;
-
-    IF v_found IS NULL THEN
-        po_data := util.result_error('document:not_found', 'no document for that id');
-        RETURN;
-    END IF;
-
-    po_data := util.result_success(jsonb_build_object('id', v_found, 'preservationClass', v_presv));
-EXCEPTION
-    WHEN SQLSTATE 'P0001' THEN
-        RAISE;
-    WHEN OTHERS THEN
-        RAISE EXCEPTION '%', util.result_error('document:set_preservation_class_failed', SQLERRM) USING ERRCODE = 'P0001';
-END
-$$;
-
 -- document.extend_retention — roll retention_until forward on co-sign
 -- (rolling extension on co-sign). The new instant comes from Go (it
 -- owns the clock); the procedure only moves it FORWARD (never shortens a TTL).
@@ -1197,8 +1156,12 @@ $$;
 -- latest and re-merges its already-computed signature. Returns the updated row +
 -- the PRIOR blob refs so Go can destroy the superseded S3 object + KMS data key
 -- (the Go layer flips the pointer first, then deletes — a failed delete leaves a
--- harmless orphan, never data loss). pi_data = { id, expected_hash, storage_ref,
--- content_hash, size, encryption_key_ref }.
+-- harmless orphan, never data loss). An archive-timestamped refresh passes its
+-- preservation_class as well: the upgrade to long-term preservation is recorded in
+-- the SAME write as the swapped bytes, so a refused class leaves the bytes untouched
+-- and swapped bytes are always recorded — never a second step that can fail on its
+-- own. pi_data = { id, expected_hash, storage_ref, content_hash, size,
+-- encryption_key_ref, [preservation_class] }.
 CREATE OR REPLACE PROCEDURE document.replace_container_blob(pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1207,6 +1170,7 @@ AS $$
 DECLARE
     v_id        text := pi_data->>'id';
     v_expected  text := pi_data->>'expected_hash';
+    v_presv     text := NULLIF(pi_data->>'preservation_class', '');
     v_cur_hash  text;
     v_cur_kind  text;
     v_old_stor  text;
@@ -1224,6 +1188,10 @@ BEGIN
     IF (pi_data->>'storage_ref') IS NULL OR (pi_data->>'content_hash') IS NULL
        OR (pi_data->>'size') IS NULL OR (pi_data->>'encryption_key_ref') IS NULL THEN
         po_data := util.result_error('document:invalid', 'storage_ref, content_hash, size and encryption_key_ref are required');
+        RETURN;
+    END IF;
+    IF v_presv IS NOT NULL AND v_presv NOT IN ('none', 'b_lt', 'preservation') THEN
+        po_data := util.result_error('document:invalid', 'invalid preservation_class');
         RETURN;
     END IF;
 
@@ -1252,6 +1220,9 @@ BEGIN
            size               = (pi_data->>'size')::bigint,
            encryption_key_ref = pi_data->>'encryption_key_ref',
            status             = 'signed',
+           -- An archive-timestamped refresh records its preservation class in the
+           -- same write as the bytes: one fact with the swap, never a second step.
+           preservation_class = COALESCE(v_presv, d.preservation_class),
            -- The platform applied this signature in place — the fact that lets a
            -- root-headed chain (a bundle, or an uploaded file co-signed here)
            -- read as signed-here rather than as a pre-signed upload.
@@ -1634,7 +1605,6 @@ REVOKE ALL ON PROCEDURE document.list_history(jsonb, jsonb)           FROM PUBLI
 REVOKE ALL ON PROCEDURE document.sweep_history(jsonb, jsonb)          FROM PUBLIC;
 REVOKE ALL ON PROCEDURE document.delete_history_chain(jsonb, jsonb)   FROM PUBLIC;
 REVOKE ALL ON PROCEDURE document.set_status(jsonb, jsonb)             FROM PUBLIC;
-REVOKE ALL ON PROCEDURE document.set_preservation_class(jsonb, jsonb) FROM PUBLIC;
 REVOKE ALL ON PROCEDURE document.extend_retention(jsonb, jsonb)       FROM PUBLIC;
 REVOKE ALL ON PROCEDURE document.remove_access(jsonb, jsonb)          FROM PUBLIC;
 REVOKE ALL ON PROCEDURE document.sweep_retention(jsonb, jsonb)        FROM PUBLIC;
@@ -1656,7 +1626,6 @@ GRANT EXECUTE ON PROCEDURE document.list_history(jsonb, jsonb)           TO docu
 GRANT EXECUTE ON PROCEDURE document.sweep_history(jsonb, jsonb)          TO document_public;
 GRANT EXECUTE ON PROCEDURE document.delete_history_chain(jsonb, jsonb)   TO document_public;
 GRANT EXECUTE ON PROCEDURE document.set_status(jsonb, jsonb)             TO document_public;
-GRANT EXECUTE ON PROCEDURE document.set_preservation_class(jsonb, jsonb) TO document_public;
 GRANT EXECUTE ON PROCEDURE document.extend_retention(jsonb, jsonb)       TO document_public;
 GRANT EXECUTE ON PROCEDURE document.remove_access(jsonb, jsonb)          TO document_public;
 GRANT EXECUTE ON PROCEDURE document.sweep_retention(jsonb, jsonb)        TO document_public;
