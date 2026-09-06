@@ -28,7 +28,12 @@
 -- owner, calls it) — keyed by (envelope_id, slot_id) and idempotent.
 
 -- envelope.create_envelope — create a draft envelope.
--- pi_data = { owner, [tenant_id], [title], [order_policy], [profile], [expiry] }.
+-- pi_data = { owner, [tenant_id], [title], [order_policy], [profile], [expiry],
+--             [origin_name], [origin_return_url], [origin_ref] }.
+-- The three origin fields describe the system that asked for the signature, when one did
+-- (see the V7 column notes). They are stored as given: the calling service is the one
+-- that verified the requester's registration and admitted the return address, so the
+-- shape rules live there, next to the registry they are checked against.
 CREATE OR REPLACE PROCEDURE envelope.create_envelope(pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -46,14 +51,18 @@ BEGIN
         po_data := util.result_error('envelope:invalid', 'order_policy must be parallel or sequential'); RETURN;
     END IF;
 
-    INSERT INTO envelope.envelope (owner, tenant_id, title, order_policy, profile, expiry)
+    INSERT INTO envelope.envelope (owner, tenant_id, title, order_policy, profile, expiry,
+                                   origin_name, origin_return_url, origin_ref)
     VALUES (
         v_owner,
         NULLIF(pi_data->>'tenant_id', ''),
         NULLIF(pi_data->>'title', ''),
         v_policy,
         NULLIF(pi_data->>'profile', ''),
-        CASE WHEN NULLIF(pi_data->>'expiry', '') IS NULL THEN NULL ELSE (pi_data->>'expiry')::timestamptz END
+        CASE WHEN NULLIF(pi_data->>'expiry', '') IS NULL THEN NULL ELSE (pi_data->>'expiry')::timestamptz END,
+        NULLIF(pi_data->>'origin_name', ''),
+        NULLIF(pi_data->>'origin_return_url', ''),
+        NULLIF(pi_data->>'origin_ref', '')
     )
     RETURNING id INTO v_id;
 
@@ -356,7 +365,7 @@ END
 $$;
 
 -- envelope.add_slot — add a signer slot to a DRAFT envelope (owner-filtered).
--- pi_data = { envelope_id, owner, order_index, [identity_ref], [role], [flow],
+-- pi_data = { envelope_id, owner, order_index, [identity_ref], [role], [flow], [return_url],
 --             [required_loa], [max_signer_slots] }.
 -- max_signer_slots caps how many 'signer' slots one envelope may hold; the calling
 -- service owns that number and sends it. Counted, never derived from order_index:
@@ -411,8 +420,11 @@ BEGIN
         END IF;
     END IF;
 
-    INSERT INTO envelope.signer_slot (envelope_id, order_index, identity_ref, role, flow, required_loa)
-    VALUES (v_env, v_idx, NULLIF(pi_data->>'identity_ref', ''), v_role, v_flow, NULLIF(pi_data->>'required_loa', ''))
+    -- return_url: this signer's own way back to the system that asked (optional; NULL
+    -- means the envelope's default applies). Stored as admitted by the calling service.
+    INSERT INTO envelope.signer_slot (envelope_id, order_index, identity_ref, role, flow, required_loa, return_url)
+    VALUES (v_env, v_idx, NULLIF(pi_data->>'identity_ref', ''), v_role, v_flow, NULLIF(pi_data->>'required_loa', ''),
+            NULLIF(pi_data->>'return_url', ''))
     RETURNING id INTO v_id;
 
     po_data := util.result_success(jsonb_build_object('id', v_id));
