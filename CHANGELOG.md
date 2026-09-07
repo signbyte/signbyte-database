@@ -6,6 +6,26 @@ integrates against the procedures.
 
 ## v0.1.2
 
+### Added — the membership register `rolebyte` joins the signbyte database
+
+The image now applies the `rolebyte` location for a signbyte deployment: tenants, their members by typed
+subject key, per-service role definitions, assignments and an append-only history of every membership change.
+The platform needs it for **machine members** — a document system that integrates with the platform is a
+service account, a member of its own tenant, and the authorization server checks that membership when it
+mints the account's tenant-named token. People signing on the portal are not registered in it: the register
+is consulted for machines, never for a signer, so nothing about signing in or signing changes.
+
+**What a deployment must act on:** add `rolebyte` to `LOCATIONS` (after `util`, before `identity`) and
+provision **one more service role before migrating: `rolebyte_public`** (`ROLEBYTE_PUBLIC_PW`) — a missing role
+stops the run. First use creates the schema and its procedures; no existing table is touched. The
+authorization server and the register service read the new location through the role; deploy the database
+first or together with them.
+
+**Verification:** `migrations/testing/roleleak.rolebyte.sql` (the register role is table-isolated, its history
+append-only at the grant boundary, no cross-silo reads in either direction) and
+`migrations/testing/tests/unit.rolebyte_config.sql` (the configuration transport), both carried by this
+repository's gate from this release on.
+
 ### Added — an envelope records where it came from, and each signer where to go back (`envelope` V7)
 
 A document system can start an envelope for its own user and hand the signer to the portal by link. For the
