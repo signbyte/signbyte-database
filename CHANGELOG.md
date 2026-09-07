@@ -4,6 +4,31 @@ Notable changes to the signbyte database — the schema set and the migration im
 newest first, per release. Written for whoever applies the image to a database or
 integrates against the procedures.
 
+## v0.1.2
+
+### Added — an envelope records where it came from, and each signer where to go back (`envelope` V7)
+
+A document system can start an envelope for its own user and hand the signer to the portal by link. For the
+portal to name the requester and offer the way back, `envelope.envelope` gains three nullable columns —
+`origin_name` (the requester's registered display name), `origin_return_url` (the default return address) and
+`origin_ref` (the requester's own reference) — and `envelope.signer_slot` gains a nullable `return_url`, a
+per-signer override of the default. `create_envelope` accepts the three origin fields and `add_slot` accepts
+`return_url`, all optional; every read that returns the row (`get_envelope`, the signer inbox's slot projection)
+carries them back as stored. An envelope started in the portal has none of them and reads NULL. The shape rules
+for a return address (https only, no credentials, no fragment, a registered destination) are the calling
+service's; the database stores what was admitted.
+
+**What a deployment must act on:** nothing beyond applying the image. `V7__origin_and_slot_return_url.sql` is
+four `ADD COLUMN IF NOT EXISTS`, nullable with no default — a metadata-only change, no table rewrite, no lock
+worth naming. No new location, role or grant. The procedure signatures only **gain optional keys**, so an older
+envelope service keeps working against the new database; a newer envelope service (`v0.3.0`) against an older
+database has its origin keys silently dropped — apply this image first or together with it.
+
+**Verification:** `migrations/testing/tests/unit.envelope_origin.sql` — the three fields and the slot override
+round-trip through `create_envelope` / `add_slot` / `get_envelope`; a slot without an override reads NULL; an
+envelope without an origin reads NULL on all three; empty strings store as NULL. Carried by this repository's
+gate from this release on.
+
 ## v0.1.1
 
 ### Changed — `document.replace_container_blob` records the preservation class in the same write; `document.set_preservation_class` dropped
