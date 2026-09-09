@@ -6,6 +6,36 @@ integrates against the procedures.
 
 ## v0.1.2
 
+### Fixed — what a person is shown keeps their country and their identity type (`util/V3`)
+
+`util.identity_display` returned the bare national identifier for every code except a Latvian personal number,
+so five different principals holding the same digits rendered as **one identical string**: an Estonian person,
+a Lithuanian person, an Estonian organisation's register number, a passport and an identity card all became
+`23456789012`. The country is part of the identity — that is why the stored key keeps it — and the identity
+type is what separates a natural person from an organisation and its seal.
+
+Where a country's own way of writing the number is known, that spelling is unchanged and identifies the code
+on its own. Everywhere else the code is now shown **exactly as stored**:
+
+```
+util.identity_display('PNOLV-01018015097')  ->  010180-15097        (unchanged)
+util.identity_display('PNOEE-23456789012')  ->  PNOEE-23456789012   (was 23456789012)
+util.identity_display('NTRLV-34567890123')  ->  NTRLV-34567890123   (was 34567890123)
+```
+
+**What a deployment must act on: nothing.** Nothing compares a displayed value, so no key, index, constraint
+or comparison is affected — this changes what a screen shows and no stored data. `util/V3` replaces the
+function; no table is touched and there is nothing to provision. The migration is a new versioned file rather
+than an edit to `util/V2`, because a versioned migration is checksummed once it has been applied.
+
+Writing the country in front of the identifier instead (`EE 23456789012`) was considered and rejected on
+measurement: a space and a hyphen are both separators to `util.canonical_identity`, so a person retyping what
+they were shown would have had the country absorbed into the identifier and resolved to a **different key,
+with no error**. The stored spelling can be typed back in and reaches the same person.
+
+The services' shared library changes to match in the same breath — the two implementations must agree exactly,
+and the same defect was in both, because this one was written to mirror the library and mirrored this too.
+
 ### Changed — an identity code is stored in one spelling, and every column that holds one refuses any other
 
 A person's identity code reaches a deployment written several ways: with the identity type and country a
