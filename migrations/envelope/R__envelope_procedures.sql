@@ -26,6 +26,15 @@
 -- and an empty caller_serial never matches (so a NULL identity_ref grants nobody). The
 -- orchestrator CALLBACK proc `mark_slot_signed` is NOT owner-scoped (signflow, not the
 -- owner, calls it) — keyed by (envelope_id, slot_id) and idempotent.
+--
+-- IDENTITY CODES are stored in ONE canonical spelling (V8), so every match on
+-- identity_ref is plain equality. Both sides of that comparison are canonicalised
+-- here: `add_slot` canonicalises the code it stores and refuses one it cannot, and
+-- every proc that takes a `caller_serial` canonicalises it where it is read from
+-- pi_data — so a caller sending an odd spelling of a code it holds correctly gets a
+-- MATCH rather than a miss. A serial that cannot be canonicalised is left as it came
+-- and simply matches nothing, which is the existing fail-closed answer: a read path
+-- must not refuse a caller, it must fail to find them.
 
 -- envelope.create_envelope — create a draft envelope.
 -- pi_data = { owner, [tenant_id], [title], [order_policy], [profile], [expiry],
@@ -87,7 +96,7 @@ AS $$
 DECLARE
     v_id     text := pi_data->>'id';
     v_owner  text := pi_data->>'owner';
-    v_serial text := NULLIF(pi_data->>'caller_serial', '');
+    v_serial text := util.canonical_identity(NULLIF(pi_data->>'caller_serial', ''));
     v_row    jsonb;
 BEGIN
     IF v_id IS NULL OR v_id = '' OR v_owner IS NULL OR v_owner = '' THEN
@@ -201,7 +210,7 @@ SET search_path = envelope, util, pg_temp
 AS $$
 DECLARE
     v_owner  text    := pi_data->>'owner';
-    v_serial text    := NULLIF(pi_data->>'caller_serial', '');
+    v_serial text    := util.canonical_identity(NULLIF(pi_data->>'caller_serial', ''));
     v_doc    text    := pi_data->>'document_id';
     v_limit  integer := LEAST(COALESCE((pi_data->>'limit')::integer, 10), 50);
     v_rows   jsonb;
@@ -272,7 +281,7 @@ SECURITY DEFINER
 SET search_path = envelope, util, pg_temp
 AS $$
 DECLARE
-    v_serial text    := NULLIF(pi_data->>'caller_serial', '');
+    v_serial text    := util.canonical_identity(NULLIF(pi_data->>'caller_serial', ''));
     v_owner  text    := NULLIF(pi_data->>'owner', '');
     v_limit  integer := LEAST(COALESCE((pi_data->>'limit')::integer, 50), 200);
     v_cursor text    := NULLIF(pi_data->>'cursor', '');
@@ -371,6 +380,12 @@ $$;
 -- service owns that number and sends it. Counted, never derived from order_index:
 -- callers number their slots from 0 or from 1 as they please, so an index bound
 -- would refuse a slot that is inside the limit.
+-- identity_ref is canonicalised before it is stored, and a code that cannot be
+-- canonicalised is REFUSED as `envelope:invalid` rather than stored under a guess:
+-- an invitation keyed on a code nobody can arrive with invites nobody. The country
+-- is the calling service's to supply from the nearest fact about the person (the
+-- country chosen on the inviting screen, or the one recorded for the system that
+-- sent the request).
 CREATE OR REPLACE PROCEDURE envelope.add_slot(pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -383,6 +398,7 @@ DECLARE
     v_role   text    := COALESCE(NULLIF(pi_data->>'role', ''), 'signer');
     v_flow   text    := NULLIF(pi_data->>'flow', '');
     v_max    integer := COALESCE((pi_data->>'max_signer_slots')::integer, 2);
+    v_ident  text    := util.canonical_identity(NULLIF(pi_data->>'identity_ref', ''));
     v_status text;
     v_signers integer;
     v_id     text;
@@ -398,6 +414,15 @@ BEGIN
     END IF;
     IF v_flow IS NOT NULL AND v_flow NOT IN ('webEid', 'eidScan', 'eparakstsMobile', 'eparakstsMobileEseal', 'csc') THEN
         po_data := util.result_error('envelope:invalid', 'invalid flow'); RETURN;
+    END IF;
+    -- An absent identity_ref is the owner's own slot and stays absent. A present one
+    -- must be storable in the canonical spelling the column requires; this is the
+    -- pre-check that turns a would-be constraint violation into a structured error
+    -- the service can act on. The message deliberately does not echo the value — an
+    -- identity code is personal data and this text reaches logs.
+    IF v_ident IS NOT NULL AND NOT util.is_canonical_identity(v_ident) THEN
+        po_data := util.result_error('envelope:invalid',
+            'identity_ref is not a canonical identity code: it must carry a known identity type and country, e.g. PNO<CC>-<code>'); RETURN;
     END IF;
 
     -- FOR UPDATE: the signer count below and the insert must be one decision. Two
@@ -423,7 +448,7 @@ BEGIN
     -- return_url: this signer's own way back to the system that asked (optional; NULL
     -- means the envelope's default applies). Stored as admitted by the calling service.
     INSERT INTO envelope.signer_slot (envelope_id, order_index, identity_ref, role, flow, required_loa, return_url)
-    VALUES (v_env, v_idx, NULLIF(pi_data->>'identity_ref', ''), v_role, v_flow, NULLIF(pi_data->>'required_loa', ''),
+    VALUES (v_env, v_idx, v_ident, v_role, v_flow, NULLIF(pi_data->>'required_loa', ''),
             NULLIF(pi_data->>'return_url', ''))
     RETURNING id INTO v_id;
 
@@ -506,7 +531,7 @@ DECLARE
     v_env       text := pi_data->>'envelope_id';
     v_slot      text := pi_data->>'slot_id';
     v_owner     text := pi_data->>'owner';
-    v_serial    text := NULLIF(pi_data->>'caller_serial', '');
+    v_serial    text := util.canonical_identity(NULLIF(pi_data->>'caller_serial', ''));
     v_idx       integer;
     v_policy    text;
     v_envstatus text;
@@ -559,7 +584,7 @@ DECLARE
     v_env    text := pi_data->>'envelope_id';
     v_slot   text := pi_data->>'slot_id';
     v_owner  text := pi_data->>'owner';
-    v_serial text := NULLIF(pi_data->>'caller_serial', '');
+    v_serial text := util.canonical_identity(NULLIF(pi_data->>'caller_serial', ''));
     v_job    text := pi_data->>'job_id';
     v_found  text;
 BEGIN
@@ -694,7 +719,7 @@ DECLARE
     v_env    text := pi_data->>'envelope_id';
     v_slot   text := pi_data->>'slot_id';
     v_owner  text := pi_data->>'owner';
-    v_serial text := NULLIF(pi_data->>'caller_serial', '');
+    v_serial text := util.canonical_identity(NULLIF(pi_data->>'caller_serial', ''));
     v_found  text;
 BEGIN
     IF v_env IS NULL OR v_env = '' OR v_slot IS NULL OR v_slot = '' OR v_owner IS NULL OR v_owner = '' THEN
@@ -750,7 +775,7 @@ DECLARE
     v_env    text := pi_data->>'envelope_id';
     v_slot   text := pi_data->>'slot_id';
     v_owner  text := pi_data->>'owner';
-    v_serial text := NULLIF(pi_data->>'caller_serial', '');
+    v_serial text := util.canonical_identity(NULLIF(pi_data->>'caller_serial', ''));
     v_name   text := NULLIF(pi_data->>'name', '');
     v_found  text;
 BEGIN

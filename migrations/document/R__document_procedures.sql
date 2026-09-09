@@ -24,10 +24,24 @@
 -- ---------------------------------------------------------------------------
 
 -- document.normalize_serial — canonical form of an eIDAS identity code for ACL
--- matching: trims surrounding whitespace and upper-cases, so trivially-different
--- spellings of the same code match. Fuller cross-border normalization (country
--- prefixes, separators) is a planned extension behind THIS seam — callers store
--- and match through this function, so widening it later needs no schema change.
+-- matching: callers store and match through this function, so one spelling of a
+-- person's code is what sits in the list and what every comparison is made against.
+--
+-- This is the seam its first version promised — "fuller cross-border normalization
+-- (country prefixes, separators) is a planned extension behind THIS seam" — with the
+-- extension now arrived. It delegates rather than implementing: the rule that decides
+-- who a person is has exactly ONE implementation on this platform, shared with
+-- `identity.person`, `envelope.signer_slot` and `rolebyte.user_account`, and asserted
+-- to agree with the services' own copy of it. A second implementation here, however
+-- small, would be a second answer to "is this the same human" — and the two would
+-- drift on the day one of them was widened.
+--
+-- The seam itself is kept, deliberately: this store names the concept in its own
+-- vocabulary (a `serial` principal), its procedures read better for it, and a future
+-- store-specific rule has somewhere to live that is not the platform-wide function.
+--
+-- A value that cannot be canonicalised comes back unchanged and therefore matches
+-- nothing — which is the fail-closed answer this function has always given.
 CREATE OR REPLACE FUNCTION document.normalize_serial(p_serial text)
 RETURNS text
 LANGUAGE sql
@@ -35,7 +49,7 @@ IMMUTABLE
 RETURNS NULL ON NULL INPUT
 SET search_path = pg_temp
 AS $$
-    SELECT upper(btrim(p_serial));
+    SELECT util.canonical_identity(p_serial);
 $$;
 
 -- document.acl_allows — true when the caller holds right p_right on the chain
@@ -1079,9 +1093,20 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Store a serial principal in its canonical form so the match is exact.
+    -- Store a serial principal in its canonical form so the match is exact, and
+    -- refuse one that cannot be put in that form rather than storing it under a
+    -- guess: a grant keyed on a code nobody can arrive with grants nobody access,
+    -- and does it silently, because a non-match is answered as `:not_found`. The
+    -- country is the calling service's to supply from the nearest fact about the
+    -- person. The message deliberately does not echo the value — an identity code is
+    -- personal data and this text reaches logs.
     IF v_kind = 'serial' THEN
         v_pid := document.normalize_serial(v_pid);
+        IF NOT util.is_canonical_identity(v_pid) THEN
+            po_data := util.result_error('document:invalid',
+                'a serial principal must be a canonical identity code carrying a known identity type and country, e.g. PNO<CC>-<code>');
+            RETURN;
+        END IF;
     END IF;
 
     INSERT INTO document.document_acl (chain_root_id, principal_kind, principal_id, rights, tenant_id, granted_by)
