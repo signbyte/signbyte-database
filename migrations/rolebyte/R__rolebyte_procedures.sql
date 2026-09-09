@@ -253,6 +253,26 @@ BEGIN
         RETURN;
     END IF;
 
+    -- Canonicalise the identity code inside the key before it becomes this member's
+    -- identity, and refuse one that cannot be canonicalised. This is the path that
+    -- carried the hole: the key an administrator types must end up identical to the
+    -- key the invited person's own login will produce, or the invitation is one
+    -- nobody can claim and nothing says why. The column's constraint requires the
+    -- canonical form; this is the pre-check that turns a would-be constraint
+    -- violation into a structured error the register can answer with.
+    --
+    -- A key of a type that carries no identity code passes through untouched — a
+    -- service account is registered here in the same column.
+    --
+    -- The message deliberately does not echo the value: an identity code is personal
+    -- data and this text reaches logs.
+    v_subject := rolebyte.canonical_subject_key(v_subject);
+    IF NOT rolebyte.is_canonical_subject_key(v_subject) THEN
+        po_data := util.result_error('membership:invalid',
+            'a pno: subjectKey must carry a canonical identity code with a known identity type and country, e.g. pno:PNO<CC>-<code>');
+        RETURN;
+    END IF;
+
     v_display := NULLIF(trim(pi_data->>'displayName'), '');
     IF v_display IS NULL THEN
         po_data := util.result_error('membership:invalid', 'displayName is required');
@@ -350,6 +370,13 @@ BEGIN
         po_data := util.result_error('membership:invalid', 'subjectKey is required');
         RETURN;
     END IF;
+
+    -- Match on the canonical key, whatever spelling of the identity code the caller
+    -- holds: register keys are stored canonical, so a caller sending an odd spelling
+    -- of a code it holds correctly gets a MATCH rather than a miss. A key this
+    -- platform cannot canonicalise is left as it came and simply matches nothing —
+    -- a lookup must not refuse a caller, it must fail to find them.
+    v_subject := rolebyte.canonical_subject_key(v_subject);
 
     WITH flipped AS (
         UPDATE rolebyte.user_account u
@@ -583,6 +610,13 @@ BEGIN
         po_data := util.result_error('membership:invalid', 'subjectKey is required');
         RETURN;
     END IF;
+
+    -- Match on the canonical key, whatever spelling of the identity code the caller
+    -- holds: register keys are stored canonical, so a caller sending an odd spelling
+    -- of a code it holds correctly gets a MATCH rather than a miss. A key this
+    -- platform cannot canonicalise is left as it came and simply matches nothing —
+    -- a lookup must not refuse a caller, it must fail to find them.
+    v_subject := rolebyte.canonical_subject_key(v_subject);
 
     SELECT COALESCE(jsonb_agg(m ORDER BY m->>'tenantId'), '[]'::jsonb)
     INTO v_memberships

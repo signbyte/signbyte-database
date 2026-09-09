@@ -6,6 +6,63 @@ integrates against the procedures.
 
 ## v0.1.2
 
+### Changed — an identity code is stored in one spelling, and every column that holds one refuses any other
+
+A person's identity code reaches a deployment written several ways: with the identity type and country a
+signing certificate or an identity provider puts on it (`PNOLV-123456-78901`), with the separator dropped
+(`PNOLV-12345678901`), as a person writes their national code (`123456-78901`), or in the `LV/LV/…` shape a
+cross-border login carries. Compared as text those are different people — so the same human arriving two ways
+became two, and the documents signed under one spelling were unreachable from the other.
+
+The `util` location, which every deployment applies first, gains the canonicaliser and the predicate the
+constraints call: `canonical_identity()` (the one stored spelling — the identity type, the country, a hyphen,
+and the code with separators removed, upper-cased), **`is_canonical_identity()`**, plus `identity_type()`,
+`identity_body()` and `identity_display()`. Functions only — no table, no role, nothing to provision.
+
+Four columns then convert what they hold and require the canonical form from there on:
+
+| column | migration | constrained |
+|---|---|---|
+| `identity.person.national_id` | `identity/V2` | always |
+| `envelope.signer_slot.identity_ref` | `envelope/V8` | when present (an owner's own slot has none) |
+| `document.document_acl.principal_id` | `document/V11` | only where `principal_kind = 'serial'` |
+| `rolebyte.user_account.subject_key` | `rolebyte/V3` | only for the typed `pno:` variety |
+
+The last two are conditional by design, not by caution: `principal_id` holds an identity code only when the
+principal is a serial (otherwise it is an internal subject), and a register key is an identity code only when
+its type prefix says so — `svc:<client id>` is a service account and never an identity code. A constraint that
+did not distinguish them would refuse every service account and every document its own creator uploaded.
+
+The procedures canonicalise on both sides: what they store, and the caller's value before comparing it. So a
+caller that holds a code correctly but spells it differently gets a **match** rather than a silent miss —
+which is what an invited co-signer needs when their certificate spells the code one way and the invitation
+spelled it another. `document.normalize_serial` now delegates to the shared implementation instead of carrying
+its own.
+
+**What a deployment must act on, in order of how much it costs you:**
+
+- **A caller that sends a bare national code now gets a named error.** `identity.upsert`
+  (`identity:invalid`), `envelope.add_slot` (`envelope:invalid`), `document.grant_acl` (`document:invalid`)
+  and `rolebyte.user_invite` (`membership:invalid`) all refuse a code they cannot canonicalise, rather than
+  storing it under a guessed country — a wrong identity key is the wrong person's documents. **The country
+  must come from the calling service**, from the nearest fact about the person: the country chosen on the
+  screen where they were invited, the country in their signing certificate, or the country recorded for the
+  system that sent the request. **Deploy your services' country handling with or before this image, never
+  after it.** The reverse order is safe: a service may send a fully-qualified code to a database that does not
+  yet require one. Every refusal message is deliberately value-free, because it reaches logs and an identity
+  code is personal data.
+- **The migrations can stop, by design, on a database that already holds rows.** Each converts before it
+  constrains. Where the column has a uniqueness key, two rows that canonicalise to the same value are one
+  person recorded twice and the key stops the run — merging them is a decision about which record's rights,
+  roles or history survive, and it must not happen silently inside a migration. A value that cannot be
+  canonicalised at all is left as it was, and the constraint then refuses it, naming the row. On empty tables
+  all of this is a no-op.
+- **`ADD CONSTRAINT ... CHECK` validates every existing row under an `ACCESS EXCLUSIVE` lock** —
+  imperceptible on a small or empty table, worth planning for on a large populated one.
+- **Nothing else changed.** No `UNIQUE` key, no `ON CONFLICT` clause and no index was touched: with one
+  spelling at rest, every match stays plain equality, and every other procedure's input and answer is as it
+  was.
+
 ### Added — the membership register `rolebyte` joins the signbyte database
 
 The image now applies the `rolebyte` location for a signbyte deployment: tenants, their members by typed
