@@ -51,6 +51,25 @@ BEGIN
         RETURN;
     END IF;
 
+    -- Canonicalise the code before it is used as the person key, so a caller that
+    -- sends a different spelling of a known person resolves to that person rather
+    -- than creating a second one. The column's constraint requires the canonical
+    -- form; this is the pre-check that turns a would-be constraint violation into
+    -- a structured error the service can act on.
+    --
+    -- A code that cannot be canonicalised is REFUSED, never stored under a guess:
+    -- a bare national code carries no country, and the country is the caller's to
+    -- supply from the nearest fact about the person (the country on their screen,
+    -- in their certificate, or recorded for the system that sent it). The message
+    -- deliberately does not echo the value — an identity code is personal data and
+    -- this text reaches logs.
+    v_national_id := util.canonical_identity(v_national_id);
+    IF NOT util.is_canonical_identity(v_national_id) THEN
+        po_data := util.result_error('identity:invalid',
+            'national_id is not a canonical identity code: it must carry a known identity type and country, e.g. PNO<CC>-<code>');
+        RETURN;
+    END IF;
+
     -- 1) Resolve / create the person by national id, refreshing the profile.
     INSERT INTO identity.person (national_id, name, given_name, family_name)
     VALUES (
