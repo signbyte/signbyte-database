@@ -401,6 +401,231 @@ $$;
 REVOKE ALL ON PROCEDURE rolebyte.claim_attach(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.claim_attach(jsonb, jsonb) TO rolebyte_public;
 
+-- directory_attach — an administration act on the tenant: name the directory the
+-- tenant trusts as its own (the issuer of the identity provider its people sign
+-- in through), replace it, or detach it (an empty or missing issuer). Emits
+-- `directoryAttached` (with the previous issuer when there was one) or
+-- `directoryDetached`; an attach of the value already held changes nothing and
+-- emits nothing. One directory belongs to at most one tenant: attaching an
+-- issuer another tenant holds is `membership:conflict`. The issuer is stored
+-- exactly as given — identity providers compare issuers byte for byte.
+CREATE OR REPLACE PROCEDURE rolebyte.directory_attach(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_actor   text;
+    v_tenant  text;
+    v_issuer  text;
+    v_current text;
+    v_changed boolean := false;
+BEGIN
+    v_actor := NULLIF(trim(pi_data->>'actor'), '');
+    IF v_actor IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'actor is required');
+        RETURN;
+    END IF;
+
+    v_tenant := NULLIF(trim(pi_data->>'tenantId'), '');
+    IF v_tenant IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'tenantId is required');
+        RETURN;
+    END IF;
+
+    SELECT directory_issuer INTO v_current FROM rolebyte.tenant WHERE id = v_tenant;
+    IF NOT FOUND THEN
+        po_data := util.result_error('tenant:not_found', 'tenant does not exist');
+        RETURN;
+    END IF;
+
+    v_issuer := NULLIF(trim(pi_data->>'issuer'), '');
+
+    IF v_issuer IS NULL THEN
+        -- Detach. Nothing to do when nothing is attached.
+        IF v_current IS NOT NULL THEN
+            UPDATE rolebyte.tenant SET directory_issuer = NULL WHERE id = v_tenant;
+            INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
+            VALUES (util.generate_ulid(), v_actor, v_tenant, 'directoryDetached',
+                    jsonb_build_object('issuer', v_current));
+            v_changed := true;
+        END IF;
+    ELSE
+        -- The shape the constraint requires, checked first so a bad value is a
+        -- structured refusal rather than a constraint violation. The message does
+        -- not repeat the value: an error text is the least controlled place a
+        -- value ends up.
+        IF NOT rolebyte.is_directory_issuer(v_issuer) THEN
+            po_data := util.result_error('membership:invalid',
+                'issuer must be an absolute http(s) URL with no whitespace, query or fragment');
+            RETURN;
+        END IF;
+
+        IF v_current IS DISTINCT FROM v_issuer THEN
+            IF EXISTS (SELECT 1 FROM rolebyte.tenant
+                       WHERE directory_issuer = v_issuer AND id <> v_tenant) THEN
+                po_data := util.result_error('membership:conflict',
+                    'this directory is attached to another tenant');
+                RETURN;
+            END IF;
+
+            UPDATE rolebyte.tenant SET directory_issuer = v_issuer WHERE id = v_tenant;
+            INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
+            VALUES (util.generate_ulid(), v_actor, v_tenant, 'directoryAttached',
+                    jsonb_strip_nulls(jsonb_build_object('issuer', v_issuer, 'from', v_current)));
+            v_changed := true;
+        END IF;
+    END IF;
+
+    po_data := util.result_success(jsonb_build_object(
+        'tenantId', v_tenant,
+        'issuer',   v_issuer,
+        'changed',  v_changed
+    ));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN unique_violation THEN
+        -- Two administrators attaching the same issuer to two tenants at the same
+        -- moment: the unique index decides, and the loser gets the same answer the
+        -- pre-check gives.
+        RAISE EXCEPTION '%', util.result_error('membership:conflict', 'this directory is attached to another tenant') USING errcode = 'P0001';
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.directory_attach(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.directory_attach(jsonb, jsonb) TO rolebyte_public;
+
+-- directory_admit — the identity provider's door beside `claim_attach`: a person
+-- has just authenticated through an issuer, and the tenant whose attached
+-- directory that issuer is admits them as an ACTIVE member with NO grants — a
+-- member, not a role-holder, until an administrator gives them one. Emits
+-- `directoryAdmitted`. Outcomes, all a success answer (refusing a login is the
+-- caller's decision, and the caller's words):
+--   * `admitted`    — a membership row was created, or an invited row for the same
+--                     person in that tenant was activated (the invitation's roles
+--                     are kept; `claimedInvitation` says so in the event);
+--   * `member`      — already an active member: nothing changes, nothing is logged;
+--   * `revoked`     — an administrator revoked this person here; the directory
+--                     does not overrule that, nothing changes;
+--   * `noDirectory` — no active tenant attached this issuer: nobody is admitted.
+-- Only a person is admitted (`sub:<person id>`): a service account does not sign
+-- in through a directory, and a key of any other kind is refused. Nothing but the
+-- issuer decides the tenant — never a name, never an e-mail address.
+CREATE OR REPLACE PROCEDURE rolebyte.directory_admit(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_actor   text;
+    v_subject text;
+    v_issuer  text;
+    v_display text;
+    v_tenant  text;
+    v_user    rolebyte.user_account%ROWTYPE;
+    v_outcome text;
+    v_admitted jsonb := '[]'::jsonb;
+BEGIN
+    v_actor := NULLIF(trim(pi_data->>'actor'), '');
+    IF v_actor IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'actor is required');
+        RETURN;
+    END IF;
+
+    -- A write door: the key must be of a kind the register defines, and a person's.
+    v_subject := NULLIF(trim(pi_data->>'subjectKey'), '');
+    IF v_subject IS NULL OR NOT rolebyte.is_typed_subject_key(v_subject) THEN
+        po_data := util.result_error('membership:invalid',
+            'subjectKey must be a typed key: sub:<person id> for a person, svc:<client id> for a service account');
+        RETURN;
+    END IF;
+    IF v_subject NOT LIKE 'sub:%' THEN
+        po_data := util.result_error('membership:invalid',
+            'a directory admits persons only: subjectKey must be sub:<person id>');
+        RETURN;
+    END IF;
+
+    v_issuer := NULLIF(trim(pi_data->>'issuer'), '');
+    IF v_issuer IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'issuer is required');
+        RETURN;
+    END IF;
+
+    v_display := NULLIF(trim(pi_data->>'displayName'), '');
+    IF v_display IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'displayName is required');
+        RETURN;
+    END IF;
+
+    -- Two first logins of one person at the same moment must not race each other
+    -- into two rows and a unique-key failure; the lock serialises the admission of
+    -- ONE subject, and different people are not queued behind each other.
+    PERFORM pg_advisory_xact_lock(hashtextextended('rolebyte.directory_admit:' || v_subject, 0));
+
+    SELECT t.id INTO v_tenant
+      FROM rolebyte.tenant t
+     WHERE t.directory_issuer = v_issuer
+       AND t.status = 'active';
+
+    IF v_tenant IS NULL THEN
+        po_data := util.result_success(jsonb_build_object(
+            'outcome', 'noDirectory', 'tenantId', NULL, 'admitted', v_admitted));
+        RETURN;
+    END IF;
+
+    SELECT * INTO v_user
+      FROM rolebyte.user_account
+     WHERE tenant_id = v_tenant AND subject_key = v_subject;
+
+    IF FOUND THEN
+        CASE v_user.status
+            WHEN 'active' THEN
+                v_outcome := 'member';
+            WHEN 'revoked' THEN
+                v_outcome := 'revoked';
+            ELSE
+                -- Invited by an administrator AND arriving through the directory: the
+                -- admission activates the invitation, roles included.
+                UPDATE rolebyte.user_account SET status = 'active' WHERE id = v_user.id;
+                INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+                VALUES (util.generate_ulid(), v_actor, v_tenant, v_user.id, 'directoryAdmitted',
+                        jsonb_build_object('subjectKey', v_subject, 'issuer', v_issuer,
+                                           'displayName', v_user.display_name, 'claimedInvitation', true));
+                v_outcome  := 'admitted';
+                v_admitted := jsonb_build_array(jsonb_build_object('userId', v_user.id, 'tenantId', v_tenant));
+        END CASE;
+    ELSE
+        INSERT INTO rolebyte.user_account (id, tenant_id, subject_key, display_name, status)
+        VALUES (util.generate_ulid(), v_tenant, v_subject, v_display, 'active')
+        RETURNING * INTO v_user;
+
+        INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+        VALUES (util.generate_ulid(), v_actor, v_tenant, v_user.id, 'directoryAdmitted',
+                jsonb_build_object('subjectKey', v_subject, 'issuer', v_issuer, 'displayName', v_display));
+
+        v_outcome  := 'admitted';
+        v_admitted := jsonb_build_array(jsonb_build_object('userId', v_user.id, 'tenantId', v_tenant));
+    END IF;
+
+    po_data := util.result_success(jsonb_build_object(
+        'outcome',  v_outcome,
+        'tenantId', v_tenant,
+        'admitted', v_admitted
+    ));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.directory_admit(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.directory_admit(jsonb, jsonb) TO rolebyte_public;
+
 -- role_grant — grant one defined role to a user in the caller's tenant.
 -- Re-granting a revoked pair flips it back; the events keep both moments.
 CREATE OR REPLACE PROCEDURE rolebyte.role_grant(IN pi_data jsonb, INOUT po_data jsonb)
@@ -754,6 +979,7 @@ AS $$
 DECLARE
     v_tenant   text := NULLIF(trim(pi_data->>'tenantId'), '');
     v_name     text;
+    v_dir      text;
     v_services jsonb;
 BEGIN
     IF v_tenant IS NULL THEN
@@ -761,7 +987,7 @@ BEGIN
         RETURN;
     END IF;
 
-    SELECT name INTO v_name FROM rolebyte.tenant WHERE id = v_tenant;
+    SELECT name, directory_issuer INTO v_name, v_dir FROM rolebyte.tenant WHERE id = v_tenant;
     IF v_name IS NULL THEN
         po_data := util.result_error('membership:not_found', 'no such tenant');
         RETURN;
@@ -782,8 +1008,13 @@ BEGIN
     INTO v_services
     FROM rolebyte.service s;
 
+    -- The tenant's attached directory travels with its display name: an address,
+    -- not a secret, and part of what makes a tenant ready to use.
     po_data := util.result_success(jsonb_build_object(
-        'tenant',   jsonb_build_object('displayName', v_name),
+        'tenant',   jsonb_build_object(
+                        'displayName', v_name,
+                        'directory',   CASE WHEN v_dir IS NULL THEN NULL::jsonb
+                                            ELSE jsonb_build_object('issuer', v_dir) END),
         'services', v_services));
 EXCEPTION
     WHEN sqlstate 'P0001' THEN RAISE;
@@ -818,6 +1049,8 @@ DECLARE
     v_svc_r    jsonb := '[]'::jsonb;
     v_roles_r  jsonb := '[]'::jsonb;
     v_tenant_r jsonb := 'null'::jsonb;
+    v_new_dir  text;
+    v_dir_r    jsonb;
 BEGIN
     IF v_tenant IS NULL OR v_actor IS NULL THEN
         po_data := util.result_error('membership:invalid', 'tenantId and actor are required');
@@ -888,6 +1121,29 @@ BEGIN
                     jsonb_build_object('from', v_name, 'to', v_new_name));
             v_tenant_r := jsonb_build_object('status', 'changed', 'from', v_name, 'to', v_new_name);
         END IF;
+    END IF;
+
+    -- The attached directory follows the document too, through the same
+    -- administration procedure a direct attach uses, so the event lands
+    -- identically. A document never detaches: an absent or empty directory
+    -- leaves the tenant's as it is (removal is an in-place administration act).
+    IF jsonb_typeof(v_section->'tenant'->'directory') = 'object' THEN
+        v_new_dir := NULLIF(trim(v_section->'tenant'->'directory'->>'issuer'), '');
+        IF v_new_dir IS NOT NULL THEN
+            v_out := NULL;
+            CALL rolebyte.directory_attach(jsonb_build_object(
+                'actor', v_actor, 'tenantId', v_tenant, 'issuer', v_new_dir), v_out);
+            IF v_out->>'result' IS DISTINCT FROM 'success' THEN
+                RAISE EXCEPTION '%', v_out USING errcode = 'P0001';
+            END IF;
+            v_dir_r := jsonb_build_object(
+                'status', CASE WHEN (v_out->'data'->>'changed')::boolean THEN 'changed' ELSE 'unchanged' END,
+                'issuer', v_new_dir);
+        END IF;
+    END IF;
+    IF v_dir_r IS NOT NULL THEN
+        v_tenant_r := COALESCE(NULLIF(v_tenant_r, 'null'::jsonb), '{}'::jsonb)
+                      || jsonb_build_object('directory', v_dir_r);
     END IF;
 
     po_data := util.result_success(jsonb_build_object(

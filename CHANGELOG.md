@@ -6,6 +6,38 @@ integrates against the procedures.
 
 ## v0.1.2
 
+### Added — a tenant's attached directory: its people are admitted as members with no grants (`rolebyte/V5`, `directory_attach`, `directory_admit`)
+
+An organisation whose people sign in through their own directory names that directory on its tenant — the
+issuer of the identity provider it trusts as its own. `rolebyte/V5` adds a nullable `tenant.directory_issuer`,
+a partial unique index (**one directory belongs to at most one tenant**) and a shape check (an absolute
+http(s) URL with no whitespace, query or fragment; stored exactly as given and matched byte for byte, which is
+how identity providers compare issuers). No existing row is touched.
+
+Two procedures, both granted to `rolebyte_public`:
+
+```
+CALL rolebyte.directory_attach('{"actor":"…","tenantId":"…","issuer":"https://login.example/tenant-id/v2.0"}', po);
+→ {"result":"success","data":{"tenantId":"…","issuer":"https://login.example/tenant-id/v2.0","changed":true}}
+   an empty or missing issuer detaches · the same issuer again answers changed:false · another tenant's issuer is membership:conflict
+
+CALL rolebyte.directory_admit('{"actor":"…","subjectKey":"sub:01J8X2K4M9N7P3Q5R6S8T0V1W2","issuer":"https://login.example/tenant-id/v2.0","displayName":"…"}', po);
+→ {"result":"success","data":{"outcome":"admitted","tenantId":"…","admitted":[{"userId":"…","tenantId":"…"}]}}
+   outcome: admitted · member (already active, nothing changed) · revoked (an administrator's revocation stands) · noDirectory (nobody attached this issuer, nobody admitted)
+```
+
+An admitted person is an **active member with no grants** — `resolve` answers the tenant with an empty scope
+set until an administrator grants a role. Only a person (`sub:<person id>`) is admitted; a service account is
+`membership:invalid`. Nothing but the issuer decides the tenant. A person invited by an administrator who then
+arrives through the directory is admitted on their invited row, roles kept. Three new event kinds —
+`directoryAttached` (with the previous issuer when replaced), `directoryDetached`, `directoryAdmitted` — and
+the configuration document (`config_get` / `config_apply`) carries `tenant.directory.issuer`; a document
+attaches or replaces, never detaches.
+
+**What a deployment must act on.** Apply this image before the membership service version that exposes the
+doors and the authorization server that calls the admission at first login. Nothing to provision; no new
+role, no new location. The migration is a new versioned file (`rolebyte/V5`).
+
 ### Changed — a person may have no identity code: a login from an organisation's directory is admitted without one (`identity/V3`, `identity.upsert`)
 
 `identity.person.national_id` is **nullable** from this release. Somebody who signs in through their
