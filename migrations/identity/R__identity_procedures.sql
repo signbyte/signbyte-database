@@ -14,18 +14,35 @@
 -- Repeatable: re-applied automatically whenever the checksum changes.
 
 -- identity.upsert — resolve a login to a stable PERSON subject and link the
--- auth-method credential. The natural person is keyed on the
--- eIDAS national id (`serial_number` / `national_id`); the auth-method handle
--- (`idp_sub`, an opaque hash for eParaksts, the national id for Web eID) becomes
--- a credential row pointing at that person. So the SAME human authenticating
--- through different methods resolves to ONE `internal_sub` (the person id),
--- instead of one identity per method.
+-- auth-method credential.
+--
+-- A login is resolved one of two ways, decided by whether it carries a national
+-- identity code (`serial_number` / `national_id`):
+--
+--   * WITH a code — the natural person is keyed on the code. The auth-method
+--     handle (`idp_sub`: an opaque hash from a mobile identity provider, the
+--     national id from a card) becomes a credential row pointing at that person,
+--     so the SAME human authenticating through different methods resolves to ONE
+--     `internal_sub` (the person id) instead of one identity per method.
+--   * WITHOUT a code — a person signing in through their organisation's
+--     directory: a work account carries a name and the directory's identifiers,
+--     no national code. Such a login is resolved by its credential handle. A
+--     handle already linked to a person lands on that person; an unknown handle
+--     creates a new person with no code and links the handle to it. Nothing else
+--     is matched on — never a name, never an e-mail address — so a codeless
+--     person stays a separate person from a card person until the two are linked
+--     by a deliberate act, which is a separate procedure and not this one.
+--
+-- A code, where present, is canonicalised and must be canonical; one that cannot
+-- be is refused rather than stored under a guess. A codeless login is one that
+-- sends no code at all, not one that sends a bad one.
 --
 -- Returns {"internal_sub": "<person id>", "created": <bool>}. `created` is true
 -- only when THIS call inserted the person (the person's first-ever login, by any
--- method) — detected via the `xmax = 0` upsert idiom — so the service records the
--- correct GDPR-audit event (identity created vs updated). Adding a new method to an
--- existing person is an update, not a create.
+-- method) — detected via the `xmax = 0` upsert idiom on the code path — so the
+-- service records the correct GDPR-audit event (identity created vs updated).
+-- Adding a new method to an existing person is an update, not a create. The
+-- profile (the name fields) is refreshed from every login, on both paths.
 CREATE OR REPLACE PROCEDURE identity.upsert(pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -33,10 +50,14 @@ SET search_path = identity, util, pg_temp
 AS $$
 DECLARE
     v_idp_sub      text := pi_data->>'idp_sub';
-    -- the national id is the person key; accept either field name (the service
-    -- sends `serial_number`), prefer an explicit `national_id`.
-    v_national_id  text := COALESCE(NULLIF(pi_data->>'national_id', ''), pi_data->>'serial_number');
+    -- the national id, where the login carries one; accept either field name
+    -- (the service sends `serial_number`), prefer an explicit `national_id`. An
+    -- empty string is the absence of a code, the same as a missing field.
+    v_national_id  text := COALESCE(NULLIF(pi_data->>'national_id', ''), NULLIF(pi_data->>'serial_number', ''));
     v_login_method text := COALESCE(pi_data->>'login_method', '');
+    v_name         text := COALESCE(pi_data->>'name', '');
+    v_given_name   text := COALESCE(pi_data->>'given_name', '');
+    v_family_name  text := COALESCE(pi_data->>'family_name', '');
     v_person_sub   text;
     v_created      boolean;
 BEGIN
@@ -44,46 +65,72 @@ BEGIN
         po_data := util.result_error('identity:invalid', 'idp_sub is required');
         RETURN;
     END IF;
-    -- A natural-person identity REQUIRES the eIDAS unique id; without it we
-    -- cannot dedupe across methods, so reject rather than create an orphan.
-    IF v_national_id IS NULL OR v_national_id = '' THEN
-        po_data := util.result_error('identity:invalid', 'national_id (serial_number) is required');
-        RETURN;
-    END IF;
 
-    -- Canonicalise the code before it is used as the person key, so a caller that
-    -- sends a different spelling of a known person resolves to that person rather
-    -- than creating a second one. The column's constraint requires the canonical
-    -- form; this is the pre-check that turns a would-be constraint violation into
-    -- a structured error the service can act on.
-    --
-    -- A code that cannot be canonicalised is REFUSED, never stored under a guess:
-    -- a bare national code carries no country, and the country is the caller's to
-    -- supply from the nearest fact about the person (the country on their screen,
-    -- in their certificate, or recorded for the system that sent it). The message
-    -- deliberately does not echo the value — an identity code is personal data and
-    -- this text reaches logs.
-    v_national_id := util.canonical_identity(v_national_id);
-    IF NOT util.is_canonical_identity(v_national_id) THEN
-        po_data := util.result_error('identity:invalid',
-            'national_id is not a canonical identity code: it must carry a known identity type and country, e.g. PNO<CC>-<code>');
-        RETURN;
-    END IF;
+    IF v_national_id IS NOT NULL THEN
+        -- Canonicalise the code before it is used as the person key, so a caller
+        -- that sends a different spelling of a known person resolves to that
+        -- person rather than creating a second one. The column's constraint
+        -- requires the canonical form; this is the pre-check that turns a
+        -- would-be constraint violation into a structured error the service can
+        -- act on.
+        --
+        -- A code that cannot be canonicalised is REFUSED, never stored under a
+        -- guess: a bare national code carries no country, and the country is the
+        -- caller's to supply from the nearest fact about the person (the country
+        -- on their screen, in their certificate, or recorded for the system that
+        -- sent it). The message deliberately does not echo the value — an
+        -- identity code is personal data and this text reaches logs.
+        v_national_id := util.canonical_identity(v_national_id);
+        IF NOT util.is_canonical_identity(v_national_id) THEN
+            po_data := util.result_error('identity:invalid',
+                'national_id is not a canonical identity code: it must carry a known identity type and country, e.g. PNO<CC>-<code>');
+            RETURN;
+        END IF;
 
-    -- 1) Resolve / create the person by national id, refreshing the profile.
-    INSERT INTO identity.person (national_id, name, given_name, family_name)
-    VALUES (
-        v_national_id,
-        COALESCE(pi_data->>'name', ''),
-        COALESCE(pi_data->>'given_name', ''),
-        COALESCE(pi_data->>'family_name', '')
-    )
-    ON CONFLICT (national_id) DO UPDATE SET
-        name        = EXCLUDED.name,
-        given_name  = EXCLUDED.given_name,
-        family_name = EXCLUDED.family_name,
-        updated_at  = now()
-    RETURNING person_sub, (xmax = 0) INTO v_person_sub, v_created;
+        -- 1a) Resolve / create the person by national id, refreshing the profile.
+        INSERT INTO identity.person (national_id, name, given_name, family_name)
+        VALUES (v_national_id, v_name, v_given_name, v_family_name)
+        ON CONFLICT (national_id) DO UPDATE SET
+            name        = EXCLUDED.name,
+            given_name  = EXCLUDED.given_name,
+            family_name = EXCLUDED.family_name,
+            updated_at  = now()
+        RETURNING person_sub, (xmax = 0) INTO v_person_sub, v_created;
+    ELSE
+        -- 1b) No code: resolve by the credential handle.
+        --
+        -- Two first logins of the same new handle at the same moment would each
+        -- find no credential and each create a person; the second's credential
+        -- write would then re-point the handle and leave the first person with
+        -- no credential at all. The lock serialises the codeless resolution of
+        -- ONE handle for the rest of this transaction, so the second arrival
+        -- finds the first's credential. Handles differ, so different people are
+        -- not queued behind each other.
+        PERFORM pg_advisory_xact_lock(hashtextextended(v_idp_sub, 0));
+
+        SELECT c.person_sub INTO v_person_sub
+          FROM identity.credential c
+         WHERE c.idp_sub = v_idp_sub;
+
+        IF v_person_sub IS NOT NULL THEN
+            -- A known handle: the same person, profile refreshed exactly as on the
+            -- code path. A code the row already holds is left as it is — a login
+            -- that carries no code never blanks one.
+            UPDATE identity.person
+               SET name        = v_name,
+                   given_name  = v_given_name,
+                   family_name = v_family_name,
+                   updated_at  = now()
+             WHERE person_sub = v_person_sub;
+            v_created := false;
+        ELSE
+            -- An unknown handle: a new person with no code.
+            INSERT INTO identity.person (national_id, name, given_name, family_name)
+            VALUES (NULL, v_name, v_given_name, v_family_name)
+            RETURNING person_sub INTO v_person_sub;
+            v_created := true;
+        END IF;
+    END IF;
 
     -- 2) Link the auth-method credential (idp_sub) to that person.
     INSERT INTO identity.credential (idp_sub, person_sub, login_method)

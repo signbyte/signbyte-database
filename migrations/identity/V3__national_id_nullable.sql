@@ -1,0 +1,26 @@
+-- V3: a person may have no national identity code.
+--
+-- Until now every person row REQUIRED a national identity code. The code is how
+-- the same human arriving through different login methods — a card, a mobile
+-- identity, a scanned identity document — is recognised as one person, and the
+-- table was built when every method carried one. A person who signs in through
+-- their organisation's directory carries none: a work account holds a name and
+-- the directory's own identifiers, never a national code. For that person the
+-- column is empty, and the row exists all the same.
+--
+-- What does NOT change:
+--   * UNIQUE (national_id) stays. A unique key treats every empty value as
+--     distinct from every other, so any number of codeless persons coexist,
+--     while a code, where present, still belongs to exactly one person.
+--   * The canonical-spelling CHECK stays. Its predicate answers NULL for an
+--     empty input and a CHECK that evaluates to NULL passes — so an empty code
+--     is unconstrained, and a present one is still refused unless canonical.
+--   * `identity.upsert` keeps matching by code wherever a code arrives. A login
+--     that carries none is resolved by its credential instead (the procedures
+--     say how); a login that carries a code that cannot be canonicalised is
+--     still refused — an empty code is the absence of one, not a bad one.
+--
+-- No existing row is touched: every row so far holds a code, and keeps it.
+-- Idempotent — dropping NOT NULL from a column that is already nullable is a
+-- no-op, so a replay against a rebuilt database is harmless.
+ALTER TABLE identity.person ALTER COLUMN national_id DROP NOT NULL;

@@ -6,6 +6,34 @@ integrates against the procedures.
 
 ## v0.1.2
 
+### Changed — a person may have no identity code: a login from an organisation's directory is admitted without one (`identity/V3`, `identity.upsert`)
+
+`identity.person.national_id` is **nullable** from this release. Somebody who signs in through their
+organisation's directory carries a name and the directory's identifiers, never a national identity code; until
+now the identity store refused such a login (`identity:invalid`, *national_id is required*). The column keeps its
+unique key (empty codes are not compared with each other) and its canonical-spelling check (it passes on an empty
+code and still refuses a non-canonical one); no existing row is touched.
+
+`identity.upsert` resolves a login **without** a code by its credential handle (`idp_sub`): a known handle lands
+on its person and refreshes the profile, an unknown handle creates a person with no code and links the handle to
+it. Nothing else is ever matched on — not a name, not an e-mail address — so a directory person and the same
+human arriving with a card are two persons until linked by a deliberate act, which is not part of this release. A
+login that carries no code never blanks a code the row already holds. A login **with** a code is handled exactly
+as before. `identity.get` answers `"serial_number": null` for a codeless person.
+
+```
+CALL identity.upsert('{"idp_sub":"<directory handle>","login_method":"upstream","name":"…"}', po);
+→ {"result":"success","data":{"internal_sub":"01J8X2K4M9N7P3Q5R6S8T0V1W2","created":true}}    the first login
+→ {"result":"success","data":{"internal_sub":"01J8X2K4M9N7P3Q5R6S8T0V1W2","created":false}}   the same handle again
+```
+
+Still refused with `identity:invalid`: a missing `idp_sub`, and a code that cannot be canonicalised — a bad code
+is not the absence of one.
+
+**What a deployment must act on.** Apply this image **before** the authorization server release that sends
+codeless logins; an older server keeps working unchanged against it, since it always sends a code. Nothing to
+provision. The migration is a new versioned file (`identity/V3`), not an edit to an applied one.
+
 ### Changed — a member's register key is their platform subject, never their identity code (`rolebyte/V4`)
 
 The `rolebyte` register keys a member by a typed `subject_key`. A person was keyed `pno:<national identity
