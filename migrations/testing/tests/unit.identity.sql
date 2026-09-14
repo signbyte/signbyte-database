@@ -10,6 +10,7 @@ DECLARE
     v_sub text;
     v_spell_sub text;
     v_foreign_sub text;
+    v_codeless_sub text;
 BEGIN
     -- First-ever login for this person -> created = true, a person id returned.
     CALL identity.upsert(
@@ -45,10 +46,19 @@ BEGIN
         RAISE EXCEPTION 'get returned the wrong national id: %', v;
     END IF;
 
-    -- Missing national id is rejected (validate-before-write).
+    -- A login without a national id is NOT refused: it is resolved by its
+    -- credential handle and, for a new handle, creates a person with no code —
+    -- somebody signing in through their organisation's directory (asserted in
+    -- full in unit.identity_codeless.sql). What is still refused is a login with
+    -- no handle at all, whatever else it carries.
     CALL identity.upsert('{"idp_sub":"idp-unit-3"}'::jsonb, v);
+    IF v->>'result' is distinct from 'success' OR (v->'data'->>'created')::boolean IS NOT TRUE THEN
+        RAISE EXCEPTION 'a login without a code should create a codeless person: %', v;
+    END IF;
+    v_codeless_sub := v->'data'->>'internal_sub';
+    CALL identity.upsert('{"serial_number":"PNOLV-00000000001"}'::jsonb, v);
     IF v->>'result' is distinct from 'error' THEN
-        RAISE EXCEPTION 'upsert without a national id should be rejected: %', v;
+        RAISE EXCEPTION 'upsert without a credential handle should be rejected: %', v;
     END IF;
 
     -- ---------------------------------------------------------------------
@@ -120,7 +130,7 @@ BEGIN
     END IF;
 
     -- Clean up so the test is idempotent across re-runs.
-    DELETE FROM identity.person WHERE person_sub IN (v_sub, v_spell_sub, v_foreign_sub);
+    DELETE FROM identity.person WHERE person_sub IN (v_sub, v_spell_sub, v_foreign_sub, v_codeless_sub);
 
     RAISE NOTICE 'unit.identity: PASS';
 END $$;

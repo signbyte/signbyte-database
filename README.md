@@ -246,7 +246,7 @@ Apply order is the `LOCATIONS` order: `util` first, `grants` last.
 | Location | Schema(s) | Holds / does |
 |---|---|---|
 | `util` | `util` | Shared primitives: `generate_ulid()`, the `result_success` / `result_error` JSON envelope, `pgcrypto`. Everything depends on it. |
-| `identity` | `identity` | Natural person + credential store — one person keyed on the eIDAS national id, many auth-method handles resolving to one stable subject. |
+| `identity` | `identity` | Natural person + credential store — one person keyed on the national identity code where the login carries one, or on their credential handle when they sign in through an organisation's directory (no code); many auth-method handles resolving to one stable subject. |
 | `document` | `document` | Document metadata (bytes + hashes live in object storage). ACL, inner files, one-container-per-chain guard, signed-PDF store. |
 | `signflow` | `signing`, `validation` | Signing jobs, signature records, per-chain lock, and the validation report. |
 | `envelope` | `envelope` | Multi-signer workflow: envelope, attached documents, signer slots, and the draft → sent → in_progress → completed / declined / cancelled / expired state machine. |
