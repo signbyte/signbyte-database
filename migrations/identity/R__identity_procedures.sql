@@ -156,9 +156,80 @@ EXCEPTION
 END
 $$;
 
+-- identity.register — give a person the platform knows a subject BEFORE they have
+-- ever logged in. An administrator registering or inviting somebody, or recording
+-- a person who will never log in, creates the person row here: the national id
+-- (canonical, unique) and whatever name is known — and NO credential. A person
+-- with no credential is not an account and cannot log in; they are a record with
+-- a stable subject, which is what every register keys them on from the first act.
+--
+-- Idempotent on the code: registering a person who already exists — because they
+-- logged in earlier, or were registered before — answers their existing subject
+-- with `created: false`. The name fields are filled only where the row has NONE:
+-- a profile a login wrote is never overwritten by what an administrator typed.
+--
+-- When that person later logs in, `identity.upsert` matches the same canonical
+-- code, lands on this row, and attaches the credential — so the subject handed
+-- out here is the one their login produces.
+--
+-- Returns {"person_sub": "<person id>", "created": <bool>}.
+CREATE OR REPLACE PROCEDURE identity.register(pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = identity, util, pg_temp
+AS $$
+DECLARE
+    v_national_id text := NULLIF(pi_data->>'national_id', '');
+    v_person_sub  text;
+    v_created     boolean;
+BEGIN
+    IF v_national_id IS NULL THEN
+        po_data := util.result_error('identity:invalid', 'national_id is required');
+        RETURN;
+    END IF;
+
+    -- The same canonicalisation and the same refusal as a login: a code that cannot
+    -- be canonicalised (no country in it, an identity type this platform does not
+    -- know) is refused, never stored under a guess. The message does not echo the
+    -- value — an identity code is personal data and this text reaches logs.
+    v_national_id := util.canonical_identity(v_national_id);
+    IF NOT util.is_canonical_identity(v_national_id) THEN
+        po_data := util.result_error('identity:invalid',
+            'national_id is not a canonical identity code: it must carry a known identity type and country, e.g. PNO<CC>-<code>');
+        RETURN;
+    END IF;
+
+    INSERT INTO identity.person AS p (national_id, name, given_name, family_name)
+    VALUES (
+        v_national_id,
+        COALESCE(pi_data->>'name', ''),
+        COALESCE(pi_data->>'given_name', ''),
+        COALESCE(pi_data->>'family_name', '')
+    )
+    ON CONFLICT (national_id) DO UPDATE SET
+        name        = CASE WHEN p.name        = '' THEN EXCLUDED.name        ELSE p.name        END,
+        given_name  = CASE WHEN p.given_name  = '' THEN EXCLUDED.given_name  ELSE p.given_name  END,
+        family_name = CASE WHEN p.family_name = '' THEN EXCLUDED.family_name ELSE p.family_name END,
+        updated_at  = CASE WHEN (p.name = '' AND EXCLUDED.name <> '')
+                             OR (p.given_name = '' AND EXCLUDED.given_name <> '')
+                             OR (p.family_name = '' AND EXCLUDED.family_name <> '')
+                           THEN now() ELSE p.updated_at END
+    RETURNING p.person_sub, (xmax = 0) INTO v_person_sub, v_created;
+
+    po_data := util.result_success(jsonb_build_object('person_sub', v_person_sub, 'created', v_created));
+EXCEPTION
+    WHEN SQLSTATE 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('identity:register_failed', SQLERRM) USING ERRCODE = 'P0001';
+END
+$$;
+
 
 -- EXECUTE-only: revoke from PUBLIC, grant only to the service role.
-REVOKE ALL ON PROCEDURE identity.upsert(jsonb, jsonb) FROM PUBLIC;
-REVOKE ALL ON PROCEDURE identity.get(jsonb, jsonb)    FROM PUBLIC;
-GRANT EXECUTE ON PROCEDURE identity.upsert(jsonb, jsonb) TO authbyte_public;
-GRANT EXECUTE ON PROCEDURE identity.get(jsonb, jsonb)    TO authbyte_public;
+REVOKE ALL ON PROCEDURE identity.upsert(jsonb, jsonb)   FROM PUBLIC;
+REVOKE ALL ON PROCEDURE identity.get(jsonb, jsonb)      FROM PUBLIC;
+REVOKE ALL ON PROCEDURE identity.register(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE identity.upsert(jsonb, jsonb)   TO authbyte_public;
+GRANT EXECUTE ON PROCEDURE identity.get(jsonb, jsonb)      TO authbyte_public;
+GRANT EXECUTE ON PROCEDURE identity.register(jsonb, jsonb) TO authbyte_public;

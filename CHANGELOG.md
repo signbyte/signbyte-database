@@ -6,6 +6,46 @@ integrates against the procedures.
 
 ## v0.1.2
 
+### Changed — a member's register key is their platform subject, never their identity code (`rolebyte/V4`)
+
+The `rolebyte` register keys a member by a typed `subject_key`. A person was keyed `pno:<national identity
+code>`; from this release they are keyed **`sub:<person id>`** — the identifier `identity.person` keys the
+person on, which is also the `sub` claim of every token the authorization server issues for them. A service
+account stays `svc:<client id>`. The register no longer knows what an identity code is: the constraint and the
+three helpers `rolebyte/V3` added are dropped, and one shape rule replaces them —
+`user_account_subject_key_typed CHECK (rolebyte.is_typed_subject_key(subject_key))`, true for `svc:<non-empty>`
+and for `sub:` followed by exactly 26 Crockford-base32 characters. `claim_attach` and `resolve` match on plain
+equality; `user_invite` refuses any other kind with `membership:invalid` —
+*"subjectKey must be a typed key: sub:<person id> for a person, svc:<client id> for a service account"*.
+
+```
+before:  {"subjectKey": "pno:PNOLV-12345678901", ...}
+after:   {"subjectKey": "sub:01J8X2K4M9N7P3Q5R6S8T0V1W2", ...}
+```
+
+**What a deployment must act on.** `V4` converts nothing: a `pno:` member has no platform subject to convert
+to without the identity store, and a register that still holds such rows makes the migration **stop**,
+reporting their count and tenants (never the keys). No deployed database holds any; one that does predates
+this model and is recreated. Apply this image **before** the services that send `sub:` keys — an older
+service's `pno:` keys are refused at every write door and resolve to nobody, and a newer service against the
+older register is refused by the `V3` constraint. Neither combination runs; migrate first, then redeploy.
+
+### Added — `identity.register`: a subject for a person before their first login
+
+A new procedure in the `identity` location, granted to `authbyte_public`. Registering or inviting a person
+creates the person row — canonical code plus whatever name is known — with a stable subject and **no
+credential**, so a person the platform knows has a key to be registered under from the first act, and cannot
+log in until a credential is attached.
+
+```
+CALL identity.register('{"national_id":"PNOLV-123456-78901","name":"…"}', po);
+→ {"result":"success","data":{"person_sub":"01J8X2K4M9N7P3Q5R6S8T0V1W2","created":true}}
+```
+
+Idempotent on the code (an existing person answers `created:false`; name fields are filled only where the row
+has none). A missing or non-canonical code is refused with `identity:invalid`, as `identity.upsert` refuses it.
+That person's first login through `identity.upsert` lands on the same row and attaches the credential.
+
 ### Fixed — what a person is shown keeps their country and their identity type (`util/V3`)
 
 `util.identity_display` returned the bare national identifier for every code except a Latvian personal number,
