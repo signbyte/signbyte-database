@@ -6,6 +6,53 @@ integrates against the procedures.
 
 ## v0.1.2
 
+### Added — a document can be kept until its owner releases it, owned by a product (`document/V12`, `R__`)
+
+Every document in this schema has belonged to a **person** and been swept after its retention window.
+A file a product keeps on an organisation's behalf is neither: it belongs to that organisation, and it
+has to still be there next year.
+
+`document.document` gains **`retention_class`** (`ttl` | `durable`, default `ttl`), which says **who
+decides** when a document goes — the service or its owner — and **not** whether a date exists. The
+`NOT NULL` on `retention_until` is dropped: a durable document its owner has not dated carries no date
+at all, rather than a placeholder a later reader would believe.
+
+**Applying this is cheap.** One column with a default and one dropped `NOT NULL` — catalogue-only, **no
+table rewrite, no backfill, no long lock**. Every row already stored reads as `ttl`, which is exactly how
+it already behaved.
+
+### Changed — the retention sweep skips a document with no date, and deliberately does not read the class
+
+`document.sweep_retention`'s filter becomes `retention_until IS NOT NULL AND retention_until < now`.
+
+What protects a document is **having no date**. A durable document whose owner set a date — an
+organisation's own data-protection policy is exactly that case — is swept when that date passes, like any
+other, because that is the owner's own instruction carried out later. A filter that tested the class
+instead would turn such a deadline into a suggestion.
+
+### Added — `product`, a third kind of access principal
+
+`ck_document_acl_kind` admits `product` beside `sub` and `serial`, for a document owned by a product
+acting for one organisation rather than by a person. The calling service derives that principal from the
+credential it authenticated with, never from a request, and a read or a release is additionally checked
+against the organisation recorded on the row.
+
+The existing canonical-identity constraint needed no change: it applies only where the principal is an
+identity code, so a product principal passes it untouched.
+
+### Changed — `document.acl_allows` has a NEW SIGNATURE; five procedures take new optional inputs
+
+**This is the part to act on.** `document.acl_allows(text, text, text, text)` is **dropped in `V12`** and
+recreated by the repeatable file with a fifth parameter. It is an internal helper with no
+`document_public` `EXECUTE` grant, so nothing outside this schema calls it — but anything that did would
+break.
+
+`document.insert` accepts `owner_kind` (`sub` | `product`) and `retention_class`, and no longer requires
+`retention_until` when the class is `durable`. `document.get`, `document.list` and
+`document.remove_access` accept `caller_product` and `caller_tenant`. **All optional** — omitting them
+gives exactly today's behaviour, so no existing caller changes.
+
+
 ### Added — a tenant's attached directory: its people are admitted as members with no grants (`rolebyte/V5`, `directory_attach`, `directory_admit`)
 
 An organisation whose people sign in through their own directory names that directory on its tenant — the
