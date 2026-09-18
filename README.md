@@ -166,7 +166,7 @@ services:
       # Reads the SAME secret the database uses — never an inline password.
       PGPASSWORD_FILE: /run/secrets/signbyte_postgres_password
       # REQUIRED: the locations this deployment applies, in order.
-      LOCATIONS: "util identity document signflow envelope eidas_audit access_audit verify_audit trust_anchor grants"
+      LOCATIONS: "util util_identity rolebyte identity document signflow envelope eidas_audit access_audit verify_audit trust_anchor grants"
       CONNECT_RETRIES: "30"
     secrets:
       - signbyte_postgres_password
@@ -185,7 +185,7 @@ Or straight from the command line — the published image, this database's locat
 
 ```sh
 docker run --rm \
-  -e LOCATIONS="util identity document signflow envelope eidas_audit access_audit verify_audit trust_anchor grants" \
+  -e LOCATIONS="util util_identity rolebyte identity document signflow envelope eidas_audit access_audit verify_audit trust_anchor grants" \
   -e PGHOST=... -e PGDATABASE=signbyte -e PGUSER=signbyte -e PGPASSWORD=... \
   ghcr.io/signbyte/signbyte-database:<sha-or-version-tag>
 ```
@@ -246,6 +246,8 @@ Apply order is the `LOCATIONS` order: `util` first, `grants` last.
 | Location | Schema(s) | Holds / does |
 |---|---|---|
 | `util` | `util` | Shared primitives: `generate_ulid()`, the `result_success` / `result_error` JSON envelope, `pgcrypto`. Everything depends on it. |
+| `util_identity` | `util` | The identity-code canonicaliser — one spelling per code, and the check the domain schemas apply. Adds functions to the `util` schema rather than creating one of its own, so a deployment that needs the primitives but not identity codes can leave it out. |
+| `rolebyte` | `rolebyte` | Central administration of tenants, user accounts, the per-service role vocabulary and role assignments, with an append-only change history. |
 | `identity` | `identity` | Natural person + credential store — one person keyed on the national identity code where the login carries one, or on their credential handle when they sign in through an organisation's directory (no code); many auth-method handles resolving to one stable subject. |
 | `document` | `document` | Document metadata (bytes + hashes live in object storage). ACL, inner files, one-container-per-chain guard, signed-PDF store. |
 | `signflow` | `signing`, `validation` | Signing jobs, signature records, per-chain lock, and the validation report. |
