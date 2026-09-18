@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: MIT
+-- Copyright (c) 2026 go-make-bytes contributors
+
 -- R: repeatable migration — the trust_anchor store API (4 procedures).
 --
 -- These back the store.Store interface the trust-anchor service uses
