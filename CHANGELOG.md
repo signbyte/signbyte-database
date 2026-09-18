@@ -6,6 +6,21 @@ integrates against the procedures.
 
 ## v0.1.2
 
+### Added — third-party notices, and an MIT marker on the trust-anchor schema
+
+**Act on this if you redistribute this repository or the image.** The body of `util.generate_ulid` is
+third-party code — `geckoboard/pgulid`, Copyright 2016 The Oklog Authors, Apache License 2.0 — adapted
+for this schema set, and it had been shipping without the notice its licence requires. It now carries
+the upstream notice and a statement that the file was modified, and the new `THIRD-PARTY-NOTICES.md`
+carries the entry plus the full Apache-2.0 text, so a copy of the licence reaches every recipient.
+
+The two trust-anchor migration files also carry an SPDX `MIT` marker: that schema is MIT wherever it
+travels, independently of this repository's own licence.
+
+Nothing executable changed — comments and one new file. The `util` and `trust_anchor` versioned
+migrations change checksum as a result, so a database that has already applied them needs its
+migration baseline moved rather than a re-run.
+
 ### Added — a document can be kept until its owner releases it, owned by a product (`document/V12`, `R__`)
 
 Every document in this schema has belonged to a **person** and been swept after its retention window.
