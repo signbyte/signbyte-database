@@ -4,7 +4,27 @@ Notable changes to the signbyte database — the schema set and the migration im
 newest first, per release. Written for whoever applies the image to a database or
 integrates against the procedures.
 
-## v0.1.2
+## v0.2.0
+
+### Changed — the identity helpers move out of `util` into their own `util_identity` location
+
+**Act on this: add `util_identity` to your `LOCATIONS`, immediately after `util`.** It is not caught if
+you forget. The runner refuses a location you *name* that does not exist; it cannot know about one you
+failed to name. Leave it out and the migration succeeds, the five identity functions are never created,
+and the first procedure that calls `util.canonical_identity` fails at run time instead of at migration
+time.
+
+What moved: `util/V2__canonical_identity.sql` and `util/V3__identity_display_keeps_the_code.sql` become
+`util_identity/V1__` and `util_identity/V2__`. They still create their functions in the **`util`
+schema** — a location is a packaging unit, not a schema, the same way `grants` is. Same functions, same
+signatures, same behaviour. Both files are `CREATE OR REPLACE FUNCTION` only, so a database that already
+has them re-applies them as a no-op under the new history table; nothing is dropped and no data moves.
+
+`util` keeps the primitives every schema uses: `generate_ulid()`, `result_success()`, `result_error()`.
+
+Why: a deployment that needs the identifier generator and the result envelope does not necessarily need
+identity-code canonicalisation, and until now it had no way to say so, because a location ships as a
+whole directory.
 
 ### Added — third-party notices, and an MIT marker on the trust-anchor schema
 

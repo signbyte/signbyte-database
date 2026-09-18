@@ -75,8 +75,9 @@ migrate() {
   done
   n_loc=$(echo "$locations" | wc -w)
   # location -> schema name: identical except the legacy signflow -> signing
-  # pairing; grants creates no schema of its own.
-  schemas=$(echo "$locations" | sed 's/\bsignflow\b/signing/' | tr ' ' '\n' | grep -v '^grants$' | tr '\n' ' ')
+  # pairing; grants and util_identity create no schema of their own (grants assigns
+  # privileges across schemas, util_identity adds functions to the util schema).
+  schemas=$(echo "$locations" | sed 's/\bsignflow\b/signing/' | tr ' ' '\n' | grep -vE '^(grants|util_identity)$' | tr '\n' ' ')
   want_schemas=$(echo "$schemas" | wc -w)
   got_schemas=$(docker exec "$PG" sh -c "psql -U platform -d $db -tAc \
     \"SELECT count(*) FROM information_schema.schemata WHERE schema_name = ANY(string_to_array(trim('$schemas'),' '))\"")
