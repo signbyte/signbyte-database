@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: MIT
+-- Copyright (c) 2026 go-make-bytes contributors
+
 -- V1: trust-anchor snapshot/bootstrap store — the `trust_anchor` schema.
 --
 -- Implements the dual-mode store's PostgreSQL backend on the platform's

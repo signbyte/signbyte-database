@@ -24,10 +24,24 @@
 -- ---------------------------------------------------------------------------
 
 -- document.normalize_serial — canonical form of an eIDAS identity code for ACL
--- matching: trims surrounding whitespace and upper-cases, so trivially-different
--- spellings of the same code match. Fuller cross-border normalization (country
--- prefixes, separators) is a planned extension behind THIS seam — callers store
--- and match through this function, so widening it later needs no schema change.
+-- matching: callers store and match through this function, so one spelling of a
+-- person's code is what sits in the list and what every comparison is made against.
+--
+-- This is the seam its first version promised — "fuller cross-border normalization
+-- (country prefixes, separators) is a planned extension behind THIS seam" — with the
+-- extension now arrived. It delegates rather than implementing: the rule that decides
+-- who a person is has exactly ONE implementation on this platform, shared with
+-- `identity.person`, `envelope.signer_slot` and `rolebyte.user_account`, and asserted
+-- to agree with the services' own copy of it. A second implementation here, however
+-- small, would be a second answer to "is this the same human" — and the two would
+-- drift on the day one of them was widened.
+--
+-- The seam itself is kept, deliberately: this store names the concept in its own
+-- vocabulary (a `serial` principal), its procedures read better for it, and a future
+-- store-specific rule has somewhere to live that is not the platform-wide function.
+--
+-- A value that cannot be canonicalised comes back unchanged and therefore matches
+-- nothing — which is the fail-closed answer this function has always given.
 CREATE OR REPLACE FUNCTION document.normalize_serial(p_serial text)
 RETURNS text
 LANGUAGE sql
@@ -35,15 +49,22 @@ IMMUTABLE
 RETURNS NULL ON NULL INPUT
 SET search_path = pg_temp
 AS $$
-    SELECT upper(btrim(p_serial));
+    SELECT util.canonical_identity(p_serial);
 $$;
 
 -- document.acl_allows — true when the caller holds right p_right on the chain
--- rooted at p_chain_root, EITHER as the owning subject OR as an invited eIDAS
--- serial. Fail-closed: an unknown root, a wrong serial, or a missing right is
--- false (so the read procedures return :not_found — no enumeration).
+-- rooted at p_chain_root, as the owning subject, an invited eIDAS serial, OR the
+-- product that stored it for an organisation. Fail-closed: an unknown root, a wrong
+-- serial, a wrong product, or a missing right is false (so the read procedures
+-- return :not_found — no enumeration).
+--
+-- p_product is the full product-under-organisation principal, which the calling
+-- service derives from the credential it authenticated with. It is compared whole:
+-- there is no partial match, so a product acting for one organisation never matches
+-- an entry written for another, and a caller that is not acting as a product passes
+-- NULL and is judged on the other two branches alone.
 CREATE OR REPLACE FUNCTION document.acl_allows(
-    p_chain_root text, p_sub text, p_serial text, p_right text
+    p_chain_root text, p_sub text, p_serial text, p_product text, p_right text
 ) RETURNS boolean
 LANGUAGE sql
 STABLE
@@ -60,6 +81,9 @@ AS $$
              OR (a.principal_kind = 'serial'
                     AND p_serial IS NOT NULL AND p_serial <> ''
                     AND a.principal_id = document.normalize_serial(p_serial))
+             OR (a.principal_kind = 'product'
+                    AND p_product IS NOT NULL AND p_product <> ''
+                    AND a.principal_id = p_product)
           )
     );
 $$;
@@ -69,7 +93,20 @@ $$;
 -- this call; the row records where the bytes live (storage_ref / encryption_key_ref)
 -- and the canonical digest. retention_until is supplied by Go (it owns the 24h
 -- clock — distinct from the SignAPI session TTL).
--- pi_data = { owner, content_hash, mime, size, retention_until, [tenant_id],
+--
+-- Who the document belongs to, and who decides when it goes, are separate answers.
+-- owner_kind says which: `sub` is a person, and the document is seeded onto their
+-- own access entry as before; `product` is a product acting for one organisation,
+-- in which case the organisation is required — a document whose owner cannot be
+-- established is a document nobody is ever able to release.
+-- retention_class says who sets the date: `ttl` keeps today's behaviour, where the
+-- service supplies one and it is required; `durable` hands that to the owner, which
+-- may leave it unset (nothing removes the document until the owner does) or set one
+-- of its own. An owner-set date that has ALREADY passed is refused rather than
+-- stored, because under a sweep that honours it, storing one means "delete at the
+-- next opportunity", which is almost never what the caller meant.
+-- pi_data = { owner, content_hash, mime, size, [retention_until], [tenant_id],
+--             [owner_kind=sub|product], [retention_class=ttl|durable],
 --             [kind=source|container], [parent_id], [filename], [storage_ref],
 --             [encryption_key_ref], [status], [preservation_class] }.
 CREATE OR REPLACE PROCEDURE document.insert(pi_data jsonb, INOUT po_data jsonb)
@@ -84,6 +121,10 @@ DECLARE
     v_kind     text := COALESCE(pi_data->>'kind', 'source');
     v_status   text := COALESCE(pi_data->>'status', 'received');
     v_presv    text := COALESCE(pi_data->>'preservation_class', 'none');
+    v_okind    text := COALESCE(pi_data->>'owner_kind', 'sub');
+    v_rclass   text := COALESCE(pi_data->>'retention_class', 'ttl');
+    v_tenant   text := NULLIF(pi_data->>'tenant_id', '');
+    v_rights   text[];
     v_size     bigint;
     v_retention timestamptz;
     v_id       text;
@@ -105,8 +146,31 @@ BEGIN
         po_data := util.result_error('document:invalid', 'size is required');
         RETURN;
     END IF;
-    IF (pi_data->>'retention_until') IS NULL THEN
+    IF v_okind NOT IN ('sub', 'product') THEN
+        po_data := util.result_error('document:invalid', 'owner_kind must be sub or product');
+        RETURN;
+    END IF;
+    IF v_rclass NOT IN ('ttl', 'durable') THEN
+        po_data := util.result_error('document:invalid', 'invalid retention_class');
+        RETURN;
+    END IF;
+    -- A product owns on behalf of one organisation, and that is what the ownership is
+    -- anchored on. Without it there is nothing to scope the document to and nobody
+    -- identifiable to release it later.
+    IF v_okind = 'product' AND v_tenant IS NULL THEN
+        po_data := util.result_error('document:invalid', 'a product-owned document requires an organisation');
+        RETURN;
+    END IF;
+    -- The service still owns the clock for the default class, so a date stays
+    -- mandatory there and today's behaviour is unchanged.
+    IF v_rclass = 'ttl' AND (pi_data->>'retention_until') IS NULL THEN
         po_data := util.result_error('document:invalid', 'retention_until is required');
+        RETURN;
+    END IF;
+    IF v_rclass = 'durable'
+       AND NULLIF(pi_data->>'retention_until', '') IS NOT NULL
+       AND (pi_data->>'retention_until')::timestamptz <= now() THEN
+        po_data := util.result_error('document:invalid', 'retention_until must be in the future');
         RETURN;
     END IF;
     -- source = an unsigned upload; container = a signed ASiC-E; pdf = a PAdES
@@ -126,16 +190,18 @@ BEGIN
     END IF;
 
     v_size      := (pi_data->>'size')::bigint;
-    v_retention := (pi_data->>'retention_until')::timestamptz;
+    -- Left NULL for a durable document its owner has not dated: nothing sweeps it
+    -- until the owner either sets a date or releases it outright.
+    v_retention := NULLIF(pi_data->>'retention_until', '')::timestamptz;
 
     INSERT INTO document.document (
         owner, tenant_id, kind, parent_id, filename, storage_ref,
         content_hash, mime, size, status, encryption_key_ref,
-        preservation_class, retention_until, inner_files
+        preservation_class, retention_class, retention_until, inner_files
     )
     VALUES (
         v_owner,
-        NULLIF(pi_data->>'tenant_id', ''),
+        v_tenant,
         v_kind,
         NULLIF(pi_data->>'parent_id', ''),
         COALESCE(pi_data->>'filename', ''),
@@ -146,6 +212,7 @@ BEGIN
         v_status,
         NULLIF(pi_data->>'encryption_key_ref', ''),
         v_presv,
+        v_rclass,
         v_retention,
         -- The ASiC-E inner-file manifest (a JSON array), captured from go-asice
         -- Inspect at write time; NULL for a plain source. Metadata only.
@@ -156,9 +223,14 @@ BEGIN
     -- A newly-uploaded source (a chain root) seeds its creator's standing access
     -- (read + co-sign); a co-signed container inherits the root's entry, so it
     -- adds none. Same transaction as the row insert, so they commit together.
+    -- A product is granted read and nothing else: it holds the document and may
+    -- release it, but co-signing is an act of a person, not of a product.
     IF NULLIF(pi_data->>'parent_id', '') IS NULL THEN
+        v_rights := CASE WHEN v_okind = 'product'
+                         THEN ARRAY['read']::text[]
+                         ELSE ARRAY['read', 'cosign']::text[] END;
         INSERT INTO document.document_acl (chain_root_id, principal_kind, principal_id, rights, tenant_id, granted_by)
-        VALUES (v_id, 'sub', v_owner, ARRAY['read', 'cosign']::text[], NULLIF(pi_data->>'tenant_id', ''), v_owner)
+        VALUES (v_id, v_okind, v_owner, v_rights, v_tenant, v_owner)
         ON CONFLICT (chain_root_id, principal_kind, principal_id) DO NOTHING;
     END IF;
 
@@ -181,10 +253,15 @@ $$;
 
 -- document.get — read one document's metadata, authorized by the chain's ACL
 -- (DB-enforced, defence-in-depth no-IDOR): the caller must hold `read` on the
--- document's chain root, as the owning subject OR an invited eIDAS serial.
--- Returns :not_found when the row is absent OR the caller is not on the ACL —
--- the two are deliberately indistinguishable (no enumeration).
--- pi_data = { id, caller_sub, [caller_serial] }.
+-- document's chain root, as the owning subject, an invited eIDAS serial, OR the
+-- owning product. Returns :not_found when the row is absent OR the caller is not on
+-- the ACL — the two are deliberately indistinguishable (no enumeration).
+--
+-- A caller acting as a product must additionally be acting for the organisation the
+-- document belongs to. The organisation is already inside the product principal, so
+-- this is a second lock on the same door — deliberately, because it is the check
+-- that still holds if a principal is ever written in some other shape.
+-- pi_data = { id, caller_sub, [caller_serial], [caller_product], [caller_tenant] }.
 CREATE OR REPLACE PROCEDURE document.get(pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -194,6 +271,8 @@ DECLARE
     v_id     text := pi_data->>'id';
     v_sub    text := pi_data->>'caller_sub';
     v_serial text := pi_data->>'caller_serial';
+    v_product text := NULLIF(pi_data->>'caller_product', '');
+    v_tenant  text := NULLIF(pi_data->>'caller_tenant', '');
     v_root   text;
     v_row    jsonb;
 BEGIN
@@ -201,7 +280,8 @@ BEGIN
         po_data := util.result_error('document:invalid', 'id is required');
         RETURN;
     END IF;
-    IF (v_sub IS NULL OR v_sub = '') AND (v_serial IS NULL OR v_serial = '') THEN
+    IF (v_sub IS NULL OR v_sub = '') AND (v_serial IS NULL OR v_serial = '')
+       AND v_product IS NULL THEN
         po_data := util.result_error('document:invalid', 'caller is required');
         RETURN;
     END IF;
@@ -212,7 +292,16 @@ BEGIN
     WHERE d.id = v_id;
 
     -- Absent row OR caller-not-on-the-chain-ACL are deliberately indistinguishable.
-    IF v_row IS NULL OR NOT document.acl_allows(v_root, v_sub, v_serial, 'read') THEN
+    IF v_row IS NULL OR NOT document.acl_allows(v_root, v_sub, v_serial, v_product, 'read') THEN
+        po_data := util.result_error('document:not_found', 'no document for that id');
+        RETURN;
+    END IF;
+
+    -- Same answer, for the same reason: a product reaching outside the organisation it
+    -- is acting for is told the document does not exist, never that it exists and is
+    -- refused. Anything else confirms the id to a caller who should not have it.
+    IF v_product IS NOT NULL
+       AND COALESCE(v_row->>'tenant_id', '') IS DISTINCT FROM COALESCE(v_tenant, '') THEN
         po_data := util.result_error('document:not_found', 'no document for that id');
         RETURN;
     END IF;
@@ -265,7 +354,7 @@ BEGIN
     LIMIT 1;
 
     -- No container yet OR caller-not-on-the-chain-ACL are deliberately indistinguishable.
-    IF v_row IS NULL OR NOT document.acl_allows(v_parent, v_sub, v_serial, 'read') THEN
+    IF v_row IS NULL OR NOT document.acl_allows(v_parent, v_sub, v_serial, NULL, 'read') THEN
         po_data := util.result_error('document:not_found', 'no container for that chain');
         RETURN;
     END IF;
@@ -318,7 +407,7 @@ BEGIN
     LIMIT 1;
 
     -- No signed PDF yet OR caller-not-on-the-chain-ACL are deliberately indistinguishable.
-    IF v_row IS NULL OR NOT document.acl_allows(v_parent, v_sub, v_serial, 'read') THEN
+    IF v_row IS NULL OR NOT document.acl_allows(v_parent, v_sub, v_serial, NULL, 'read') THEN
         po_data := util.result_error('document:not_found', 'no signed pdf for that chain');
         RETURN;
     END IF;
@@ -337,7 +426,11 @@ $$;
 -- rows. A row is included when the caller holds `read` on its chain root (as the
 -- owning subject OR an invited eIDAS serial) — so a co-signer sees the shared
 -- document, not only their own uploads.
--- pi_data = { caller_sub, [caller_serial], [limit], [after] (exclusive upper-bound id) }.
+-- A caller acting as a product sees the documents it stored for the organisation it
+-- is acting for, and nothing else: the organisation must match on the row as well as
+-- inside the principal.
+-- pi_data = { caller_sub, [caller_serial], [caller_product], [caller_tenant],
+--             [limit], [after] (exclusive upper-bound id) }.
 CREATE OR REPLACE PROCEDURE document.list(pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -347,11 +440,13 @@ DECLARE
     v_sub     text := pi_data->>'caller_sub';
     v_serial  text := NULLIF(pi_data->>'caller_serial', '');
     v_nserial text := document.normalize_serial(v_serial);
+    v_product text := NULLIF(pi_data->>'caller_product', '');
+    v_tenant  text := NULLIF(pi_data->>'caller_tenant', '');
     v_limit   int  := LEAST(COALESCE((pi_data->>'limit')::int, 100), 1000);
     v_after   text := NULLIF(pi_data->>'after', '');
     v_rows    jsonb;
 BEGIN
-    IF (v_sub IS NULL OR v_sub = '') AND v_serial IS NULL THEN
+    IF (v_sub IS NULL OR v_sub = '') AND v_serial IS NULL AND v_product IS NULL THEN
         po_data := util.result_error('document:invalid', 'caller is required');
         RETURN;
     END IF;
@@ -370,8 +465,11 @@ BEGIN
                 AND (
                       (a.principal_kind = 'sub'    AND v_sub IS NOT NULL AND v_sub <> '' AND a.principal_id = v_sub)
                    OR (a.principal_kind = 'serial' AND v_nserial IS NOT NULL AND a.principal_id = v_nserial)
+                   OR (a.principal_kind = 'product' AND v_product IS NOT NULL AND a.principal_id = v_product)
                 )
           )
+          AND (v_product IS NULL
+               OR COALESCE(d.tenant_id, '') = COALESCE(v_tenant, ''))
           AND (v_after IS NULL OR d.id < v_after)
         ORDER BY d.id DESC
         LIMIT v_limit
@@ -575,7 +673,7 @@ BEGIN
     FROM document.document d
     WHERE d.id = v_id;
 
-    IF v_root IS NULL OR NOT document.acl_allows(v_root, v_sub, v_serial, 'read') THEN
+    IF v_root IS NULL OR NOT document.acl_allows(v_root, v_sub, v_serial, NULL, 'read') THEN
         po_data := util.result_error('document:not_found', 'no chain for that id');
         RETURN;
     END IF;
@@ -886,7 +984,12 @@ $$;
 -- legal hold on ANY row in the chain refuses the whole operation (bytes + access
 -- kept). The owner is just one entry — it cannot destroy a document a co-signer
 -- still holds. A solo document is a one-entry ACL, so this behaves exactly like
--- the prior owner-filtered delete. pi_data = { doc_id, caller_sub, [caller_serial] }.
+-- the prior owner-filtered delete.
+--
+-- This is also how a product releases what it stored: a product-owned document has
+-- exactly one entry, so removing that entry is the release, and the bytes go with it.
+-- A legal hold refuses it like any other delete.
+-- pi_data = { doc_id, caller_sub, [caller_serial], [caller_product], [caller_tenant] }.
 CREATE OR REPLACE PROCEDURE document.remove_access(pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -896,6 +999,9 @@ DECLARE
     v_doc       text := pi_data->>'doc_id';
     v_sub       text := pi_data->>'caller_sub';
     v_serial    text := pi_data->>'caller_serial';
+    v_product   text := NULLIF(pi_data->>'caller_product', '');
+    v_tenant    text := NULLIF(pi_data->>'caller_tenant', '');
+    v_rowtenant text;
     v_root      text;
     v_held      boolean;
     v_remaining int;
@@ -905,18 +1011,27 @@ BEGIN
         po_data := util.result_error('document:invalid', 'doc_id is required');
         RETURN;
     END IF;
-    IF (v_sub IS NULL OR v_sub = '') AND (v_serial IS NULL OR v_serial = '') THEN
+    IF (v_sub IS NULL OR v_sub = '') AND (v_serial IS NULL OR v_serial = '')
+       AND v_product IS NULL THEN
         po_data := util.result_error('document:invalid', 'caller is required');
         RETURN;
     END IF;
 
     -- Resolve the chain root from the document.
-    SELECT COALESCE(NULLIF(d.parent_id, ''), d.id) INTO v_root
+    SELECT COALESCE(NULLIF(d.parent_id, ''), d.id), COALESCE(d.tenant_id, '')
+      INTO v_root, v_rowtenant
     FROM document.document d
     WHERE d.id = v_doc;
 
     -- Absent row OR caller-not-on-the-ACL are deliberately indistinguishable.
-    IF v_root IS NULL OR NOT document.acl_allows(v_root, v_sub, v_serial, 'read') THEN
+    IF v_root IS NULL OR NOT document.acl_allows(v_root, v_sub, v_serial, v_product, 'read') THEN
+        po_data := util.result_error('document:not_found', 'no document for that id');
+        RETURN;
+    END IF;
+
+    -- A product may only release inside the organisation it is acting for, and a
+    -- refusal reads as absence here too.
+    IF v_product IS NOT NULL AND v_rowtenant IS DISTINCT FROM COALESCE(v_tenant, '') THEN
         po_data := util.result_error('document:not_found', 'no document for that id');
         RETURN;
     END IF;
@@ -937,7 +1052,9 @@ BEGIN
       AND ( (a.principal_kind = 'sub'
                 AND v_sub IS NOT NULL AND v_sub <> '' AND a.principal_id = v_sub)
          OR (a.principal_kind = 'serial'
-                AND v_serial IS NOT NULL AND v_serial <> '' AND a.principal_id = document.normalize_serial(v_serial)) );
+                AND v_serial IS NOT NULL AND v_serial <> '' AND a.principal_id = document.normalize_serial(v_serial))
+         OR (a.principal_kind = 'product'
+                AND v_product IS NOT NULL AND a.principal_id = v_product) );
 
     SELECT count(*) INTO v_remaining FROM document.document_acl WHERE chain_root_id = v_root;
 
@@ -974,12 +1091,18 @@ EXCEPTION
 END
 $$;
 
--- document.sweep_retention — set-based purge driver. Selects expired,
+-- document.sweep_retention — set-based purge driver. Selects dated,
 -- non-legal-hold, not-already-purged documents whose retention_until < `now`,
 -- flips them to status='expired', NULLs their storage_ref + encryption_key_ref, and
 -- RETURNS the prior {id, storageRef, encryptionKeyRef} list so the Go core.Tasker
 -- can destroy the S3 objects + KMS data keys. Retention PARAMS (the `now` instant,
 -- batch limit) come from Go. pi_data = { now, [limit] }.
+--
+-- What protects a document from this sweep is having NO date, never which retention
+-- class it carries. A document whose owner set a date is removed when that date
+-- passes exactly like any other, because the owner asked for that — it is a release
+-- scheduled in advance, not the store overruling the owner. Reading the class here
+-- instead would turn an owner's own data-protection deadline into a suggestion.
 CREATE OR REPLACE PROCEDURE document.sweep_retention(pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -993,7 +1116,8 @@ BEGIN
     WITH expired AS (
         SELECT id, storage_ref, encryption_key_ref
         FROM document.document
-        WHERE retention_until < v_now
+        WHERE retention_until IS NOT NULL
+          AND retention_until < v_now
           AND legal_hold = false
           AND status <> 'deleted'
           AND status <> 'expired'
@@ -1079,9 +1203,20 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Store a serial principal in its canonical form so the match is exact.
+    -- Store a serial principal in its canonical form so the match is exact, and
+    -- refuse one that cannot be put in that form rather than storing it under a
+    -- guess: a grant keyed on a code nobody can arrive with grants nobody access,
+    -- and does it silently, because a non-match is answered as `:not_found`. The
+    -- country is the calling service's to supply from the nearest fact about the
+    -- person. The message deliberately does not echo the value — an identity code is
+    -- personal data and this text reaches logs.
     IF v_kind = 'serial' THEN
         v_pid := document.normalize_serial(v_pid);
+        IF NOT util.is_canonical_identity(v_pid) THEN
+            po_data := util.result_error('document:invalid',
+                'a serial principal must be a canonical identity code carrying a known identity type and country, e.g. PNO<CC>-<code>');
+            RETURN;
+        END IF;
     END IF;
 
     INSERT INTO document.document_acl (chain_root_id, principal_kind, principal_id, rights, tenant_id, granted_by)
@@ -1639,4 +1774,4 @@ GRANT EXECUTE ON PROCEDURE document.rebundle_container(jsonb, jsonb)      TO doc
 -- ACL helper functions: owned by the migrating role, invoked only inside the procedures
 -- above (no service-role EXECUTE — document_public never calls them directly).
 REVOKE ALL ON FUNCTION document.normalize_serial(text)             FROM PUBLIC;
-REVOKE ALL ON FUNCTION document.acl_allows(text, text, text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION document.acl_allows(text, text, text, text, text) FROM PUBLIC;
