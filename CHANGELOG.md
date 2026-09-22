@@ -6,6 +6,31 @@ integrates against the procedures.
 
 ## v0.2.0
 
+### Added — `rolebyte.user_list`: the tenant's people, by name, for a picker
+
+A screen that shows who holds a piece of work has to put a name to the opaque key the work is
+attributed to, and almost nobody who may read that work may also read the membership
+administration. `rolebyte.user_list(jsonb, jsonb)` answers only that question: for one tenant,
+every member's `id`, `subjectKey`, `displayName` and `status`, ordered by name. No roles, no
+grants, no history, no identity code.
+
+```
+{"tenantId": "01M…"}
+→ {"users":[{"id":"01M…","subjectKey":"sub:01HZ…","displayName":"Anna Kalniņa","status":"active"}]}
+```
+
+**Service accounts are excluded inside the procedure, not by the caller.** A service account is a
+member row like any other, so a list that returned every member would offer the storage service as
+a person to assign work to.
+
+**Revoked members ARE returned, with their status saying so.** Work attributed to somebody who has
+left still has to show their name, and the caller decides for itself whether to offer them. An
+anonymised row carries whatever name the erasure left behind.
+
+Refuses `membership:invalid` with no `tenantId` and `tenant:not_found` for a tenant that does not
+exist. Granted to `rolebyte_public`. This is a new procedure in the repeatable `rolebyte`
+migration — nothing else in that location changed, and re-applying it is the whole upgrade.
+
 ### Changed — the identity helpers move out of `util` into their own `util_identity` location
 
 **Act on this: add `util_identity` to your `LOCATIONS`, immediately after `util`.** It is not caught if
