@@ -226,8 +226,8 @@ on its own. Everywhere else the code is now shown **exactly as stored**:
 
 ```
 util.identity_display('PNOLV-XXXXXXXXXXX')  ->  XXXXXX-XXXXX        (unchanged)
-util.identity_display('PNOEE-XXXXXXXXXXX')  ->  PNOEE-XXXXXXXXXXX   (was 23456789012)
-util.identity_display('NTRLV-XXXXXXXXXXX')  ->  NTRLV-XXXXXXXXXXX   (was 34567890123)
+util.identity_display('PNOEE-XXXXXXXXXXX')  ->  PNOEE-XXXXXXXXXXX   (was XXXXXXXXXXX)
+util.identity_display('NTRLV-XXXXXXXXXXX')  ->  NTRLV-XXXXXXXXXXX   (was XXXXXXXXXXX)
 ```
 
 **What a deployment must act on: nothing.** Nothing compares a displayed value, so no key, index, constraint
