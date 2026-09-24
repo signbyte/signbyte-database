@@ -864,6 +864,70 @@ $$;
 REVOKE ALL ON PROCEDURE rolebyte.resolve(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.resolve(jsonb, jsonb) TO rolebyte_public;
 
+-- rolebyte.user_list — the tenant's people, by name, for a picker.
+--
+-- The narrowest possible read of the membership register: who is in this
+-- workspace and what they are called. No roles, no grants, no history, no
+-- identity code — a name and the opaque key work is attributed to.
+--
+-- It exists because every product that shows work has to show WHO HOLDS IT,
+-- and a screen cannot put a name to a key it may not read. The administration
+-- read (members with their grants) answers a different question for a different
+-- audience: anyone who may see a task needs this one, and almost none of them
+-- may see that one. One cannot stand in for the other without handing
+-- everybody's grants to anyone who can open a task.
+--
+-- MACHINE MEMBERS ARE EXCLUDED, in the procedure rather than in a caller. A
+-- service account is a member row like any other, so a list that returned
+-- every member would offer the storage service as a person to assign work to.
+--
+-- Revoked members are included and say so: work attributed to somebody who has
+-- left still has to show their name, and a screen decides for itself whether to
+-- offer them. Anonymised rows carry whatever name the erasure left behind,
+-- which is the point of anonymising rather than deleting.
+CREATE OR REPLACE PROCEDURE rolebyte.user_list(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_tenant text;
+    v_items  jsonb;
+BEGIN
+    v_tenant := NULLIF(trim(pi_data->>'tenantId'), '');
+    IF v_tenant IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'tenantId is required');
+        RETURN;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM rolebyte.tenant WHERE id = v_tenant) THEN
+        po_data := util.result_error('tenant:not_found', 'tenant does not exist');
+        RETURN;
+    END IF;
+
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+               'id',          u.id,
+               'subjectKey',  u.subject_key,
+               'displayName', u.display_name,
+               'status',      u.status
+           ) ORDER BY lower(u.display_name), u.id), '[]'::jsonb)
+      INTO v_items
+      FROM rolebyte.user_account u
+     WHERE u.tenant_id = v_tenant
+       AND u.subject_key NOT LIKE 'svc:%';
+
+    po_data := util.result_success(jsonb_build_object('users', v_items));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.user_list(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.user_list(jsonb, jsonb) TO rolebyte_public;
+
 -- history — the append-only promise made queryable: a tenant's membership
 -- events in a time window, optionally narrowed to one service (the events
 -- carry the service in their payload). The billing seat-count source.

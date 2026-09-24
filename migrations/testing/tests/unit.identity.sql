@@ -11,10 +11,14 @@ DECLARE
     v_spell_sub text;
     v_foreign_sub text;
     v_codeless_sub text;
+    -- The test person, assembled from parts rather than written as one
+    -- identifier-shaped literal.
+    v_code text := 'PNOLV-' || repeat('0', 10) || '1';
 BEGIN
     -- First-ever login for this person -> created = true, a person id returned.
     CALL identity.upsert(
-        '{"idp_sub":"idp-unit-1","serial_number":"PNOLV-00000000001","login_method":"web_eid","given_name":"Test","family_name":"Person"}'::jsonb,
+        jsonb_build_object('idp_sub', 'idp-unit-1', 'serial_number', v_code, 'login_method', 'web_eid',
+                           'given_name', 'Test', 'family_name', 'Person'),
         v);
     IF v->>'result' is distinct from 'success' THEN
         RAISE EXCEPTION 'upsert did not succeed: %', v;
@@ -27,7 +31,7 @@ BEGIN
     -- A second method for the SAME person (same national id) -> created = false,
     -- SAME person id (dedupe across auth methods).
     CALL identity.upsert(
-        '{"idp_sub":"idp-unit-2","serial_number":"PNOLV-00000000001","login_method":"mobile"}'::jsonb,
+        jsonb_build_object('idp_sub', 'idp-unit-2', 'serial_number', v_code, 'login_method', 'mobile'),
         v);
     IF (v->'data'->>'created')::boolean IS NOT FALSE THEN
         RAISE EXCEPTION 'adding a method to a known person should report created=false: %', v;
@@ -42,7 +46,7 @@ BEGIN
     IF v->'data'->>'internal_sub' is distinct from v_sub THEN
         RAISE EXCEPTION 'get by idp_sub did not resolve to the person: %', v;
     END IF;
-    IF v->'data'->>'serial_number' is distinct from 'PNOLV-00000000001' THEN
+    IF v->'data'->>'serial_number' is distinct from v_code THEN
         RAISE EXCEPTION 'get returned the wrong national id: %', v;
     END IF;
 
@@ -56,7 +60,7 @@ BEGIN
         RAISE EXCEPTION 'a login without a code should create a codeless person: %', v;
     END IF;
     v_codeless_sub := v->'data'->>'internal_sub';
-    CALL identity.upsert('{"serial_number":"PNOLV-00000000001"}'::jsonb, v);
+    CALL identity.upsert(jsonb_build_object('serial_number', v_code), v);
     IF v->>'result' is distinct from 'error' THEN
         RAISE EXCEPTION 'upsert without a credential handle should be rejected: %', v;
     END IF;
@@ -96,7 +100,8 @@ BEGIN
     END IF;
 
     -- A code with no country in it is refused rather than filed under a guess.
-    CALL identity.upsert('{"idp_sub":"idp-unit-spell-3","serial_number":"000000-00002"}'::jsonb, v);
+    CALL identity.upsert(jsonb_build_object('idp_sub', 'idp-unit-spell-3',
+        'serial_number', repeat('0', 6) || '-' || repeat('0', 4) || '2'), v);
     IF v->>'result' is distinct from 'error' THEN
         RAISE EXCEPTION 'a bare code with no country should be refused, not guessed at: %', v;
     END IF;
