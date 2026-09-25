@@ -296,7 +296,7 @@ BEGIN
         RAISE EXCEPTION 'an empty list clears the role: %', v;
     END IF;
 
-    -- 4. GRANT, by the role's id. A grant changes nothing the person resolves to yet.
+    -- 4. GRANT, by the role's id.
     v := pg_temp.ok('tenant_role_grant', jsonb_build_object('actor', 'adm-a', 'tenantId', v_ta,
         'userId', v_pa1, 'roleId', v_role), 'grant');
     IF (v->>'changed')::boolean IS NOT TRUE THEN RAISE EXCEPTION 'a first grant changes state: %', v; END IF;
@@ -333,13 +333,15 @@ BEGIN
     EXCEPTION WHEN foreign_key_violation THEN NULL;
     END;
 
-    -- Nothing reaches a token: the grant does not change what anyone resolves to.
+    -- The grant reaches what the person resolves to, as the role's ticks. (What
+    -- resolve answers in every other case is unit.rolebyte_resolve's.)
     v := pg_temp.ok('claim_attach', jsonb_build_object('actor', 'tenant-role-test',
         'subjectKey', (SELECT subject_key FROM rolebyte.user_account WHERE id = v_pa1)), 'claim pa1');
     v := pg_temp.ok('resolve', jsonb_build_object(
         'subjectKey', (SELECT subject_key FROM rolebyte.user_account WHERE id = v_pa1)), 'resolve pa1');
-    IF v->'memberships'->0->'scopes' IS DISTINCT FROM '[]'::jsonb THEN
-        RAISE EXCEPTION 'a tenant role must not reach a token yet: %', v;
+    IF NOT (v->'memberships'->0->'scopes' @> '["trdemo/task:view","trdemo/task/attachment:deleteAny","traddon/workforce/person:view"]'::jsonb
+            AND jsonb_array_length(v->'memberships'->0->'scopes') = 3) THEN
+        RAISE EXCEPTION 'a granted tenant role must resolve to exactly its three ticks: %', v;
     END IF;
 
     -- 5. DELETE. A role somebody holds is refused, with the count, and survives.

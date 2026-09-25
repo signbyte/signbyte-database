@@ -964,9 +964,15 @@ REVOKE ALL ON PROCEDURE rolebyte.user_revoke(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.user_revoke(jsonb, jsonb) TO rolebyte_public;
 
 -- resolve — the identity provider's hot path at token issue: an authenticated
--- subject key answers the memberships it may act under, each with the
--- `group:level` scope set from currently granted assignments. Reads only;
--- a stranger resolves to an empty list.
+-- subject key answers the memberships it may act under, each with one flat scope
+-- set from what is currently granted there: a service's role as `group:level`,
+-- and each permission a tenant's own role ticks as `service/feature:act`. Reads
+-- only; a stranger resolves to an empty list.
+--
+-- Both kinds feed ONE distinct aggregate, so a person who holds no tenant role
+-- resolves exactly as before tenant roles existed, and a box ticked by two roles
+-- appears once. The two kinds cannot collide: a permission always carries a `/`
+-- and a role's group never does.
 CREATE OR REPLACE PROCEDURE rolebyte.resolve(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -995,10 +1001,19 @@ BEGIN
             'userId',      u.id,
             'displayName', u.display_name,
             'scopes',      COALESCE((
-                SELECT jsonb_agg(DISTINCT rd.role_group || ':' || rd.role_level)
-                FROM rolebyte.assignment a
-                JOIN rolebyte.role_definition rd ON rd.id = a.role_definition_id
-                WHERE a.user_id = u.id AND a.state = 'granted'
+                SELECT jsonb_agg(DISTINCT s.scope)
+                FROM (
+                    SELECT rd.role_group || ':' || rd.role_level AS scope
+                    FROM rolebyte.assignment a
+                    JOIN rolebyte.role_definition rd ON rd.id = a.role_definition_id
+                    WHERE a.user_id = u.id AND a.state = 'granted'
+                    UNION ALL
+                    SELECT sp.service_key || '/' || sp.feature_key || ':' || sp.act
+                    FROM rolebyte.tenant_role_assignment ta
+                    JOIN rolebyte.tenant_role_permission tp ON tp.tenant_role_id = ta.tenant_role_id
+                    JOIN rolebyte.service_permission sp ON sp.id = tp.permission_id
+                    WHERE ta.user_id = u.id AND ta.tenant_id = u.tenant_id AND ta.state = 'granted'
+                ) s
             ), '[]'::jsonb)
         ) AS m
         FROM rolebyte.user_account u
@@ -1183,8 +1198,9 @@ GRANT EXECUTE ON PROCEDURE rolebyte.bootstrap_state(jsonb, jsonb) TO rolebyte_pu
 -- Tenant roles. A tenant's own roles, each made of ticks over the permissions
 -- services declare, identified by id and named as the tenant names them. Every
 -- procedure below takes the tenant, and a role of any other tenant answers
--- exactly as one that never existed. Nothing a tenant role holds reaches a
--- token here: `resolve` does not read these tables.
+-- exactly as one that never existed. What a granted role ticks reaches the
+-- person's token through `resolve`, so a change to the ticks or the grants
+-- changes what they resolve to.
 -- ---------------------------------------------------------------------------
 
 -- tenant_role_permission_names — the permissions a role holds, spelled as they

@@ -6,13 +6,28 @@ integrates against the procedures.
 
 ## v0.3.0
 
+### Changed — `rolebyte.resolve` answers what a granted tenant role holds
+
+Each membership's `scopes` now carries every permission a granted tenant role of that membership ticks,
+spelled as it travels, beside the `group:level` strings its service roles give:
+
+```
+{"subjectKey":"sub:01J…"}
+→ {"memberships":[{"tenantId":"01J…","userId":"01J…","displayName":"…",
+                   "scopes":["projects/spentTime:view","projects/task:edit","projects:log"]}]}
+```
+
+**A person holding no tenant role resolves byte for byte as before** (asserted by `unit.rolebyte_resolve.sql`
+against the previous aggregation). The list stays distinct; its order is the database collation's and is not
+part of the contract. No signature change and no new migration.
+
 ### Added — a tenant defines its own roles
 
 A role was always a service's: one `group:level` rung, the same on every tenant. A tenant can now make
 **its own roles** out of the permissions services declare, name them as it names them, and change them at
 will. A tenant role is identified by its id; its name is a label, unique in the tenant ignoring case, and
-one role may hold permissions of several services. **Nothing a tenant role holds reaches a token yet**:
-`rolebyte.resolve` does not read the new tables.
+one role may hold permissions of several services. What a granted role holds reaches `rolebyte.resolve`
+(below).
 
 ```
 rolebyte.tenant_role_define        {"actor":"…","tenantId":"…","name":"Manager"}
