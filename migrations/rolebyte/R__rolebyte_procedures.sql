@@ -173,6 +173,13 @@ BEGIN
         RETURN;
     END IF;
 
+    -- `/` marks a permission; a role spelled like one would hand out an act
+    -- nobody declared or ticked.
+    IF position('/' IN v_group) > 0 THEN
+        po_data := util.result_error('membership:invalid', 'a role group may not contain "/"');
+        RETURN;
+    END IF;
+
     IF NOT EXISTS (SELECT 1 FROM rolebyte.service WHERE key = v_service) THEN
         po_data := util.result_error('membership:not_found', 'service is not registered');
         RETURN;
@@ -209,6 +216,155 @@ $$;
 
 REVOKE ALL ON PROCEDURE rolebyte.role_define(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.role_define(jsonb, jsonb) TO rolebyte_public;
+
+-- permission_declare — a service declares one act it enforces on one of its
+-- features. Additive: a new permission is created, an identical one reports
+-- `unchanged`, and a changed description is updated and reports `changed`.
+-- A permission's class never changes — re-classing would change who may hand
+-- it out — so a declaration naming a different class is refused, naming the
+-- permission. The declaration is read strictly: a property this register does
+-- not know is refused rather than dropped, so a later property carrying a
+-- requirement can never be stored without it. Emits `permissionDeclared` or
+-- `permissionDescribed` when something changed, nothing otherwise.
+CREATE OR REPLACE PROCEDURE rolebyte.permission_declare(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_actor   text;
+    v_service text;
+    v_decl    jsonb;
+    v_unknown text;
+    v_feature text;
+    v_act     text;
+    v_desc    text;
+    v_class   text;
+    v_name    text;
+    v_row     rolebyte.service_permission%ROWTYPE;
+BEGIN
+    v_actor := NULLIF(trim(pi_data->>'actor'), '');
+    IF v_actor IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'actor is required');
+        RETURN;
+    END IF;
+
+    v_service := NULLIF(trim(pi_data->>'service'), '');
+    IF v_service IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'service is required');
+        RETURN;
+    END IF;
+
+    v_decl := pi_data->'permission';
+    IF jsonb_typeof(v_decl) IS DISTINCT FROM 'object' THEN
+        po_data := util.result_error('membership:invalid', 'permission must be an object');
+        RETURN;
+    END IF;
+
+    SELECT k INTO v_unknown
+    FROM jsonb_object_keys(v_decl) AS k
+    WHERE k NOT IN ('feature', 'act', 'description', 'class')
+    ORDER BY k
+    LIMIT 1;
+    IF v_unknown IS NOT NULL THEN
+        po_data := util.result_error('membership:invalid',
+            format('a permission has no property "%s"', v_unknown));
+        RETURN;
+    END IF;
+
+    IF jsonb_typeof(v_decl->'feature') IS DISTINCT FROM 'string'
+       OR jsonb_typeof(v_decl->'act') IS DISTINCT FROM 'string'
+       OR jsonb_typeof(v_decl->'class') IS DISTINCT FROM 'string'
+       OR (v_decl ? 'description' AND jsonb_typeof(v_decl->'description') IS DISTINCT FROM 'string') THEN
+        po_data := util.result_error('membership:invalid',
+            'feature, act and class are required strings, and description is a string');
+        RETURN;
+    END IF;
+
+    v_feature := v_decl->>'feature';
+    v_act     := v_decl->>'act';
+    v_class   := v_decl->>'class';
+    v_desc    := COALESCE(trim(v_decl->>'description'), '');
+
+    IF NOT rolebyte.is_permission_feature(v_feature) THEN
+        po_data := util.result_error('membership:invalid',
+            'feature must be one or more lower-camel words joined by "/"');
+        RETURN;
+    END IF;
+    IF NOT rolebyte.is_permission_act(v_act) THEN
+        po_data := util.result_error('membership:invalid', 'act must be one lower-camel word');
+        RETURN;
+    END IF;
+    IF v_class NOT IN ('ordinary', 'tenantConfiguration', 'roleManagement') THEN
+        po_data := util.result_error('membership:invalid',
+            'class must be ordinary, tenantConfiguration or roleManagement');
+        RETURN;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM rolebyte.service WHERE key = v_service) THEN
+        po_data := util.result_error('membership:not_found', 'service is not registered');
+        RETURN;
+    END IF;
+    IF NOT rolebyte.is_permission_service(v_service) THEN
+        po_data := util.result_error('membership:invalid',
+            'this service key cannot open a permission: lower-case letters, digits and "-" only');
+        RETURN;
+    END IF;
+
+    v_name := v_service || '/' || v_feature || ':' || v_act;
+
+    SELECT * INTO v_row
+    FROM rolebyte.service_permission
+    WHERE service_key = v_service AND feature_key = v_feature AND act = v_act
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        INSERT INTO rolebyte.service_permission (id, service_key, feature_key, act, description, class)
+        VALUES (util.generate_ulid(), v_service, v_feature, v_act, v_desc, v_class)
+        ON CONFLICT (service_key, feature_key, act) DO NOTHING;
+        IF NOT FOUND THEN
+            -- A concurrent declaration of the same permission won the insert:
+            -- read what it stored and answer against that.
+            SELECT * INTO v_row
+            FROM rolebyte.service_permission
+            WHERE service_key = v_service AND feature_key = v_feature AND act = v_act
+            FOR UPDATE;
+        ELSE
+            INSERT INTO rolebyte.event (id, actor, kind, payload)
+            VALUES (util.generate_ulid(), v_actor, 'permissionDeclared',
+                    jsonb_build_object('service', v_service, 'permission', v_name, 'class', v_class));
+            po_data := util.result_success(jsonb_build_object('permission', v_name, 'status', 'added'));
+            RETURN;
+        END IF;
+    END IF;
+
+    IF v_row.class <> v_class THEN
+        po_data := util.result_error('membership:conflict',
+            format('%s is declared as %s, and a permission''s class never changes', v_name, v_row.class));
+        RETURN;
+    END IF;
+
+    IF v_row.description = v_desc THEN
+        po_data := util.result_success(jsonb_build_object('permission', v_name, 'status', 'unchanged'));
+        RETURN;
+    END IF;
+
+    UPDATE rolebyte.service_permission SET description = v_desc WHERE id = v_row.id;
+    INSERT INTO rolebyte.event (id, actor, kind, payload)
+    VALUES (util.generate_ulid(), v_actor, 'permissionDescribed',
+            jsonb_build_object('service', v_service, 'permission', v_name,
+                               'from', v_row.description, 'to', v_desc));
+    po_data := util.result_success(jsonb_build_object('permission', v_name, 'status', 'changed'));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.permission_declare(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.permission_declare(jsonb, jsonb) TO rolebyte_public;
 
 -- user_invite — a tenant admin adds a person by typed subject key, with the
 -- role grants they should hold, status `invited`. All requested roles are
@@ -1024,9 +1180,9 @@ REVOKE ALL ON PROCEDURE rolebyte.bootstrap_state(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.bootstrap_state(jsonb, jsonb) TO rolebyte_public;
 
 -- ---------------------------------------------------------------------------
--- Configuration transport. The role vocabulary (services and their role
--- definitions) and the tenant's display name travel in a configuration
--- document. The vocabulary is shared by every tenant on a deployment, so a
+-- Configuration transport. The vocabulary (services with their role
+-- definitions and the permissions they declare) and the tenant's display name
+-- travel in a configuration document. The vocabulary is shared by every tenant on a deployment, so a
 -- document only ever ADDS to it — defining what is missing, reporting what
 -- is already present — and never removes: retiring a role people may hold
 -- somewhere is an administration act performed in place, not a side effect
@@ -1034,7 +1190,7 @@ GRANT EXECUTE ON PROCEDURE rolebyte.bootstrap_state(jsonb, jsonb) TO rolebyte_pu
 -- ---------------------------------------------------------------------------
 
 -- config_get — the vocabulary as it travels: every service with its role
--- definitions, plus the asking tenant's display name.
+-- definitions and its permissions, plus the asking tenant's display name.
 CREATE OR REPLACE PROCEDURE rolebyte.config_get(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1067,7 +1223,16 @@ BEGIN
                               'description', d.description)
                               ORDER BY d.role_group, d.role_level), '[]'::jsonb)
                    FROM rolebyte.role_definition d
-                   WHERE d.service_key = s.key))
+                   WHERE d.service_key = s.key),
+               'permissions', (
+                   SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                              'feature',     p.feature_key,
+                              'act',         p.act,
+                              'description', p.description,
+                              'class',       p.class)
+                              ORDER BY p.feature_key, p.act), '[]'::jsonb)
+                   FROM rolebyte.service_permission p
+                   WHERE p.service_key = s.key))
                ORDER BY s.key), '[]'::jsonb)
     INTO v_services
     FROM rolebyte.service s;
@@ -1106,12 +1271,14 @@ DECLARE
     v_section  jsonb := pi_data->'section';
     v_svc      jsonb;
     v_role     jsonb;
+    v_perm     jsonb;
     v_out      jsonb;
     v_key      text;
     v_name     text;
     v_new_name text;
     v_svc_r    jsonb := '[]'::jsonb;
     v_roles_r  jsonb := '[]'::jsonb;
+    v_perms_r  jsonb := '[]'::jsonb;
     v_tenant_r jsonb := 'null'::jsonb;
     v_new_dir  text;
     v_dir_r    jsonb;
@@ -1171,6 +1338,28 @@ BEGIN
                     'level',   v_role->>'level',
                     'status',  CASE WHEN (v_out->'data'->>'created')::boolean THEN 'added' ELSE 'unchanged' END);
             END LOOP;
+
+            -- The service's permissions, declared through the same procedure a
+            -- direct declaration uses so the events land identically; one refused
+            -- entry rolls the whole section back.
+            IF v_svc ? 'permissions' AND jsonb_typeof(v_svc->'permissions') IS DISTINCT FROM 'array' THEN
+                RAISE EXCEPTION '%', util.result_error('membership:config_bad_document',
+                    format('the permissions of service %s must be an array', v_key)) USING errcode = 'P0001';
+            END IF;
+            FOR v_perm IN SELECT * FROM jsonb_array_elements(COALESCE(v_svc->'permissions', '[]'::jsonb)) LOOP
+                v_out := NULL;
+                CALL rolebyte.permission_declare(jsonb_build_object(
+                    'actor',      v_actor,
+                    'service',    v_key,
+                    'permission', v_perm), v_out);
+                IF v_out->>'result' IS DISTINCT FROM 'success' THEN
+                    RAISE EXCEPTION '%', v_out USING errcode = 'P0001';
+                END IF;
+                v_perms_r := v_perms_r || jsonb_build_object(
+                    'service',    v_key,
+                    'permission', v_out->'data'->>'permission',
+                    'status',     v_out->'data'->>'status');
+            END LOOP;
         END LOOP;
     END IF;
 
@@ -1211,9 +1400,10 @@ BEGIN
     END IF;
 
     po_data := util.result_success(jsonb_build_object(
-        'services', v_svc_r,
-        'roles',    v_roles_r,
-        'tenant',   v_tenant_r));
+        'services',    v_svc_r,
+        'roles',       v_roles_r,
+        'permissions', v_perms_r,
+        'tenant',      v_tenant_r));
 EXCEPTION
     WHEN sqlstate 'P0001' THEN
         RAISE;

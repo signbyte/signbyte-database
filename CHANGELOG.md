@@ -4,6 +4,36 @@ Notable changes to the signbyte database — the schema set and the migration im
 newest first, per release. Written for whoever applies the image to a database or
 integrates against the procedures.
 
+## v0.3.0
+
+### Added — `rolebyte.permission_declare`: a service declares the permissions it enforces
+
+A service could declare its roles (one `group:level` rung each) and nothing finer. It can now also
+declare **permissions**: one act on one feature, spelled `<service>/<feature path>:<act>`, for example
+`projects/task/attachment:deleteAny`. The feature path may nest, and nesting grants nothing. Declaring
+changes nothing that anybody holds: no role carries a permission and no token contains one yet.
+
+```
+{"actor":"…","service":"projects",
+ "permission":{"feature":"task/attachment","act":"deleteAny","description":"…","class":"ordinary"}}
+→ {"permission":"projects/task/attachment:deleteAny","status":"added"}
+```
+
+The status is `added`, `unchanged`, or `changed` for a new description. **A permission's `class`**
+(`ordinary` · `tenantConfiguration` · `roleManagement`) **never changes**: a declaration naming a
+different class is refused with `membership:conflict`, naming the permission. **An unknown property is
+refused** with `membership:invalid` rather than dropped. The configuration section carries
+`services[].permissions[]` beside `roles`: `config_get` answers it, and `config_apply` declares it and
+rolls the whole section back on any refused entry.
+
+New migration `rolebyte/V6__service_permission.sql`. It rewrites no row.
+
+### Changed — a role's group may no longer contain `/`
+
+`/` now marks a permission, so `rolebyte.role_define` refuses such a group with `membership:invalid`
+and the table checks it too. The migration confirms first that no existing role group contains one; if
+one does, it stops and says so rather than rewriting anything.
+
 ## v0.2.0
 
 ### Added — `rolebyte.user_list`: the tenant's people, by name, for a picker
