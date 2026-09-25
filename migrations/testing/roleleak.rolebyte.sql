@@ -35,8 +35,17 @@ BEGIN
     PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.assignment');
     PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.event');
     PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.service_permission');
+    PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.tenant_role');
+    PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.tenant_role_permission');
+    PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.tenant_role_assignment');
     PERFORM pg_temp.deny('rolebyte_public',
         'INSERT INTO rolebyte.tenant(id, name) VALUES (''x'', ''x'')');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'INSERT INTO rolebyte.tenant_role(id, tenant_id, name) VALUES (''x'', ''x'', ''x'')');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'INSERT INTO rolebyte.tenant_role_assignment(id, tenant_id, user_id, tenant_role_id) '
+        || 'VALUES (''x'', ''x'', ''x'', ''x'')');
+    PERFORM pg_temp.deny('rolebyte_public', 'DELETE FROM rolebyte.tenant_role_permission');
     PERFORM pg_temp.deny('rolebyte_public',
         'INSERT INTO rolebyte.service_permission(id, service_key, feature_key, act, class) '
         || 'VALUES (''x'', ''x'', ''x'', ''x'', ''ordinary'')');
@@ -52,6 +61,8 @@ BEGIN
     PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.user_account');
     PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.tenant');
     PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.service_permission');
+    PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.tenant_role');
+    PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.tenant_role_assignment');
 END $$;
 
 SELECT 'ROLELEAK: PASS — the register role is table-isolated, its history is append-only at the grant boundary, and no other service role reads the register' AS result;

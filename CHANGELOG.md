@@ -6,6 +6,34 @@ integrates against the procedures.
 
 ## v0.3.0
 
+### Added — a tenant defines its own roles
+
+A role was always a service's: one `group:level` rung, the same on every tenant. A tenant can now make
+**its own roles** out of the permissions services declare, name them as it names them, and change them at
+will. A tenant role is identified by its id; its name is a label, unique in the tenant ignoring case, and
+one role may hold permissions of several services. **Nothing a tenant role holds reaches a token yet**:
+`rolebyte.resolve` does not read the new tables.
+
+```
+rolebyte.tenant_role_define        {"actor":"…","tenantId":"…","name":"Manager"}
+  → {"id":"…","name":"Manager","description":"","permissions":[]}
+rolebyte.tenant_role_permissions_set {"actor":"…","tenantId":"…","roleId":"…",
+                                    "permissions":["projects/task:edit","projects/spentTime:view"]}
+  → {"id":"…","permissions":[…],"added":[…],"removed":[],"changed":true}
+```
+
+Beside them: `tenant_role_list`, `tenant_role_update` (rename; an absent description keeps the one there),
+`tenant_role_delete` (**refused with `membership:conflict` while anybody holds the role**), and
+`tenant_role_grant` / `tenant_role_revoke` by the role's id. A tick naming a permission nobody declared is
+`membership:unknown_permission` and changes nothing. A role of another tenant answers exactly as one that
+never existed. Every change is an attributed event under new kinds (`tenantRoleDefined` … `tenantRoleRevoked`),
+none of which carries a `service`.
+
+New migration `rolebyte/V7__tenant_role.sql`. It rewrites no row. It adds `UNIQUE (tenant_id, id)` to
+`rolebyte.user_account`, which refuses nothing and builds one index, so that a grant can reference a person
+and a role **together with their tenant**: a grant joining two tenants cannot be stored at all. Apply the
+schema before a rolebyte service that uses these procedures; an older service is unaffected.
+
 ### Added — `rolebyte.permission_declare`: a service declares the permissions it enforces
 
 A service could declare its roles (one `group:level` rung each) and nothing finer. It can now also
