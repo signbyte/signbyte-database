@@ -1607,8 +1607,9 @@ REVOKE ALL ON PROCEDURE rolebyte.tenant_role_permissions_set(jsonb, jsonb) FROM 
 GRANT EXECUTE ON PROCEDURE rolebyte.tenant_role_permissions_set(jsonb, jsonb) TO rolebyte_public;
 
 -- tenant_role_delete — remove a role nobody holds. A role held by any member
--- whose access has not been revoked is refused with the count: deleting it
--- would take access away from people with no way back. The role's ticks and its
+-- whose access has not been revoked, or placed by a member service on its own
+-- objects, is refused with the counts: deleting it would take access away from
+-- people with no way back. The role's ticks and its
 -- ended grants go with it; the history keeps all of them. Emits
 -- `tenantRoleDeleted` carrying what the role held.
 CREATE OR REPLACE PROCEDURE rolebyte.tenant_role_delete(IN pi_data jsonb, INOUT po_data jsonb)
@@ -1622,6 +1623,8 @@ DECLARE
     v_role   text;
     v_row    rolebyte.tenant_role%ROWTYPE;
     v_held   int;
+    v_placed bigint;
+    v_by     text;
     v_perms  jsonb;
 BEGIN
     v_actor  := NULLIF(trim(pi_data->>'actor'), '');
@@ -1632,7 +1635,8 @@ BEGIN
         RETURN;
     END IF;
 
-    -- The lock also holds off a grant of this role until the delete has decided.
+    -- The lock also holds off a grant of this role, and a report of it placed,
+    -- until the delete has decided.
     SELECT * INTO v_row
       FROM rolebyte.tenant_role
      WHERE id = v_role AND tenant_id = v_tenant
@@ -1648,15 +1652,39 @@ BEGIN
      WHERE a.tenant_role_id = v_row.id
        AND a.state = 'granted'
        AND u.status <> 'revoked';
-    IF v_held > 0 THEN
+
+    -- Placed elsewhere counts as in use, as long as the service that placed it
+    -- is still a member here; a retired service's count no longer holds a role.
+    SELECT COALESCE(sum(p.placements), 0),
+           string_agg(DISTINCT u.display_name, ', ' ORDER BY u.display_name)
+      INTO v_placed, v_by
+      FROM rolebyte.tenant_role_placement p
+      JOIN rolebyte.user_account u ON u.id = p.reporter_id
+     WHERE p.tenant_role_id = v_row.id
+       AND u.status = 'active';
+
+    IF v_held > 0 AND v_placed > 0 THEN
+        po_data := util.result_error('membership:conflict',
+            format('this role is held by %s %s and placed %s %s by %s; revoke it and move those placements first',
+                   v_held, CASE WHEN v_held = 1 THEN 'person' ELSE 'people' END,
+                   v_placed, CASE WHEN v_placed = 1 THEN 'time' ELSE 'times' END, v_by));
+        RETURN;
+    ELSIF v_held > 0 THEN
         po_data := util.result_error('membership:conflict',
             format('this role is held by %s %s; revoke it from them first',
                    v_held, CASE WHEN v_held = 1 THEN 'person' ELSE 'people' END));
+        RETURN;
+    ELSIF v_placed > 0 THEN
+        po_data := util.result_error('membership:conflict',
+            format('this role is placed %s %s by %s; move those placements to another role first',
+                   v_placed, CASE WHEN v_placed = 1 THEN 'time' ELSE 'times' END, v_by));
         RETURN;
     END IF;
 
     v_perms := rolebyte.tenant_role_permission_names(v_row.id);
 
+    -- What is left is a retired service's count, which goes with the role.
+    DELETE FROM rolebyte.tenant_role_placement WHERE tenant_role_id = v_row.id;
     DELETE FROM rolebyte.tenant_role_assignment WHERE tenant_role_id = v_row.id;
     DELETE FROM rolebyte.tenant_role_permission WHERE tenant_role_id = v_row.id;
     DELETE FROM rolebyte.tenant_role WHERE id = v_row.id;
@@ -1807,6 +1835,168 @@ $$;
 
 REVOKE ALL ON PROCEDURE rolebyte.tenant_role_revoke(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.tenant_role_revoke(jsonb, jsonb) TO rolebyte_public;
+
+-- ---------------------------------------------------------------------------
+-- Placement elsewhere. A service that owns its own objects places the tenant's
+-- roles on them and keeps those placements itself. It copies what each role
+-- carries, so that checking a person on one of its objects is a local read, and
+-- asks again to learn of a change. In return it reports how many placements of
+-- each role it holds, so a role in use is not deleted from under its people.
+-- ---------------------------------------------------------------------------
+
+-- tenant_role_definitions — the tenant's roles as a service that places them
+-- needs them: each role's id, its labels, and the permissions it carries in this
+-- tenant. Those are its ticks narrowed to what the tenant has, the same filter
+-- resolve applies to a person granted the role across the tenant, so a role
+-- placed on one object never carries more than the same role granted everywhere.
+-- Roles in id order, permissions in byte order, so the same state always reads
+-- the same whatever the database's collation. Names no person.
+CREATE OR REPLACE PROCEDURE rolebyte.tenant_role_definitions(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_tenant text;
+    v_roles  jsonb;
+BEGIN
+    v_tenant := NULLIF(trim(pi_data->>'tenantId'), '');
+    IF v_tenant IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'tenantId is required');
+        RETURN;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM rolebyte.tenant WHERE id = v_tenant) THEN
+        po_data := util.result_error('tenant:not_found', 'tenant does not exist');
+        RETURN;
+    END IF;
+
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+               'id',          r.id,
+               'name',        r.name,
+               'description', r.description,
+               'permissions', COALESCE((
+                   SELECT jsonb_agg(p.name ORDER BY p.name COLLATE "C")
+                     FROM (
+                         SELECT sp.service_key || '/' || sp.feature_key || ':' || sp.act AS name
+                           FROM rolebyte.tenant_role_permission tp
+                           JOIN rolebyte.service_permission sp ON sp.id = tp.permission_id
+                          WHERE tp.tenant_role_id = r.id
+                            AND EXISTS (
+                                SELECT 1 FROM rolebyte.tenant_entitlement e
+                                 WHERE e.tenant_id = r.tenant_id
+                                   AND e.service_key = sp.service_key
+                                   AND e.state = 'entitled'
+                                   AND (e.feature_key = ''
+                                        OR sp.feature_key = e.feature_key
+                                        OR starts_with(sp.feature_key, e.feature_key || '/')))
+                     ) p
+               ), '[]'::jsonb)
+           ) ORDER BY r.id COLLATE "C"), '[]'::jsonb)
+      INTO v_roles
+      FROM rolebyte.tenant_role r
+     WHERE r.tenant_id = v_tenant;
+
+    po_data := util.result_success(jsonb_build_object('tenantId', v_tenant, 'roles', v_roles));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.tenant_role_definitions(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.tenant_role_definitions(jsonb, jsonb) TO rolebyte_public;
+
+-- tenant_role_placements_set — a service reports how many times it has placed
+-- each of the tenant's roles, as one whole set that replaces its last report; a
+-- role left out counts zero. The reporter is the service's own member row in the
+-- tenant, which the caller takes from the verified token and never from what the
+-- service sent. Every count is checked before anything is written.
+--
+-- An id that is not one of this tenant's roles is never stored. It is answered
+-- back under `unknown`, which is how a service learns that it placed a role
+-- deleted a moment before. The roles named are locked against a delete until the
+-- report commits, so a report and a delete of the same role never both win: the
+-- one that goes second sees the other.
+CREATE OR REPLACE PROCEDURE rolebyte.tenant_role_placements_set(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_tenant   text;
+    v_reporter text;
+    v_set      jsonb;
+    v_entry    record;
+    v_known    text[];
+    v_unknown  jsonb;
+BEGIN
+    v_tenant   := NULLIF(trim(pi_data->>'tenantId'), '');
+    v_reporter := NULLIF(trim(pi_data->>'reporterId'), '');
+    v_set      := pi_data->'placements';
+    IF v_tenant IS NULL OR v_reporter IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'tenantId and reporterId are required');
+        RETURN;
+    END IF;
+    IF v_set IS NULL OR jsonb_typeof(v_set) <> 'object' THEN
+        po_data := util.result_error('membership:invalid', 'placements must map role ids to counts');
+        RETURN;
+    END IF;
+
+    FOR v_entry IN SELECT key, value FROM jsonb_each(v_set) LOOP
+        IF jsonb_typeof(v_entry.value) <> 'number'
+           OR (v_entry.value #>> '{}')::numeric < 0
+           OR (v_entry.value #>> '{}')::numeric <> trunc((v_entry.value #>> '{}')::numeric)
+           OR (v_entry.value #>> '{}')::numeric > 2147483647 THEN
+            po_data := util.result_error('membership:invalid',
+                format('the count for %s must be a whole number, zero or more', left(v_entry.key, 64)));
+            RETURN;
+        END IF;
+    END LOOP;
+
+    -- The second layer under the caller's own check: only an active member of
+    -- this tenant reports for it.
+    IF NOT EXISTS (SELECT 1 FROM rolebyte.user_account u
+                    WHERE u.id = v_reporter AND u.tenant_id = v_tenant AND u.status = 'active') THEN
+        po_data := util.result_error('membership:notMember', 'the reporter is not a member of this tenant');
+        RETURN;
+    END IF;
+
+    SELECT COALESCE(array_agg(r.id), '{}')
+      INTO v_known
+      FROM (SELECT r.id
+              FROM rolebyte.tenant_role r
+             WHERE r.tenant_id = v_tenant
+               AND r.id IN (SELECT jsonb_object_keys(v_set))
+               FOR KEY SHARE) r;
+
+    SELECT COALESCE(jsonb_agg(k ORDER BY k COLLATE "C"), '[]'::jsonb)
+      INTO v_unknown
+      FROM jsonb_object_keys(v_set) k
+     WHERE k <> ALL (v_known);
+
+    DELETE FROM rolebyte.tenant_role_placement
+     WHERE tenant_id = v_tenant AND reporter_id = v_reporter;
+
+    INSERT INTO rolebyte.tenant_role_placement (tenant_id, tenant_role_id, reporter_id, placements)
+    SELECT v_tenant, e.key, v_reporter, (e.value #>> '{}')::integer
+      FROM jsonb_each(v_set) e
+     WHERE e.key = ANY (v_known)
+       AND (e.value #>> '{}')::integer > 0;
+
+    po_data := util.result_success(jsonb_build_object('unknown', v_unknown));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.tenant_role_placements_set(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.tenant_role_placements_set(jsonb, jsonb) TO rolebyte_public;
 
 -- ---------------------------------------------------------------------------
 -- Configuration transport. The vocabulary (services with their role

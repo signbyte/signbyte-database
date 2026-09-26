@@ -6,6 +6,22 @@ integrates against the procedures.
 
 ## v0.3.0
 
+### Added — a service that places a tenant's roles reads them, and a role in use cannot be deleted
+
+A member service that places the tenant's roles on its own objects reads what each role carries with the new
+`rolebyte.tenant_role_definitions`: each role's id, name and description, and its permissions narrowed to what the
+tenant has. It reports how many times it placed each role with the new `rolebyte.tenant_role_placements_set`,
+stored in the new table `rolebyte.tenant_role_placement` (migration `V9`, a new empty table).
+
+```
+CALL rolebyte.tenant_role_definitions('{"tenantId":"01J…"}'::jsonb, NULL);
+CALL rolebyte.tenant_role_placements_set('{"tenantId":"01J…","reporterId":"01J…","placements":{"01J…":12}}'::jsonb, NULL);
+```
+
+**Changed:** `rolebyte.tenant_role_delete` now also refuses a role that an active member service reports placed,
+with `membership:conflict` and the count. Nothing to do on upgrade: until a service reports a placement, every
+delete answers as before.
+
 ### Added — what a tenant has decides which of its roles' permissions reach a token
 
 A tenant now has a part of the catalog services declare: a whole service, or one feature of it, recorded in
