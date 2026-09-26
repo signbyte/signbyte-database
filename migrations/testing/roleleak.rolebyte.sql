@@ -52,6 +52,17 @@ BEGIN
     PERFORM pg_temp.deny('rolebyte_public',
         'INSERT INTO rolebyte.user_account(id, tenant_id, subject_key, display_name) '
         || 'VALUES (''x'', ''x'', ''svc:x'', ''x'')');
+    -- what a tenant has is the operator's to write: the register's own role can neither
+    -- read nor write the table, nor run the procedures that do.
+    PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.tenant_entitlement');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'INSERT INTO rolebyte.tenant_entitlement(id, tenant_id, service_key) VALUES (''x'', ''x'', ''x'')');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'CALL rolebyte.entitlement_grant(''{"actor":"x","tenantId":"x","service":"x"}''::jsonb, NULL::jsonb)');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'CALL rolebyte.entitlement_revoke(''{"actor":"x","tenantId":"x","service":"x"}''::jsonb, NULL::jsonb)');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'CALL rolebyte.entitlement_list(''{"tenantId":"x"}''::jsonb, NULL::jsonb)');
     -- the history is append-only at the grant boundary, even for the register's own role.
     PERFORM pg_temp.deny('rolebyte_public', 'UPDATE rolebyte.event SET kind = ''x''');
     PERFORM pg_temp.deny('rolebyte_public', 'DELETE FROM rolebyte.event');
@@ -63,6 +74,7 @@ BEGIN
     PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.service_permission');
     PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.tenant_role');
     PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.tenant_role_assignment');
+    PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.tenant_entitlement');
 END $$;
 
 SELECT 'ROLELEAK: PASS — the register role is table-isolated, its history is append-only at the grant boundary, and no other service role reads the register' AS result;

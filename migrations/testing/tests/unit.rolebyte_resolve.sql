@@ -128,6 +128,10 @@ BEGIN
     v_ta := pg_temp.ok('tenant_create', '{"actor":"resolve-test","name":"Resolve A"}', 'tenant A')->>'id';
     v_tb := pg_temp.ok('tenant_create', '{"actor":"resolve-test","name":"Resolve B"}', 'tenant B')->>'id';
     v_tc := pg_temp.ok('tenant_create', '{"actor":"resolve-test","name":"Resolve C"}', 'tenant C')->>'id';
+    -- Tenant A has both services, so its roles' ticks reach the answer. What an
+    -- entitlement withholds is unit.rolebyte_entitlement's.
+    PERFORM pg_temp.ok('entitlement_grant', jsonb_build_object('actor', 'op:resolve-test', 'tenantId', v_ta, 'service', 'rsdemo'), 'entitle A rsdemo');
+    PERFORM pg_temp.ok('entitlement_grant', jsonb_build_object('actor', 'op:resolve-test', 'tenantId', v_ta, 'service', 'rsaddon'), 'entitle A rsaddon');
 
     -- Eleven people in tenant A, each claimed (active) unless stated.
     --  1 service roles only (two of one group, one of another)

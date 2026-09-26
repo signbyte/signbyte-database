@@ -108,6 +108,10 @@ BEGIN
 
     v_ta := pg_temp.ok('tenant_create', '{"actor":"tenant-role-test","name":"Tenant roles A"}', 'tenant A')->>'id';
     v_tb := pg_temp.ok('tenant_create', '{"actor":"tenant-role-test","name":"Tenant roles B"}', 'tenant B')->>'id';
+    -- Tenant A has both services, so a granted role's ticks reach what its holder
+    -- resolves to. What an entitlement withholds is unit.rolebyte_entitlement's.
+    PERFORM pg_temp.ok('entitlement_grant', jsonb_build_object('actor', 'op:tenant-role-test', 'tenantId', v_ta, 'service', 'trdemo'), 'entitle A trdemo');
+    PERFORM pg_temp.ok('entitlement_grant', jsonb_build_object('actor', 'op:tenant-role-test', 'tenantId', v_ta, 'service', 'traddon'), 'entitle A traddon');
     v_pa1 := pg_temp.ok('user_invite', jsonb_build_object('actor', 'adm-a', 'tenantId', v_ta,
         'subjectKey', 'sub:' || util.generate_ulid(), 'displayName', 'A member', 'roles', '[]'::jsonb), 'invite pa1')->>'id';
     v_pa2 := pg_temp.ok('user_invite', jsonb_build_object('actor', 'adm-a', 'tenantId', v_ta,

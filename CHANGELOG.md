@@ -6,6 +6,24 @@ integrates against the procedures.
 
 ## v0.3.0
 
+### Added — what a tenant has decides which of its roles' permissions reach a token
+
+A tenant now has a part of the catalog services declare: a whole service, or one feature of it, recorded in
+the new table `rolebyte.tenant_entitlement` (migration `V8`, a new empty table). A permission a tenant role ticks
+reaches `rolebyte.resolve` only while the tenant has its feature; a feature covers the features nested under it.
+
+```
+CALL rolebyte.entitlement_grant('{"actor":"op:you","tenantId":"01J…","service":"projects"}'::jsonb, NULL);
+CALL rolebyte.entitlement_revoke('{"actor":"op:you","tenantId":"01J…","service":"projects"}'::jsonb, NULL);
+CALL rolebyte.entitlement_list('{"tenantId":"01J…"}'::jsonb, NULL);
+```
+
+Revoking deletes nothing the tenant configured: its roles keep their permissions, which come back when the
+entitlement does. The three procedures are **not** granted to `rolebyte_public`; the deployment's operator calls
+them as the location's owner. A service's `group:level` role is never filtered, so **a person holding no tenant
+role resolves exactly as before**. **If you grant tenant roles:** entitle each such tenant after applying this
+image, or its roles' permissions stop reaching tokens.
+
 ### Changed — `rolebyte.resolve` answers what a granted tenant role holds
 
 Each membership's `scopes` now carries every permission a granted tenant role of that membership ticks,

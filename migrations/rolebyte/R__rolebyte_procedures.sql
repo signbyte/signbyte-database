@@ -973,6 +973,12 @@ GRANT EXECUTE ON PROCEDURE rolebyte.user_revoke(jsonb, jsonb) TO rolebyte_public
 -- resolves exactly as before tenant roles existed, and a box ticked by two roles
 -- appears once. The two kinds cannot collide: a permission always carries a `/`
 -- and a role's group never does.
+--
+-- A tick reaches the answer only while the tenant has its feature: an
+-- entitlement to the whole service, to the feature itself, or to a feature it is
+-- nested under. Without one the tick is simply absent — the role keeps it, so it
+-- returns unchanged when the entitlement does. A service's role is not a catalog
+-- permission and is never filtered.
 CREATE OR REPLACE PROCEDURE rolebyte.resolve(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1013,6 +1019,14 @@ BEGIN
                     JOIN rolebyte.tenant_role_permission tp ON tp.tenant_role_id = ta.tenant_role_id
                     JOIN rolebyte.service_permission sp ON sp.id = tp.permission_id
                     WHERE ta.user_id = u.id AND ta.tenant_id = u.tenant_id AND ta.state = 'granted'
+                      AND EXISTS (
+                          SELECT 1 FROM rolebyte.tenant_entitlement e
+                           WHERE e.tenant_id = u.tenant_id
+                             AND e.service_key = sp.service_key
+                             AND e.state = 'entitled'
+                             AND (e.feature_key = ''
+                                  OR sp.feature_key = e.feature_key
+                                  OR starts_with(sp.feature_key, e.feature_key || '/')))
                 ) s
             ), '[]'::jsonb)
         ) AS m
@@ -2029,3 +2043,201 @@ $$;
 
 REVOKE ALL ON PROCEDURE rolebyte.config_apply(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.config_apply(jsonb, jsonb) TO rolebyte_public;
+
+-- ===========================================================================
+-- Entitlement: what a tenant has, read by resolve. Written only by the
+-- deployment's operator — none of these is granted to the register's own role,
+-- so no request a tenant can make, through any route, reaches them. The
+-- operator calls them as the location's owner, the way a deployment creates a
+-- tenant and registers what its services declare.
+--
+-- A write reaches the next token within the resolve cache's lifetime: the
+-- service's cache is not told, because the service is not the one writing.
+-- ===========================================================================
+
+-- entitlement_refusal — the one check an entitlement write makes before it
+-- names anything: the tenant exists, the service is registered, and the feature
+-- is empty (the whole service) or one that a permission of the service carries,
+-- itself or nested under it. A typo is refused rather than stored as an
+-- entitlement to nothing. NULL when everything holds.
+CREATE OR REPLACE FUNCTION rolebyte.entitlement_refusal(p_tenant text, p_service text, p_feature text)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SET search_path = rolebyte, util, pg_temp
+AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM rolebyte.tenant WHERE id = p_tenant) THEN
+        RETURN util.result_error('membership:not_found', 'no such tenant');
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM rolebyte.service WHERE key = p_service) THEN
+        RETURN util.result_error('membership:not_found', 'service is not registered');
+    END IF;
+    IF p_feature = '' THEN
+        RETURN NULL;
+    END IF;
+    IF rolebyte.is_permission_feature(p_feature) IS NOT TRUE THEN
+        RETURN util.result_error('membership:invalid',
+            'feature must be empty or one or more lower-camel words joined by "/"');
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM rolebyte.service_permission
+                    WHERE service_key = p_service
+                      AND (feature_key = p_feature OR starts_with(feature_key, p_feature || '/'))) THEN
+        RETURN util.result_error('membership:not_found', 'no permission of this service has this feature');
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION rolebyte.entitlement_refusal(text, text, text) FROM PUBLIC;
+
+-- entitlement_grant — give a tenant a whole service (`feature` absent or empty)
+-- or one feature of it. Entitling again after a revoke flips it back; entitling
+-- what the tenant already has changes nothing. Emits `tenantEntitled`.
+CREATE OR REPLACE PROCEDURE rolebyte.entitlement_grant(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_actor   text;
+    v_tenant  text;
+    v_service text;
+    v_feature text;
+    v_refusal jsonb;
+    v_changed boolean := false;
+BEGIN
+    v_actor   := NULLIF(trim(pi_data->>'actor'), '');
+    v_tenant  := NULLIF(trim(pi_data->>'tenantId'), '');
+    v_service := NULLIF(trim(pi_data->>'service'), '');
+    v_feature := COALESCE(trim(pi_data->>'feature'), '');
+    IF v_actor IS NULL OR v_tenant IS NULL OR v_service IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'actor, tenantId and service are required');
+        RETURN;
+    END IF;
+
+    v_refusal := rolebyte.entitlement_refusal(v_tenant, v_service, v_feature);
+    IF v_refusal IS NOT NULL THEN
+        po_data := v_refusal;
+        RETURN;
+    END IF;
+
+    INSERT INTO rolebyte.tenant_entitlement (id, tenant_id, service_key, feature_key)
+    VALUES (util.generate_ulid(), v_tenant, v_service, v_feature)
+    ON CONFLICT (tenant_id, service_key, feature_key)
+        DO UPDATE SET state = 'entitled', entitled_at = now(), revoked_at = NULL
+        WHERE rolebyte.tenant_entitlement.state = 'revoked';
+    v_changed := FOUND;
+
+    IF v_changed THEN
+        INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+        VALUES (util.generate_ulid(), v_actor, v_tenant, NULL, 'tenantEntitled',
+                jsonb_build_object('service', v_service, 'feature', v_feature));
+    END IF;
+
+    po_data := util.result_success(jsonb_build_object('changed', v_changed));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.entitlement_grant(jsonb, jsonb) FROM PUBLIC;
+
+-- entitlement_revoke — take an entitlement away. Nothing the tenant configured
+-- is deleted: its roles keep their ticks, which stop reaching tokens. Revoking
+-- what is already revoked changes nothing; revoking what the tenant was never
+-- given is refused, so a mistyped name cannot look like a revoke that happened.
+-- Emits `tenantEntitlementRevoked`.
+CREATE OR REPLACE PROCEDURE rolebyte.entitlement_revoke(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_actor   text;
+    v_tenant  text;
+    v_service text;
+    v_feature text;
+    v_changed boolean := false;
+BEGIN
+    v_actor   := NULLIF(trim(pi_data->>'actor'), '');
+    v_tenant  := NULLIF(trim(pi_data->>'tenantId'), '');
+    v_service := NULLIF(trim(pi_data->>'service'), '');
+    v_feature := COALESCE(trim(pi_data->>'feature'), '');
+    IF v_actor IS NULL OR v_tenant IS NULL OR v_service IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'actor, tenantId and service are required');
+        RETURN;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM rolebyte.tenant_entitlement
+                    WHERE tenant_id = v_tenant AND service_key = v_service AND feature_key = v_feature) THEN
+        po_data := util.result_error('membership:not_found', 'the tenant was never given this');
+        RETURN;
+    END IF;
+
+    UPDATE rolebyte.tenant_entitlement
+       SET state = 'revoked', revoked_at = now()
+     WHERE tenant_id = v_tenant AND service_key = v_service AND feature_key = v_feature
+       AND state = 'entitled';
+    v_changed := FOUND;
+
+    IF v_changed THEN
+        INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+        VALUES (util.generate_ulid(), v_actor, v_tenant, NULL, 'tenantEntitlementRevoked',
+                jsonb_build_object('service', v_service, 'feature', v_feature));
+    END IF;
+
+    po_data := util.result_success(jsonb_build_object('changed', v_changed));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.entitlement_revoke(jsonb, jsonb) FROM PUBLIC;
+
+-- entitlement_list — what a tenant has now: each entitlement in force, a whole
+-- service as an empty feature, in a stable order.
+CREATE OR REPLACE PROCEDURE rolebyte.entitlement_list(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_tenant text;
+    v_items  jsonb;
+BEGIN
+    v_tenant := NULLIF(trim(pi_data->>'tenantId'), '');
+    IF v_tenant IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'tenantId is required');
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM rolebyte.tenant WHERE id = v_tenant) THEN
+        po_data := util.result_error('membership:not_found', 'no such tenant');
+        RETURN;
+    END IF;
+
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'service',    e.service_key,
+        'feature',    e.feature_key,
+        'entitledAt', e.entitled_at
+    ) ORDER BY e.service_key, e.feature_key), '[]'::jsonb)
+    INTO v_items
+    FROM rolebyte.tenant_entitlement e
+    WHERE e.tenant_id = v_tenant AND e.state = 'entitled';
+
+    po_data := util.result_success(jsonb_build_object('entitlements', v_items));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.entitlement_list(jsonb, jsonb) FROM PUBLIC;
