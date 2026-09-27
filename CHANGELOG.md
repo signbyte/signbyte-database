@@ -6,6 +6,29 @@ integrates against the procedures.
 
 ## v0.3.0
 
+### Changed — a declared permission says where it may be granted, carries a label per language, and can be retired
+
+Migration `V11` adds three columns to `rolebyte.service_permission` without rewriting it.
+
+**A declaration without `plane` is now refused**, so a service that declares permissions must send it from the
+same release as this image. `plane` is `tenant` (granted to the whole tenant) or `object` (placed on one object the
+service owns), and like `class` it never changes: naming the other one is refused with `membership:conflict`. A
+permission declared before this migration takes its plane from its next declaration.
+
+`labels` is an optional map from a language tag to a label (`{"lv": "…"}`); `description` stays the fallback. A
+declaration with `"retired": true` retires the permission, and one without the mark brings it back. A retired
+permission keeps working for every tenant role that already ticks it, cannot be added to any other
+(`membership:invalid`, *"‹permission› is retired: a role that holds it keeps it, and no role can be given it
+again"*), and no longer reaches a tenant's administrators. The configuration section answers and accepts all three,
+so an export applied back changes nothing.
+
+```
+CALL rolebyte.permission_declare('{"actor":"svc:you","service":"work","permission":
+      {"feature":"task/comment","act":"add","class":"ordinary","plane":"object",
+       "labels":{"lv":"Komentēt uzdevumu"}}}'::jsonb, NULL);
+→ {"permission":"work/task/comment:add","status":"added"}
+```
+
 ### Added — a tenant keeps its last administrator, and the operator has a way back
 
 A tenant's administrator is a member holding the `membership:admin` role whose access is not revoked. Revoking

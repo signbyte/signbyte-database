@@ -101,10 +101,10 @@ BEGIN
     -- Two services declare what a role may tick: a role spans both.
     PERFORM pg_temp.ok('service_register', '{"actor":"tenant-role-test","service":"trdemo","displayName":"Work"}', 'register trdemo');
     PERFORM pg_temp.ok('service_register', '{"actor":"tenant-role-test","service":"traddon","displayName":"People"}', 'register traddon');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"tenant-role-test","service":"trdemo","permission":{"feature":"task","act":"view","class":"ordinary"}}', 'declare task:view');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"tenant-role-test","service":"trdemo","permission":{"feature":"task","act":"edit","class":"ordinary"}}', 'declare task:edit');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"tenant-role-test","service":"trdemo","permission":{"feature":"task/attachment","act":"deleteAny","class":"ordinary"}}', 'declare attachment:deleteAny');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"tenant-role-test","service":"traddon","permission":{"feature":"workforce/person","act":"view","class":"ordinary"}}', 'declare person:view');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"tenant-role-test","service":"trdemo","permission":{"feature":"task","act":"view","class":"ordinary","plane":"object"}}', 'declare task:view');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"tenant-role-test","service":"trdemo","permission":{"feature":"task","act":"edit","class":"ordinary","plane":"object"}}', 'declare task:edit');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"tenant-role-test","service":"trdemo","permission":{"feature":"task/attachment","act":"deleteAny","class":"ordinary","plane":"object"}}', 'declare attachment:deleteAny');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"tenant-role-test","service":"traddon","permission":{"feature":"workforce/person","act":"view","class":"ordinary","plane":"object"}}', 'declare person:view');
 
     v_ta := pg_temp.ok('tenant_create', '{"actor":"tenant-role-test","name":"Tenant roles A"}', 'tenant A')->>'id';
     v_tb := pg_temp.ok('tenant_create', '{"actor":"tenant-role-test","name":"Tenant roles B"}', 'tenant B')->>'id';

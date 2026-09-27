@@ -153,10 +153,10 @@ BEGIN
     PERFORM pg_temp.ok('service_register', '{"actor":"adm-test","service":"adpeople","displayName":"People"}', 'register adpeople');
     PERFORM pg_temp.ok('service_register', '{"actor":"adm-test","service":"adbare","displayName":"Bare"}', 'register adbare');
     PERFORM pg_temp.ok('role_define', '{"actor":"adm-test","service":"adsvc","group":"adsvc","level":"read"}', 'define adsvc:read');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"adm-test","service":"adsvc","permission":{"feature":"task","act":"view","class":"ordinary"}}', 'declare task:view');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"adm-test","service":"adsvc","permission":{"feature":"setup","act":"edit","class":"tenantConfiguration"}}', 'declare setup:edit');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"adm-test","service":"adsvc","permission":{"feature":"access","act":"assign","class":"roleManagement"}}', 'declare access:assign');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"adm-test","service":"adpeople","permission":{"feature":"person","act":"view","class":"ordinary"}}', 'declare person:view');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"adm-test","service":"adsvc","permission":{"feature":"task","act":"view","class":"ordinary","plane":"object"}}', 'declare task:view');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"adm-test","service":"adsvc","permission":{"feature":"setup","act":"edit","class":"tenantConfiguration","plane":"tenant"}}', 'declare setup:edit');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"adm-test","service":"adsvc","permission":{"feature":"access","act":"assign","class":"roleManagement","plane":"tenant"}}', 'declare access:assign');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"adm-test","service":"adpeople","permission":{"feature":"person","act":"view","class":"ordinary","plane":"object"}}', 'declare person:view');
 
     -- 6. The operator opens two tenants, each with its first administrator.
     v := pg_temp.ok('tenant_open', jsonb_build_object('actor', 'op:test', 'name', 'Administrator A',
@@ -283,7 +283,7 @@ BEGIN
     PERFORM pg_temp.holds_exactly(pg_temp.scopes(v_s[1], v_ta),
         ARRAY['membership:admin', 'adsvc/task:view', 'adsvc/setup:edit', 'adsvc/access:assign'], 'Anna, adsvc entitled');
     --    A box declared later reaches her with no write.
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"adm-test","service":"adsvc","permission":{"feature":"report","act":"export","class":"ordinary"}}', 'declare report:export');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"adm-test","service":"adsvc","permission":{"feature":"report","act":"export","class":"ordinary","plane":"object"}}', 'declare report:export');
     PERFORM pg_temp.ok('entitlement_grant', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta, 'service', 'adpeople'), 'entitle A adpeople');
     v_full := pg_temp.scopes(v_s[1], v_ta);
     PERFORM pg_temp.holds_exactly(v_full, ARRAY['membership:admin', 'adsvc/task:view', 'adsvc/setup:edit',

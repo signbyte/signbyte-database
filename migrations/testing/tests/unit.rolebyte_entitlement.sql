@@ -136,11 +136,11 @@ BEGIN
     PERFORM pg_temp.ok('service_register', '{"actor":"ent-test","service":"esaddon","displayName":"People"}', 'register esaddon');
     PERFORM pg_temp.ok('service_register', '{"actor":"ent-test","service":"esother","displayName":"Other"}', 'register esother');
     PERFORM pg_temp.ok('role_define', '{"actor":"ent-test","service":"esdemo","group":"esdemo","level":"read"}', 'define esdemo:read');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"ent-test","service":"esdemo","permission":{"feature":"task","act":"view","class":"ordinary"}}', 'declare task:view');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"ent-test","service":"esdemo","permission":{"feature":"task/attachment","act":"delete","class":"ordinary"}}', 'declare attachment:delete');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"ent-test","service":"esdemo","permission":{"feature":"spentTime","act":"view","class":"ordinary"}}', 'declare spentTime:view');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"ent-test","service":"esaddon","permission":{"feature":"workforce/person","act":"view","class":"ordinary"}}', 'declare person:view');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"ent-test","service":"esother","permission":{"feature":"spentTime","act":"view","class":"ordinary"}}', 'declare other spentTime:view');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"ent-test","service":"esdemo","permission":{"feature":"task","act":"view","class":"ordinary","plane":"object"}}', 'declare task:view');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"ent-test","service":"esdemo","permission":{"feature":"task/attachment","act":"delete","class":"ordinary","plane":"object"}}', 'declare attachment:delete');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"ent-test","service":"esdemo","permission":{"feature":"spentTime","act":"view","class":"ordinary","plane":"object"}}', 'declare spentTime:view');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"ent-test","service":"esaddon","permission":{"feature":"workforce/person","act":"view","class":"ordinary","plane":"object"}}', 'declare person:view');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"ent-test","service":"esother","permission":{"feature":"spentTime","act":"view","class":"ordinary","plane":"object"}}', 'declare other spentTime:view');
 
     v_ta := pg_temp.ok('tenant_create', '{"actor":"ent-test","name":"Entitlement A"}', 'tenant A')->>'id';
     v_tb := pg_temp.ok('tenant_create', '{"actor":"ent-test","name":"Entitlement B"}', 'tenant B')->>'id';

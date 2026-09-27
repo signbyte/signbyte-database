@@ -123,9 +123,9 @@ BEGIN
     PERFORM pg_temp.ok('role_define', '{"actor":"resolve-test","service":"rsdemo","group":"rsdemo","level":"read"}', 'define rsdemo:read');
     PERFORM pg_temp.ok('role_define', '{"actor":"resolve-test","service":"rsdemo","group":"rsdemo","level":"write"}', 'define rsdemo:write');
     PERFORM pg_temp.ok('role_define', '{"actor":"resolve-test","service":"rsdemo","group":"rsreport","level":"view"}', 'define rsreport:view');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"resolve-test","service":"rsdemo","permission":{"feature":"task","act":"view","class":"ordinary"}}', 'declare task:view');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"resolve-test","service":"rsdemo","permission":{"feature":"spentTime","act":"view","class":"ordinary"}}', 'declare spentTime:view');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"resolve-test","service":"rsaddon","permission":{"feature":"workforce/person","act":"view","class":"ordinary"}}', 'declare person:view');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"resolve-test","service":"rsdemo","permission":{"feature":"task","act":"view","class":"ordinary","plane":"object"}}', 'declare task:view');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"resolve-test","service":"rsdemo","permission":{"feature":"spentTime","act":"view","class":"ordinary","plane":"object"}}', 'declare spentTime:view');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"resolve-test","service":"rsaddon","permission":{"feature":"workforce/person","act":"view","class":"ordinary","plane":"object"}}', 'declare person:view');
 
     v_ta := pg_temp.ok('tenant_create', '{"actor":"resolve-test","name":"Resolve A"}', 'tenant A')->>'id';
     v_tb := pg_temp.ok('tenant_create', '{"actor":"resolve-test","name":"Resolve B"}', 'tenant B')->>'id';

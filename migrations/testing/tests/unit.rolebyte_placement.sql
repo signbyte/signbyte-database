@@ -116,10 +116,10 @@ BEGIN
     -- by bytes `a/b` comes first, by words `ab`.
     PERFORM pg_temp.ok('service_register', '{"actor":"pl-test","service":"plorder","displayName":"Orders"}', 'register plorder');
     PERFORM pg_temp.ok('service_register', '{"actor":"pl-test","service":"plpeople","displayName":"People"}', 'register plpeople');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"pl-test","service":"plorder","permission":{"feature":"ab","act":"c","class":"ordinary"}}', 'declare ab:c');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"pl-test","service":"plorder","permission":{"feature":"a/b","act":"d","class":"ordinary"}}', 'declare a/b:d');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"pl-test","service":"plorder","permission":{"feature":"hidden","act":"view","class":"ordinary"}}', 'declare hidden:view');
-    PERFORM pg_temp.ok('permission_declare', '{"actor":"pl-test","service":"plpeople","permission":{"feature":"person","act":"view","class":"ordinary"}}', 'declare person:view');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"pl-test","service":"plorder","permission":{"feature":"ab","act":"c","class":"ordinary","plane":"object"}}', 'declare ab:c');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"pl-test","service":"plorder","permission":{"feature":"a/b","act":"d","class":"ordinary","plane":"object"}}', 'declare a/b:d');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"pl-test","service":"plorder","permission":{"feature":"hidden","act":"view","class":"ordinary","plane":"object"}}', 'declare hidden:view');
+    PERFORM pg_temp.ok('permission_declare', '{"actor":"pl-test","service":"plpeople","permission":{"feature":"person","act":"view","class":"ordinary","plane":"object"}}', 'declare person:view');
 
     v_ta := pg_temp.ok('tenant_create', '{"actor":"pl-test","name":"Placement A"}', 'tenant A')->>'id';
     v_tb := pg_temp.ok('tenant_create', '{"actor":"pl-test","name":"Placement B"}', 'tenant B')->>'id';
