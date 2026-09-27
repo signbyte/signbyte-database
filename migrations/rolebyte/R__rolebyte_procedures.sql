@@ -782,6 +782,234 @@ $$;
 REVOKE ALL ON PROCEDURE rolebyte.directory_admit(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.directory_admit(jsonb, jsonb) TO rolebyte_public;
 
+-- ---------------------------------------------------------------------------
+-- The administrator. A tenant's administrator is a member holding the
+-- `membership:admin` rung, whose account is not revoked: the rung is what every
+-- administration act checks, and the first administrator receives it when a
+-- tenant is opened. An administrator holds every permission of every product
+-- the tenant has (resolve), and is the only holder of the permissions that
+-- change the tenant's own setup, because no role may tick them
+-- (tenant_role_permissions_set).
+--
+-- Every tenant keeps at least one administrator. Each door that can remove
+-- one asks administrator_removal_refusal first, under a lock per tenant, so
+-- two administrators removing each other at the same moment cannot both
+-- succeed. An invited administrator counts: the first one is invited until
+-- they first sign in.
+-- ---------------------------------------------------------------------------
+
+-- is_administrator_rung — whether a service role's coordinates are the
+-- administrator rung. The ONE home of that pair.
+CREATE OR REPLACE FUNCTION rolebyte.is_administrator_rung(p_group text, p_level text)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+SET search_path = pg_temp
+AS $$
+    SELECT p_group IS NOT DISTINCT FROM 'membership' AND p_level IS NOT DISTINCT FROM 'admin';
+$$;
+
+REVOKE ALL ON FUNCTION rolebyte.is_administrator_rung(text, text) FROM PUBLIC;
+
+-- is_administrator — whether a member is an administrator of their tenant now:
+-- the rung granted, and the account not revoked.
+CREATE OR REPLACE FUNCTION rolebyte.is_administrator(p_user_id text)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SET search_path = rolebyte, pg_temp
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+          FROM rolebyte.assignment a
+          JOIN rolebyte.role_definition rd ON rd.id = a.role_definition_id
+          JOIN rolebyte.user_account u ON u.id = a.user_id
+         WHERE a.user_id = p_user_id
+           AND a.state = 'granted'
+           AND rolebyte.is_administrator_rung(rd.role_group, rd.role_level)
+           AND u.status <> 'revoked'
+    );
+$$;
+
+REVOKE ALL ON FUNCTION rolebyte.is_administrator(text) FROM PUBLIC;
+
+-- administrator_lock — serialise every change to who administers a tenant.
+-- Transaction-scoped, so it is released when the calling procedure's
+-- transaction ends. A key pair of its own, apart from the bootstrap lock.
+CREATE OR REPLACE FUNCTION rolebyte.administrator_lock(p_tenant text)
+RETURNS void
+LANGUAGE sql
+VOLATILE
+SET search_path = pg_temp
+AS $$
+    SELECT pg_advisory_xact_lock(hashtext('rolebyte.administrators'), hashtext(p_tenant));
+$$;
+
+REVOKE ALL ON FUNCTION rolebyte.administrator_lock(text) FROM PUBLIC;
+
+-- administrator_removal_refusal — the lockout invariant, asked by every door
+-- that can remove an administrator, before it writes: removing this member
+-- would leave the tenant with no administrator. Takes the tenant's lock first
+-- and only then counts, so of two concurrent removals the second counts after
+-- the first has committed. NULL when the removal may go ahead, including when
+-- the member is not in this tenant (the caller answers that as it always has).
+CREATE OR REPLACE FUNCTION rolebyte.administrator_removal_refusal(p_tenant text, p_user_id text)
+RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_name text;
+BEGIN
+    PERFORM rolebyte.administrator_lock(p_tenant);
+
+    SELECT u.display_name INTO v_name
+      FROM rolebyte.user_account u
+     WHERE u.id = p_user_id
+       AND u.tenant_id = p_tenant
+       AND rolebyte.is_administrator(u.id);
+    IF NOT FOUND THEN
+        RETURN NULL;
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM rolebyte.user_account o
+                WHERE o.tenant_id = p_tenant
+                  AND o.id <> p_user_id
+                  AND rolebyte.is_administrator(o.id)) THEN
+        RETURN NULL;
+    END IF;
+
+    RETURN util.result_error('membership:conflict',
+        format('%s is this tenant''s last administrator; make someone else an administrator first', v_name));
+END;
+$$;
+
+REVOKE ALL ON FUNCTION rolebyte.administrator_removal_refusal(text, text) FROM PUBLIC;
+
+-- administrator_rung — the rung's role definition, created with this
+-- service's registration when the deployment never had them (a tenant opened
+-- by the operator before anyone used the bootstrap door). Each creation is the
+-- same event the defining procedures write. Returns the definition's id.
+CREATE OR REPLACE FUNCTION rolebyte.administrator_rung(p_actor text)
+RETURNS text
+LANGUAGE plpgsql
+VOLATILE
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_id text;
+BEGIN
+    INSERT INTO rolebyte.service (key, display_name)
+    VALUES ('rolebyte', 'Membership administration')
+    ON CONFLICT (key) DO NOTHING;
+    IF FOUND THEN
+        INSERT INTO rolebyte.event (id, actor, kind, payload)
+        VALUES (util.generate_ulid(), p_actor, 'serviceRegistered',
+                jsonb_build_object('service', 'rolebyte', 'displayName', 'Membership administration'));
+    END IF;
+
+    INSERT INTO rolebyte.role_definition (id, service_key, role_group, role_level, description)
+    VALUES (util.generate_ulid(), 'rolebyte', 'membership', 'admin',
+            'administer this tenant''s users and their roles')
+    ON CONFLICT (service_key, role_group, role_level) DO NOTHING;
+    IF FOUND THEN
+        INSERT INTO rolebyte.event (id, actor, kind, payload)
+        VALUES (util.generate_ulid(), p_actor, 'roleDefined',
+                jsonb_build_object('service', 'rolebyte', 'group', 'membership', 'level', 'admin'));
+    END IF;
+
+    SELECT id INTO v_id
+      FROM rolebyte.role_definition
+     WHERE service_key = 'rolebyte' AND role_group = 'membership' AND role_level = 'admin';
+    RETURN v_id;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION rolebyte.administrator_rung(text) FROM PUBLIC;
+
+-- administrator_make — the one step the operator's acts share: make the person
+-- with this subject key an administrator of this tenant, whatever anyone else's
+-- state. A member receives the rung; someone not yet a member is added,
+-- invited, holding it, which needs a display name. A member whose access was
+-- revoked is refused: nothing in this register gives access back, so naming
+-- them is a mistake to report, not an act to perform.
+--
+-- Everything is checked before the first write, so a refusal changes nothing
+-- and the caller returns it as it stands. On success it answers the member's
+-- id and whether anything changed; the caller writes its own event beside the
+-- ones written here.
+CREATE OR REPLACE FUNCTION rolebyte.administrator_make(p_actor text, p_tenant text, p_subject text, p_display text)
+RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_user    rolebyte.user_account%ROWTYPE;
+    v_rung    text;
+    v_invited boolean := false;
+    v_changed boolean := false;
+BEGIN
+    -- The message does not echo the key: this text reaches logs.
+    IF p_subject IS NULL OR NOT rolebyte.is_typed_subject_key(p_subject) THEN
+        RETURN util.result_error('membership:invalid',
+            'subjectKey must be a typed key: sub:<person id> for a person, svc:<client id> for a service account');
+    END IF;
+
+    PERFORM rolebyte.administrator_lock(p_tenant);
+
+    SELECT * INTO v_user
+      FROM rolebyte.user_account
+     WHERE tenant_id = p_tenant AND subject_key = p_subject
+       FOR UPDATE;
+
+    IF FOUND AND v_user.status = 'revoked' THEN
+        RETURN util.result_error('membership:conflict',
+            format('%s no longer has access to this tenant, so cannot be made its administrator', v_user.display_name));
+    END IF;
+    IF NOT FOUND AND p_display IS NULL THEN
+        RETURN util.result_error('membership:invalid',
+            'displayName is required to add someone who is not yet a member of the tenant');
+    END IF;
+
+    IF NOT FOUND THEN
+        INSERT INTO rolebyte.user_account (id, tenant_id, subject_key, display_name, status)
+        VALUES (util.generate_ulid(), p_tenant, p_subject, p_display, 'invited')
+        RETURNING * INTO v_user;
+
+        INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+        VALUES (util.generate_ulid(), p_actor, p_tenant, v_user.id, 'userInvited',
+                jsonb_build_object('subjectKey', p_subject, 'displayName', p_display));
+        v_invited := true;
+    END IF;
+
+    v_rung := rolebyte.administrator_rung(p_actor);
+
+    INSERT INTO rolebyte.assignment (id, user_id, role_definition_id)
+    VALUES (util.generate_ulid(), v_user.id, v_rung)
+    ON CONFLICT (user_id, role_definition_id)
+        DO UPDATE SET state = 'granted', granted_at = now(), revoked_at = NULL
+        WHERE rolebyte.assignment.state = 'revoked';
+    v_changed := FOUND;
+
+    IF v_changed THEN
+        INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+        VALUES (util.generate_ulid(), p_actor, p_tenant, v_user.id, 'roleGranted',
+                jsonb_build_object('service', 'rolebyte', 'group', 'membership', 'level', 'admin'));
+    END IF;
+
+    RETURN util.result_success(jsonb_build_object(
+        'userId',  v_user.id,
+        'status',  v_user.status,
+        'invited', v_invited,
+        'changed', v_changed
+    ));
+END;
+$$;
+
+REVOKE ALL ON FUNCTION rolebyte.administrator_make(text, text, text, text) FROM PUBLIC;
+
 -- role_grant — grant one defined role to a user in the caller's tenant.
 -- Re-granting a revoked pair flips it back; the events keep both moments.
 CREATE OR REPLACE PROCEDURE rolebyte.role_grant(IN pi_data jsonb, INOUT po_data jsonb)
@@ -853,6 +1081,8 @@ REVOKE ALL ON PROCEDURE rolebyte.role_grant(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.role_grant(jsonb, jsonb) TO rolebyte_public;
 
 -- role_revoke — revoke one granted role from a user in the caller's tenant.
+-- Revoking the administrator rung is refused when it would leave the tenant
+-- without an administrator (administrator_removal_refusal).
 CREATE OR REPLACE PROCEDURE rolebyte.role_revoke(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -866,6 +1096,7 @@ DECLARE
     v_group   text;
     v_level   text;
     v_def_id  text;
+    v_refusal jsonb;
     v_changed boolean := false;
 BEGIN
     v_actor   := NULLIF(trim(pi_data->>'actor'), '');
@@ -895,6 +1126,14 @@ BEGIN
         RETURN;
     END IF;
 
+    IF rolebyte.is_administrator_rung(v_group, v_level) THEN
+        v_refusal := rolebyte.administrator_removal_refusal(v_tenant, v_user_id);
+        IF v_refusal IS NOT NULL THEN
+            po_data := v_refusal;
+            RETURN;
+        END IF;
+    END IF;
+
     UPDATE rolebyte.assignment
     SET state = 'revoked', revoked_at = now()
     WHERE user_id = v_user_id AND role_definition_id = v_def_id AND state = 'granted';
@@ -921,6 +1160,8 @@ GRANT EXECUTE ON PROCEDURE rolebyte.role_revoke(jsonb, jsonb) TO rolebyte_public
 -- user_revoke — the offboarding switch: the user stops resolving everywhere
 -- at the next session refresh. Assignment rows are left as they stand — the
 -- user-level status gates resolution, and the event stream keeps the truth.
+-- Revoking the tenant's last administrator is refused
+-- (administrator_removal_refusal).
 CREATE OR REPLACE PROCEDURE rolebyte.user_revoke(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -930,12 +1171,19 @@ DECLARE
     v_actor   text;
     v_tenant  text;
     v_user_id text;
+    v_refusal jsonb;
 BEGIN
     v_actor   := NULLIF(trim(pi_data->>'actor'), '');
     v_tenant  := NULLIF(trim(pi_data->>'tenantId'), '');
     v_user_id := NULLIF(trim(pi_data->>'userId'), '');
     IF v_actor IS NULL OR v_tenant IS NULL OR v_user_id IS NULL THEN
         po_data := util.result_error('membership:invalid', 'actor, tenantId and userId are required');
+        RETURN;
+    END IF;
+
+    v_refusal := rolebyte.administrator_removal_refusal(v_tenant, v_user_id);
+    IF v_refusal IS NOT NULL THEN
+        po_data := v_refusal;
         RETURN;
     END IF;
 
@@ -979,6 +1227,13 @@ GRANT EXECUTE ON PROCEDURE rolebyte.user_revoke(jsonb, jsonb) TO rolebyte_public
 -- nested under. Without one the tick is simply absent — the role keeps it, so it
 -- returns unchanged when the entitlement does. A service's role is not a catalog
 -- permission and is never filtered.
+--
+-- An administrator of the tenant holds every declared permission the tenant has,
+-- whatever their roles tick, so a permission declared later reaches them with no
+-- write and a product the tenant does not have gives them nothing. Nobody else
+-- holds a permission that changes the tenant's own setup: a role cannot be given
+-- one, and a tick stored before that rule is skipped here. Where no service
+-- declares a permission, an administrator resolves exactly as before.
 CREATE OR REPLACE PROCEDURE rolebyte.resolve(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1015,10 +1270,14 @@ BEGIN
                     WHERE a.user_id = u.id AND a.state = 'granted'
                     UNION ALL
                     SELECT sp.service_key || '/' || sp.feature_key || ':' || sp.act
-                    FROM rolebyte.tenant_role_assignment ta
-                    JOIN rolebyte.tenant_role_permission tp ON tp.tenant_role_id = ta.tenant_role_id
-                    JOIN rolebyte.service_permission sp ON sp.id = tp.permission_id
-                    WHERE ta.user_id = u.id AND ta.tenant_id = u.tenant_id AND ta.state = 'granted'
+                    FROM rolebyte.service_permission sp
+                    WHERE (adm.yes
+                           OR (sp.class = 'ordinary' AND EXISTS (
+                               SELECT 1
+                                 FROM rolebyte.tenant_role_assignment ta
+                                 JOIN rolebyte.tenant_role_permission tp ON tp.tenant_role_id = ta.tenant_role_id
+                                WHERE ta.user_id = u.id AND ta.tenant_id = u.tenant_id AND ta.state = 'granted'
+                                  AND tp.permission_id = sp.id)))
                       AND EXISTS (
                           SELECT 1 FROM rolebyte.tenant_entitlement e
                            WHERE e.tenant_id = u.tenant_id
@@ -1032,6 +1291,7 @@ BEGIN
         ) AS m
         FROM rolebyte.user_account u
         JOIN rolebyte.tenant t ON t.id = u.tenant_id
+        CROSS JOIN LATERAL (SELECT rolebyte.is_administrator(u.id) AS yes) adm
         WHERE u.subject_key = v_subject
           AND u.status = 'active'
           AND t.status = 'active'
@@ -1489,6 +1749,7 @@ DECLARE
     v_feature text;
     v_act     text;
     v_pid     text;
+    v_class   text;
     v_ids     text[] := '{}'::text[];
     v_added   jsonb;
     v_removed jsonb;
@@ -1537,12 +1798,20 @@ BEGIN
             RETURN;
         END IF;
 
-        SELECT id INTO v_pid
+        SELECT id, class INTO v_pid, v_class
           FROM rolebyte.service_permission
          WHERE service_key = v_service AND feature_key = v_feature AND act = v_act;
         IF v_pid IS NULL THEN
             po_data := util.result_error('membership:unknown_permission',
                 format('%s is not a declared permission', v_perm));
+            RETURN;
+        END IF;
+        -- A permission that changes the tenant's own setup, or who may do what,
+        -- is held only by the tenant's administrators. No role carries one, so
+        -- nobody can hand out a role that grants more than they were given.
+        IF v_class <> 'ordinary' THEN
+            po_data := util.result_error('membership:invalid',
+                format('%s changes the tenant''s own setup; only the Administrator checkbox holds it', v_perm));
             RETURN;
         END IF;
         v_ids := array_append(v_ids, v_pid);
@@ -1849,6 +2118,8 @@ GRANT EXECUTE ON PROCEDURE rolebyte.tenant_role_revoke(jsonb, jsonb) TO rolebyte
 -- tenant. Those are its ticks narrowed to what the tenant has, the same filter
 -- resolve applies to a person granted the role across the tenant, so a role
 -- placed on one object never carries more than the same role granted everywhere.
+-- For the same reason a tick of a permission that changes the tenant's own setup,
+-- stored before a role could no longer carry one, is left out.
 -- Roles in id order, permissions in byte order, so the same state always reads
 -- the same whatever the database's collation. Names no person.
 CREATE OR REPLACE PROCEDURE rolebyte.tenant_role_definitions(IN pi_data jsonb, INOUT po_data jsonb)
@@ -1882,6 +2153,7 @@ BEGIN
                            FROM rolebyte.tenant_role_permission tp
                            JOIN rolebyte.service_permission sp ON sp.id = tp.permission_id
                           WHERE tp.tenant_role_id = r.id
+                            AND sp.class = 'ordinary'
                             AND EXISTS (
                                 SELECT 1 FROM rolebyte.tenant_entitlement e
                                  WHERE e.tenant_id = r.tenant_id
@@ -2431,3 +2703,371 @@ END;
 $$;
 
 REVOKE ALL ON PROCEDURE rolebyte.entitlement_list(jsonb, jsonb) FROM PUBLIC;
+
+-- ===========================================================================
+-- The operator's administrator acts: the way back for a tenant whose
+-- administrators are gone. The deployment's operator opens a tenant with its
+-- first administrator, sees every tenant with its administrators, and can make
+-- someone an administrator or remove one. Like entitlement, none of these is
+-- granted to the register's own role, so no request a tenant can make reaches
+-- them; the operator calls them as the location's owner.
+--
+-- Each act that changes an administrator writes the ordinary events of what it
+-- changed and one event of its own kind, so a later notice to the tenant can
+-- select them by kind: `administratorSetByOperator`,
+-- `administratorUnsetByOperator`, and the seed's `administratorSeeded`.
+--
+-- The one exception is the seed, which the service applies at start from its
+-- own environment and therefore runs as the register's role.
+-- ===========================================================================
+
+-- tenant_open — a new tenant with its first administrator, invited until their
+-- first sign-in. The administrator is named by the subject key the identity
+-- store gave them, as every invitation is. Emits `tenantCreated`, `userInvited`,
+-- `roleGranted` and `administratorSetByOperator`.
+CREATE OR REPLACE PROCEDURE rolebyte.tenant_open(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_actor   text;
+    v_name    text;
+    v_admin   jsonb;
+    v_subject text;
+    v_display text;
+    v_tenant  rolebyte.tenant%ROWTYPE;
+    v_made    jsonb;
+BEGIN
+    v_actor := NULLIF(trim(pi_data->>'actor'), '');
+    v_name  := NULLIF(trim(pi_data->>'name'), '');
+    IF v_actor IS NULL OR v_name IS NULL THEN
+        po_data := util.result_error('tenant:invalid', 'actor and name are required');
+        RETURN;
+    END IF;
+
+    v_admin := pi_data->'administrator';
+    IF jsonb_typeof(v_admin) IS DISTINCT FROM 'object' THEN
+        po_data := util.result_error('membership:invalid',
+            'administrator must be an object with subjectKey and displayName');
+        RETURN;
+    END IF;
+    v_subject := NULLIF(trim(v_admin->>'subjectKey'), '');
+    v_display := NULLIF(trim(v_admin->>'displayName'), '');
+    IF v_subject IS NULL OR NOT rolebyte.is_typed_subject_key(v_subject) THEN
+        po_data := util.result_error('membership:invalid',
+            'subjectKey must be a typed key: sub:<person id> for a person, svc:<client id> for a service account');
+        RETURN;
+    END IF;
+    IF v_display IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'displayName is required');
+        RETURN;
+    END IF;
+
+    INSERT INTO rolebyte.tenant (id, name)
+    VALUES (util.generate_ulid(), v_name)
+    RETURNING * INTO v_tenant;
+
+    INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
+    VALUES (util.generate_ulid(), v_actor, v_tenant.id, 'tenantCreated',
+            jsonb_build_object('name', v_tenant.name));
+
+    v_made := rolebyte.administrator_make(v_actor, v_tenant.id, v_subject, v_display);
+    IF v_made->>'result' IS DISTINCT FROM 'success' THEN
+        RAISE EXCEPTION '%', v_made USING errcode = 'P0001';
+    END IF;
+
+    INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+    VALUES (util.generate_ulid(), v_actor, v_tenant.id, v_made->'data'->>'userId',
+            'administratorSetByOperator', '{}'::jsonb);
+
+    po_data := util.result_success(jsonb_build_object(
+        'tenant', jsonb_build_object(
+            'id',        v_tenant.id,
+            'name',      v_tenant.name,
+            'status',    v_tenant.status,
+            'createdAt', v_tenant.created_at),
+        'administrator', jsonb_build_object(
+            'id',     v_made->'data'->>'userId',
+            'status', v_made->'data'->>'status')
+    ));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.tenant_open(jsonb, jsonb) FROM PUBLIC;
+
+-- administrator_set — the operator makes a person an administrator of a tenant,
+-- whatever anyone else's state: the case where the only administrator is gone.
+-- A member receives the rung; someone not yet a member is added, invited,
+-- holding it. Making an administrator of someone who already is one changes
+-- nothing and writes nothing. Emits `administratorSetByOperator` beside the
+-- events of what it changed.
+CREATE OR REPLACE PROCEDURE rolebyte.administrator_set(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_actor  text;
+    v_tenant text;
+    v_made   jsonb;
+BEGIN
+    v_actor  := NULLIF(trim(pi_data->>'actor'), '');
+    v_tenant := NULLIF(trim(pi_data->>'tenantId'), '');
+    IF v_actor IS NULL OR v_tenant IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'actor and tenantId are required');
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM rolebyte.tenant WHERE id = v_tenant) THEN
+        po_data := util.result_error('tenant:not_found', 'tenant does not exist');
+        RETURN;
+    END IF;
+
+    v_made := rolebyte.administrator_make(v_actor, v_tenant,
+        NULLIF(trim(pi_data->>'subjectKey'), ''), NULLIF(trim(pi_data->>'displayName'), ''));
+    IF v_made->>'result' IS DISTINCT FROM 'success' THEN
+        po_data := v_made;
+        RETURN;
+    END IF;
+
+    IF (v_made->'data'->>'changed')::boolean THEN
+        INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+        VALUES (util.generate_ulid(), v_actor, v_tenant, v_made->'data'->>'userId',
+                'administratorSetByOperator', '{}'::jsonb);
+    END IF;
+
+    po_data := util.result_success(jsonb_build_object(
+        'tenantId', v_tenant,
+        'userId',   v_made->'data'->>'userId',
+        'invited',  (v_made->'data'->>'invited')::boolean,
+        'changed',  (v_made->'data'->>'changed')::boolean
+    ));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.administrator_set(jsonb, jsonb) FROM PUBLIC;
+
+-- administrator_unset — the operator removes an administrator. The tenant still
+-- keeps one: removing the last is refused, so this follows a set. The member
+-- stays a member; only the rung goes. Removing it from someone who does not
+-- hold it changes nothing and writes nothing. Emits `roleRevoked` and
+-- `administratorUnsetByOperator`.
+CREATE OR REPLACE PROCEDURE rolebyte.administrator_unset(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_actor   text;
+    v_tenant  text;
+    v_user_id text;
+    v_refusal jsonb;
+    v_def     rolebyte.role_definition%ROWTYPE;
+    v_changed boolean := false;
+BEGIN
+    v_actor   := NULLIF(trim(pi_data->>'actor'), '');
+    v_tenant  := NULLIF(trim(pi_data->>'tenantId'), '');
+    v_user_id := NULLIF(trim(pi_data->>'userId'), '');
+    IF v_actor IS NULL OR v_tenant IS NULL OR v_user_id IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'actor, tenantId and userId are required');
+        RETURN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM rolebyte.user_account WHERE id = v_user_id AND tenant_id = v_tenant) THEN
+        po_data := util.result_error('membership:not_found', 'user does not exist');
+        RETURN;
+    END IF;
+
+    v_refusal := rolebyte.administrator_removal_refusal(v_tenant, v_user_id);
+    IF v_refusal IS NOT NULL THEN
+        po_data := v_refusal;
+        RETURN;
+    END IF;
+
+    FOR v_def IN
+        UPDATE rolebyte.assignment a
+           SET state = 'revoked', revoked_at = now()
+          FROM rolebyte.role_definition rd
+         WHERE rd.id = a.role_definition_id
+           AND a.user_id = v_user_id
+           AND a.state = 'granted'
+           AND rolebyte.is_administrator_rung(rd.role_group, rd.role_level)
+        RETURNING rd.*
+    LOOP
+        INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+        VALUES (util.generate_ulid(), v_actor, v_tenant, v_user_id, 'roleRevoked',
+                jsonb_build_object('service', v_def.service_key, 'group', v_def.role_group, 'level', v_def.role_level));
+        v_changed := true;
+    END LOOP;
+
+    IF v_changed THEN
+        INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+        VALUES (util.generate_ulid(), v_actor, v_tenant, v_user_id, 'administratorUnsetByOperator', '{}'::jsonb);
+    END IF;
+
+    po_data := util.result_success(jsonb_build_object('changed', v_changed));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.administrator_unset(jsonb, jsonb) FROM PUBLIC;
+
+-- tenant_overview — the operator's view of the deployment: every tenant with its
+-- status, what it has, and who holds the administrator rung with the state of
+-- their account, so a tenant whose only administrator was revoked is visible as
+-- one. Tenants in the order they were created.
+CREATE OR REPLACE PROCEDURE rolebyte.tenant_overview(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_items jsonb;
+BEGIN
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'id',        t.id,
+        'name',      t.name,
+        'status',    t.status,
+        'createdAt', t.created_at,
+        'entitlements', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object('service', e.service_key, 'feature', e.feature_key)
+                             ORDER BY e.service_key, e.feature_key)
+              FROM rolebyte.tenant_entitlement e
+             WHERE e.tenant_id = t.id AND e.state = 'entitled'), '[]'::jsonb),
+        'administrators', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object(
+                       'userId',      u.id,
+                       'subjectKey',  u.subject_key,
+                       'displayName', u.display_name,
+                       'status',      u.status)
+                   ORDER BY lower(u.display_name), u.id)
+              FROM rolebyte.user_account u
+             WHERE u.tenant_id = t.id
+               AND EXISTS (SELECT 1 FROM rolebyte.assignment a
+                             JOIN rolebyte.role_definition rd ON rd.id = a.role_definition_id
+                            WHERE a.user_id = u.id AND a.state = 'granted'
+                              AND rolebyte.is_administrator_rung(rd.role_group, rd.role_level))), '[]'::jsonb)
+    ) ORDER BY t.created_at, t.id), '[]'::jsonb)
+    INTO v_items
+    FROM rolebyte.tenant t;
+
+    po_data := util.result_success(jsonb_build_object('tenants', v_items));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.tenant_overview(jsonb, jsonb) FROM PUBLIC;
+
+-- administrator_seed — the environment's way back, on a deployment the operator
+-- runs on the customer's own machines: at start the service passes the subject
+-- key its environment names, and that person becomes an administrator of the
+-- tenant as administrator_set makes one.
+--
+-- Applied once per value. The last value applied to the tenant is remembered,
+-- so a restart with the same value does nothing and writes nothing, and a new
+-- value acts whatever anyone else's state. It never removes anyone: the new
+-- administrator removes the old one. The tenant may be left out when the
+-- deployment has exactly one. Emits `administratorSeeded` for each value
+-- applied, beside the events of what it changed.
+--
+-- The register's own role runs this one: the value comes from the deployment's
+-- own environment, which is the operator's. Every refusal is one the service
+-- stops its start on, so a seed that did not apply is never mistaken for one
+-- that did.
+CREATE OR REPLACE PROCEDURE rolebyte.administrator_seed(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_actor   text;
+    v_tenant  text;
+    v_subject text;
+    v_count   integer;
+    v_made    jsonb;
+BEGIN
+    v_actor   := NULLIF(trim(pi_data->>'actor'), '');
+    v_tenant  := NULLIF(trim(pi_data->>'tenantId'), '');
+    v_subject := NULLIF(trim(pi_data->>'subjectKey'), '');
+    IF v_actor IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'actor is required');
+        RETURN;
+    END IF;
+    IF v_subject IS NULL OR NOT rolebyte.is_typed_subject_key(v_subject) THEN
+        po_data := util.result_error('membership:invalid',
+            'subjectKey must be a typed key: sub:<person id> for a person, svc:<client id> for a service account');
+        RETURN;
+    END IF;
+
+    IF v_tenant IS NULL THEN
+        SELECT count(*) INTO v_count FROM rolebyte.tenant;
+        IF v_count = 0 THEN
+            po_data := util.result_error('tenant:not_found', 'the deployment has no tenant to seed an administrator into');
+            RETURN;
+        END IF;
+        IF v_count > 1 THEN
+            po_data := util.result_error('membership:invalid',
+                format('the tenant must be named: the deployment has %s tenants', v_count));
+            RETURN;
+        END IF;
+        SELECT id INTO v_tenant FROM rolebyte.tenant;
+    ELSIF NOT EXISTS (SELECT 1 FROM rolebyte.tenant WHERE id = v_tenant) THEN
+        po_data := util.result_error('tenant:not_found', 'tenant does not exist');
+        RETURN;
+    END IF;
+
+    -- Two instances starting together with the same value apply it once.
+    PERFORM rolebyte.administrator_lock(v_tenant);
+    IF EXISTS (SELECT 1 FROM rolebyte.administrator_seed
+                WHERE tenant_id = v_tenant AND subject_key = v_subject) THEN
+        po_data := util.result_success(jsonb_build_object('tenantId', v_tenant, 'applied', false));
+        RETURN;
+    END IF;
+
+    v_made := rolebyte.administrator_make(v_actor, v_tenant, v_subject, NULLIF(trim(pi_data->>'displayName'), ''));
+    IF v_made->>'result' IS DISTINCT FROM 'success' THEN
+        po_data := v_made;
+        RETURN;
+    END IF;
+
+    INSERT INTO rolebyte.administrator_seed (tenant_id, subject_key)
+    VALUES (v_tenant, v_subject)
+    ON CONFLICT (tenant_id) DO UPDATE SET subject_key = EXCLUDED.subject_key, applied_at = now();
+
+    INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+    VALUES (util.generate_ulid(), v_actor, v_tenant, v_made->'data'->>'userId', 'administratorSeeded',
+            jsonb_build_object('subjectKey', v_subject));
+
+    po_data := util.result_success(jsonb_build_object(
+        'tenantId', v_tenant,
+        'userId',   v_made->'data'->>'userId',
+        'applied',  true,
+        'changed',  (v_made->'data'->>'changed')::boolean
+    ));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.administrator_seed(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.administrator_seed(jsonb, jsonb) TO rolebyte_public;

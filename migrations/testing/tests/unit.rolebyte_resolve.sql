@@ -1,6 +1,8 @@
 -- Unit test: resolve answers a tenant role's ticks beside the service roles' levels.
 -- A person who holds only service roles resolves byte for byte as the register
--- did before tenant roles reached a token — compared as text against that
+-- did before tenant roles reached a token (an administrator of a tenant that has
+-- declared permissions aside, whose answer unit.rolebyte_administrator
+-- asserts) — compared as text against that
 -- aggregation, kept below as the reference; a granted tenant role adds each box
 -- it ticks as `service/feature:act`; both kinds together give both; a box ticked
 -- twice appears once; an empty role, a revoked grant and another membership's
@@ -241,6 +243,9 @@ BEGIN
     -- 8. After all of it, every person in the register who holds no tenant role
     --    resolves exactly as before — this test's people and every fixture any
     --    earlier test left — and person 1's answer is the one taken at the start.
+    --    The one other exception is an administrator of a tenant that has declared
+    --    permissions: they hold every one of them, which unit.rolebyte_administrator
+    --    asserts. An administrator where nothing is declared stays in the sweep.
     v_n := 0;
     FOR k IN
         SELECT DISTINCT u.subject_key FROM rolebyte.user_account u
@@ -251,6 +256,12 @@ BEGIN
         CONTINUE WHEN EXISTS (SELECT 1 FROM rolebyte.user_account u2
                                JOIN rolebyte.tenant_role_assignment ta ON ta.user_id = u2.id AND ta.state = 'granted'
                               WHERE u2.subject_key = k);
+        CONTINUE WHEN EXISTS (SELECT 1 FROM rolebyte.user_account u3
+                               WHERE u3.subject_key = k
+                                 AND rolebyte.is_administrator(u3.id)
+                                 AND EXISTS (SELECT 1 FROM rolebyte.tenant_entitlement e
+                                               JOIN rolebyte.service_permission sp ON sp.service_key = e.service_key
+                                              WHERE e.tenant_id = u3.tenant_id AND e.state = 'entitled'));
         PERFORM pg_temp.same_as_before(k, 'subject ' || k);
         v_n := v_n + 1;
     END LOOP;

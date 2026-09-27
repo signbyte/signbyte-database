@@ -63,6 +63,20 @@ BEGIN
         'CALL rolebyte.entitlement_revoke(''{"actor":"x","tenantId":"x","service":"x"}''::jsonb, NULL::jsonb)');
     PERFORM pg_temp.deny('rolebyte_public',
         'CALL rolebyte.entitlement_list(''{"tenantId":"x"}''::jsonb, NULL::jsonb)');
+    -- who administers a tenant is the operator's way back: the register's own role can
+    -- run none of those acts, nor read or write the remembered seed. Only the seed
+    -- itself, applied from the service's own environment, is the service's to run.
+    PERFORM pg_temp.deny('rolebyte_public',
+        'CALL rolebyte.tenant_open(''{"actor":"x","name":"x"}''::jsonb, NULL::jsonb)');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'CALL rolebyte.administrator_set(''{"actor":"x","tenantId":"x"}''::jsonb, NULL::jsonb)');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'CALL rolebyte.administrator_unset(''{"actor":"x","tenantId":"x","userId":"x"}''::jsonb, NULL::jsonb)');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'CALL rolebyte.tenant_overview(''{}''::jsonb, NULL::jsonb)');
+    PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.administrator_seed');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'INSERT INTO rolebyte.administrator_seed(tenant_id, subject_key) VALUES (''x'', ''x'')');
     -- the history is append-only at the grant boundary, even for the register's own role.
     PERFORM pg_temp.deny('rolebyte_public', 'UPDATE rolebyte.event SET kind = ''x''');
     PERFORM pg_temp.deny('rolebyte_public', 'DELETE FROM rolebyte.event');
@@ -75,6 +89,7 @@ BEGIN
     PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.tenant_role');
     PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.tenant_role_assignment');
     PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.tenant_entitlement');
+    PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.administrator_seed');
 END $$;
 
 SELECT 'ROLELEAK: PASS — the register role is table-isolated, its history is append-only at the grant boundary, and no other service role reads the register' AS result;

@@ -6,6 +6,32 @@ integrates against the procedures.
 
 ## v0.3.0
 
+### Added — a tenant keeps its last administrator, and the operator has a way back
+
+A tenant's administrator is a member holding the `membership:admin` role whose access is not revoked. Revoking
+that role from the tenant's last administrator, or revoking their access, is now refused with
+`membership:conflict` and *"‹name› is this tenant's last administrator; make someone else an administrator
+first"*. An invited administrator counts. Two administrators removing each other at the same moment cannot both
+succeed.
+
+The deployment's operator, as the location's owner (the service role cannot), can now open a tenant with its first
+administrator, make someone an administrator, remove one, and list every tenant with its administrators:
+
+```
+CALL rolebyte.tenant_open('{"actor":"op:you","name":"Workshop","administrator":{"subjectKey":"sub:01J…","displayName":"Ilze"}}'::jsonb, NULL);
+CALL rolebyte.administrator_set('{"actor":"op:you","tenantId":"01J…","subjectKey":"sub:01J…","displayName":"Ilze"}'::jsonb, NULL);
+CALL rolebyte.administrator_unset('{"actor":"op:you","tenantId":"01J…","userId":"01J…"}'::jsonb, NULL);
+CALL rolebyte.tenant_overview('{}'::jsonb, NULL);
+```
+
+An administrator can also be named in the service's environment and is applied at start, once per value, through
+the new `rolebyte.administrator_seed`, remembered in the new table `rolebyte.administrator_seed` (migration `V10`,
+a new empty table). A seed never removes anyone.
+
+**Changed:** an administrator now also resolves every permission the tenant has, and no role can hold a permission
+that changes the tenant's own setup. Where no service declares permissions, which is the signbyte case today,
+every resolve answers exactly as before. Nothing to do on upgrade.
+
 ### Added — a service that places a tenant's roles reads them, and a role in use cannot be deleted
 
 A member service that places the tenant's roles on its own objects reads what each role carries with the new
