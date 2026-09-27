@@ -1442,6 +1442,112 @@ $$;
 REVOKE ALL ON PROCEDURE rolebyte.user_list(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.user_list(jsonb, jsonb) TO rolebyte_public;
 
+-- rolebyte.access_list — who holds what in a tenant, for its administrators.
+--
+-- Every member of the tenant with what the register holds for them: their
+-- service roles, their tenant roles, and whether the Administrator checkbox is
+-- ticked (the `membership:admin` rung, answered as `administrator` rather than
+-- as a service role, because that is how it is set and unset).
+--
+-- It answers what is STORED, not what reaches a token. A revoked member's
+-- grants stay on record when their access ends, and they are listed here as
+-- held; `status` is what says none of them reaches a token any more. So nobody
+-- disappears from this list: a person who has left is still somebody whose
+-- work carries their name.
+--
+-- Service accounts are listed, marked `kind: service`. The names read leaves
+-- them out because a picker must not offer a machine as somebody to give work
+-- to; this read is for the administrator, who has to be able to see every
+-- holder of a grant in their tenant, a machine's included.
+--
+-- `arrival` marks a person who has signed in and holds nothing yet: an active
+-- account (an invitation becomes active only at its first sign-in, and a
+-- directory admits a person active and with nothing), no service role, no
+-- tenant role, not an administrator. A person whose last grant was taken away
+-- is one again: they can sign in and do nothing, which is what an administrator
+-- looking at arrivals is there to change. A service account never is one: it
+-- does not sign in to be given something. It is decided here so that every
+-- screen showing arrivals shows the same people.
+--
+-- No paging: a tenant is tens of people, the same as the names read.
+CREATE OR REPLACE PROCEDURE rolebyte.access_list(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_tenant text;
+    v_items  jsonb;
+BEGIN
+    v_tenant := NULLIF(trim(pi_data->>'tenantId'), '');
+    IF v_tenant IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'tenantId is required');
+        RETURN;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM rolebyte.tenant WHERE id = v_tenant) THEN
+        po_data := util.result_error('tenant:not_found', 'tenant does not exist');
+        RETURN;
+    END IF;
+
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+               'id',            m.id,
+               'subjectKey',    m.subject_key,
+               'displayName',   m.display_name,
+               'kind',          m.kind,
+               'status',        m.status,
+               'administrator', m.administrator,
+               'arrival',       m.kind = 'person' AND m.status = 'active' AND NOT m.administrator
+                                AND jsonb_array_length(m.service_roles) = 0
+                                AND jsonb_array_length(m.tenant_roles) = 0,
+               'serviceRoles',  m.service_roles,
+               'tenantRoles',   m.tenant_roles
+           ) ORDER BY lower(m.display_name), m.id), '[]'::jsonb)
+      INTO v_items
+      FROM (
+          SELECT u.id, u.subject_key, u.display_name, u.status,
+                 CASE WHEN u.subject_key LIKE 'svc:%' THEN 'service' ELSE 'person' END AS kind,
+                 EXISTS (
+                     SELECT 1
+                       FROM rolebyte.assignment a
+                       JOIN rolebyte.role_definition rd ON rd.id = a.role_definition_id
+                      WHERE a.user_id = u.id AND a.state = 'granted'
+                        AND rolebyte.is_administrator_rung(rd.role_group, rd.role_level)
+                 ) AS administrator,
+                 COALESCE((
+                     SELECT jsonb_agg(jsonb_build_object(
+                                'service', rd.service_key,
+                                'group',   rd.role_group,
+                                'level',   rd.role_level
+                            ) ORDER BY rd.service_key, rd.role_group, rd.role_level)
+                       FROM rolebyte.assignment a
+                       JOIN rolebyte.role_definition rd ON rd.id = a.role_definition_id
+                      WHERE a.user_id = u.id AND a.state = 'granted'
+                        AND NOT rolebyte.is_administrator_rung(rd.role_group, rd.role_level)
+                 ), '[]'::jsonb) AS service_roles,
+                 COALESCE((
+                     SELECT jsonb_agg(jsonb_build_object('id', r.id, 'name', r.name)
+                                      ORDER BY lower(r.name), r.id)
+                       FROM rolebyte.tenant_role_assignment ta
+                       JOIN rolebyte.tenant_role r ON r.id = ta.tenant_role_id AND r.tenant_id = ta.tenant_id
+                      WHERE ta.user_id = u.id AND ta.tenant_id = u.tenant_id AND ta.state = 'granted'
+                 ), '[]'::jsonb) AS tenant_roles
+            FROM rolebyte.user_account u
+           WHERE u.tenant_id = v_tenant
+      ) m;
+
+    po_data := util.result_success(jsonb_build_object('members', v_items));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.access_list(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.access_list(jsonb, jsonb) TO rolebyte_public;
+
 -- history — the append-only promise made queryable: a tenant's membership
 -- events in a time window, optionally narrowed to one service (the events
 -- carry the service in their payload). The billing seat-count source.

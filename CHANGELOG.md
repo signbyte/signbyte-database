@@ -6,6 +6,15 @@ integrates against the procedures.
 
 ## v0.3.0
 
+### Added — who holds what in a tenant
+
+A new procedure, `rolebyte.access_list`, with no migration and nothing to provision: every member of a tenant,
+ordered by name, with what the register holds for them — `kind` (`person` or `service`), `status`,
+`administrator`, `arrival`, `serviceRoles` (service, group, level) and `tenantRoles` (id, name). It answers what is
+stored: a member whose access was revoked is listed with the grants still on record, and service accounts are
+listed and marked. `arrival` is an active person holding nothing. It is granted to the register's own role and
+writes nothing.
+
 ### Changed — a declared permission says where it may be granted, carries a label per language, and can be retired
 
 Migration `V11` adds three columns to `rolebyte.service_permission` without rewriting it.
