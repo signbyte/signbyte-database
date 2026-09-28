@@ -6,6 +6,15 @@ integrates against the procedures.
 
 ## v0.3.0
 
+### Changed — the CSC signing flow is two flows
+
+Migrations `envelope` `V9` and `signflow` `V6` each replace one `CHECK` constraint (`ck_slot_flow`,
+`ck_signing_job_flow`) by drop and re-add, rewriting nothing. The single `csc` flow is now two, named for how the eID
+card is read: `cscEidScan` (a phone reads it) and `cscEidPlugin` (a card reader, through the provider's browser
+extension). `envelope.add_slot` and the signing procedures accept the two names and refuse `csc` with `invalid flow`;
+rows already stored with `csc` stay valid and are not touched. **Deploy together with signing services that send the
+new names.**
+
 ### Added — roles a new tenant can start with, and user types
 
 Migration `V12` adds columns to `rolebyte.service_permission`, `rolebyte.tenant_role`, `rolebyte.user_account` and

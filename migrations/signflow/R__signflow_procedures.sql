@@ -46,7 +46,7 @@ BEGIN
     -- evaluates to NULL rather than true — without it the branch never fires
     -- for a missing field, and the caller gets whatever the write fails with
     -- instead of the precise refusal this check exists to give.
-    IF v_flow IS NULL OR v_flow NOT IN ('webEid', 'eidScan', 'eparakstsMobile', 'eparakstsMobileEseal', 'csc') THEN
+    IF v_flow IS NULL OR v_flow NOT IN ('webEid', 'eidScan', 'eparakstsMobile', 'eparakstsMobileEseal', 'cscEidScan', 'cscEidPlugin') THEN
         po_data := util.result_error('signing:invalid', 'invalid flow'); RETURN;
     END IF;
     IF v_format IS NULL OR v_format NOT IN ('PAdES', 'XAdES') THEN
@@ -219,7 +219,7 @@ BEGIN
     -- evaluates to NULL rather than true — without it the branch never fires
     -- for a missing field, and the caller gets whatever the write fails with
     -- instead of the precise refusal this check exists to give.
-    IF v_flow IS NULL OR v_flow NOT IN ('webEid', 'eidScan', 'eparakstsMobile', 'eparakstsMobileEseal', 'csc') THEN
+    IF v_flow IS NULL OR v_flow NOT IN ('webEid', 'eidScan', 'eparakstsMobile', 'eparakstsMobileEseal', 'cscEidScan', 'cscEidPlugin') THEN
         po_data := util.result_error('signing:invalid', 'invalid flow_used'); RETURN;
     END IF;
     IF v_format IS NULL OR v_format NOT IN ('PAdES', 'XAdES') THEN
