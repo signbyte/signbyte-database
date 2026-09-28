@@ -6,6 +6,37 @@ integrates against the procedures.
 
 ## v0.3.0
 
+### Added — roles a new tenant can start with, and user types
+
+Migration `V12` adds columns to `rolebyte.service_permission`, `rolebyte.tenant_role`, `rolebyte.user_account` and
+`rolebyte.tenant`, and two tables (`rolebyte.user_type`, `rolebyte.user_type_permission`), rewriting nothing. **A
+deployment whose services declare no shipped roles behaves exactly as before**: its tenants open with no roles.
+
+A permission declaration may carry `seeds`, `"worker"`, `"manager"` or both, on an ordinary permission of the object
+plane only (anything else is `membership:invalid`). Once any service declares one, `rolebyte.tenant_create` and
+`rolebyte.tenant_open` create three roles with every new tenant: *Guest* (holding nothing), *Worker* and *Manager*,
+each holding the permissions whose `seeds` name it, named in Latvian when the tenant is opened with `"language":
+"lv"`. `rolebyte.tenant_open` answers them under `roles`, and `rolebyte.tenant_role_definitions` names each one's
+`seed`. A tenant changes or deletes them like any other role. Tenants already open are not touched until the operator
+runs `rolebyte.tenant_seed_roles({actor, tenantId})` for them, which creates the shipped roles a tenant lacks from what
+is declared now, leaves what it has alone, and changes nothing when run again.
+
+User types are named sets of a tenant's **tenant-wide** permissions, given to a member across the tenant:
+`rolebyte.user_type_define`, `user_type_update`, `user_type_delete` (refused while anybody holds it),
+`user_type_list` and `user_type_assign`, with `rolebyte.resolve` adding what the member's user type holds. A tenant
+may also choose one user type for people arriving through its attached directory
+(`rolebyte.corporate_login_default_set` / `_get`); `rolebyte.directory_admit` gives it once, to a person admitted for
+the first time, never to one claiming an invitation. Every act is an attributed event, and each event carries the
+state it left, so the history alone rebuilds every role and user type. All new procedures are granted to the
+register's own role.
+
+```
+CALL rolebyte.user_type_define('{"actor":"sub:…","tenantId":"01K6…","name":"Office",
+      "permissions":["work/project:create"]}'::jsonb, NULL);
+→ {"id":"01K6…","name":"Office","description":"","permissions":["work/project:create"],
+   "members":0,"corporateLoginDefault":false}
+```
+
 ### Added — who holds what in a tenant
 
 A new procedure, `rolebyte.access_list`, with no migration and nothing to provision: every member of a tenant,

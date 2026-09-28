@@ -160,7 +160,10 @@ BEGIN
     v_defs := pg_temp.ok('tenant_role_definitions', jsonb_build_object('tenantId', v_ta), 'read A');
     PERFORM pg_temp.is(v_defs->>'tenantId', v_ta, 'the read names its tenant');
     PERFORM pg_temp.is(pg_temp.texts(jsonb_path_query_array(v_defs, '$.roles[*].id')),
-        (SELECT array_agg(x ORDER BY x COLLATE "C") FROM unnest(ARRAY[v_boss, v_crew, v_empty]) x), 'A''s roles, in id order');
+        -- A's three own roles and the three every new tenant starts with.
+        (SELECT array_agg(r.id ORDER BY r.id COLLATE "C") FROM rolebyte.tenant_role r WHERE r.tenant_id = v_ta), 'A''s roles, in id order');
+    PERFORM pg_temp.is((SELECT count(*) FROM rolebyte.tenant_role WHERE tenant_id = v_ta AND id IN (v_boss, v_crew, v_empty))::text,
+        '3', 'the roles A made are among them');
     PERFORM pg_temp.is(pg_temp.role_in(v_defs, v_rb), NULL::jsonb, 'another tenant''s role');
     PERFORM pg_temp.is(pg_temp.role_in(v_defs, v_boss)->>'name', 'Meistars', 'the role''s name travels');
 

@@ -42,7 +42,9 @@ $$;
 REVOKE ALL ON PROCEDURE rolebyte.ping(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.ping(jsonb, jsonb) TO rolebyte_public;
 
--- tenant_create — register the paying organisation. Emits `tenantCreated`.
+-- tenant_create — register the paying organisation, with the roles every new
+-- tenant starts with (see seed_roles). Emits `tenantCreated` and a
+-- `tenantRoleSeeded` per role.
 CREATE OR REPLACE PROCEDURE rolebyte.tenant_create(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -72,6 +74,9 @@ BEGIN
     INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
     VALUES (util.generate_ulid(), v_actor, v_row.id, 'tenantCreated',
             jsonb_build_object('name', v_row.name));
+
+    -- Every new tenant starts with the roles the register creates for it.
+    PERFORM rolebyte.seed_roles(v_actor, v_row.id, NULLIF(btrim(pi_data->>'language'), ''));
 
     po_data := util.result_success(jsonb_build_object(
         'id',        v_row.id,
@@ -229,8 +234,11 @@ GRANT EXECUTE ON PROCEDURE rolebyte.role_define(jsonb, jsonb) TO rolebyte_public
 -- not know is refused rather than dropped, so a later property carrying a
 -- requirement can never be stored without it. Emits `permissionDeclared` for a
 -- new permission, and for an existing one `permissionDescribed`,
--- `permissionLabelled`, `permissionPlaneDeclared`, `permissionRetired` or
--- `permissionReinstated` for each thing that changed; nothing otherwise.
+-- `permissionLabelled`, `permissionPlaneDeclared`, `permissionSeeded`,
+-- `permissionRetired` or `permissionReinstated` for each thing that changed;
+-- nothing otherwise. `seeds` names the roles the register creates with every new
+-- tenant that hold the permission (`worker`, `manager`; Guest holds nothing); only
+-- an ordinary permission on the object plane carries any.
 CREATE OR REPLACE PROCEDURE rolebyte.permission_declare(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -248,6 +256,7 @@ DECLARE
     v_plane   text;
     v_labels  jsonb;
     v_retired boolean;
+    v_seeds   text[];
     v_name    text;
     v_changed boolean := false;
     v_row     rolebyte.service_permission%ROWTYPE;
@@ -272,7 +281,7 @@ BEGIN
 
     SELECT k INTO v_unknown
     FROM jsonb_object_keys(v_decl) AS k
-    WHERE k NOT IN ('feature', 'act', 'description', 'class', 'plane', 'labels', 'retired')
+    WHERE k NOT IN ('feature', 'act', 'description', 'class', 'plane', 'labels', 'retired', 'seeds')
     ORDER BY k
     LIMIT 1;
     IF v_unknown IS NOT NULL THEN
@@ -299,6 +308,15 @@ BEGIN
         po_data := util.result_error('membership:invalid', 'retired must be true or false');
         RETURN;
     END IF;
+    IF v_decl ? 'seeds' AND (jsonb_typeof(v_decl->'seeds') IS DISTINCT FROM 'array'
+        OR EXISTS (SELECT 1 FROM jsonb_array_elements(v_decl->'seeds') e
+                    WHERE jsonb_typeof(e) <> 'string' OR (e #>> '{}') NOT IN ('worker', 'manager'))
+        OR (SELECT count(DISTINCT e #>> '{}') FROM jsonb_array_elements(v_decl->'seeds') e)
+           <> jsonb_array_length(v_decl->'seeds')) THEN
+        po_data := util.result_error('membership:invalid',
+            'seeds name the roles a new tenant starts with that hold the permission: "worker", "manager", each once');
+        RETURN;
+    END IF;
 
     v_feature := v_decl->>'feature';
     v_act     := v_decl->>'act';
@@ -306,6 +324,8 @@ BEGIN
     v_plane   := v_decl->>'plane';
     v_desc    := COALESCE(trim(v_decl->>'description'), '');
     v_retired := COALESCE((v_decl->>'retired')::boolean, false);
+    v_seeds   := COALESCE(ARRAY(SELECT e FROM jsonb_array_elements_text(COALESCE(v_decl->'seeds', '[]'::jsonb)) e
+                                ORDER BY e COLLATE "C"), '{}');
     SELECT COALESCE(jsonb_object_agg(l.lang, btrim(l.label #>> '{}')), '{}'::jsonb)
       INTO v_labels
       FROM jsonb_each(COALESCE(v_decl->'labels', '{}'::jsonb)) AS l(lang, label);
@@ -328,6 +348,11 @@ BEGIN
         po_data := util.result_error('membership:invalid', 'plane must be tenant or object');
         RETURN;
     END IF;
+    IF cardinality(v_seeds) > 0 AND (v_plane <> 'object' OR v_class <> 'ordinary') THEN
+        po_data := util.result_error('membership:invalid',
+            'only an ordinary permission on the object plane is given to a seeded role');
+        RETURN;
+    END IF;
 
     IF NOT EXISTS (SELECT 1 FROM rolebyte.service WHERE key = v_service) THEN
         po_data := util.result_error('membership:not_found', 'service is not registered');
@@ -348,9 +373,9 @@ BEGIN
 
     IF NOT FOUND THEN
         INSERT INTO rolebyte.service_permission
-               (id, service_key, feature_key, act, description, class, plane, labels, retired_at)
+               (id, service_key, feature_key, act, description, class, plane, labels, retired_at, seeds)
         VALUES (util.generate_ulid(), v_service, v_feature, v_act, v_desc, v_class, v_plane, v_labels,
-                CASE WHEN v_retired THEN now() END)
+                CASE WHEN v_retired THEN now() END, v_seeds)
         ON CONFLICT (service_key, feature_key, act) DO NOTHING;
         IF NOT FOUND THEN
             -- A concurrent declaration of the same permission won the insert:
@@ -404,6 +429,15 @@ BEGIN
         VALUES (util.generate_ulid(), v_actor, 'permissionLabelled',
                 jsonb_build_object('service', v_service, 'permission', v_name,
                                    'from', v_row.labels, 'to', v_labels));
+        v_changed := true;
+    END IF;
+
+    IF v_row.seeds <> v_seeds THEN
+        UPDATE rolebyte.service_permission SET seeds = v_seeds WHERE id = v_row.id;
+        INSERT INTO rolebyte.event (id, actor, kind, payload)
+        VALUES (util.generate_ulid(), v_actor, 'permissionSeeded',
+                jsonb_build_object('service', v_service, 'permission', v_name,
+                                   'from', to_jsonb(v_row.seeds), 'to', to_jsonb(v_seeds)));
         v_changed := true;
     END IF;
 
@@ -722,9 +756,14 @@ GRANT EXECUTE ON PROCEDURE rolebyte.directory_attach(jsonb, jsonb) TO rolebyte_p
 -- directory_admit — the identity provider's door beside `claim_attach`: a person
 -- has just authenticated through an issuer, and the tenant whose attached
 -- directory that issuer is admits them as an ACTIVE member with NO grants — a
--- member, not a role-holder, until an administrator gives them one. Emits
--- `directoryAdmitted`. Outcomes, all a success answer (refusing a login is the
--- caller's decision, and the caller's words):
+-- member, not a role-holder, until an administrator gives them one — holding
+-- the tenant's user type for people arriving through its corporate login, when
+-- it has one. That default is given once, to a person the directory brings in
+-- for the first time, and recorded as its own source; an invitation the person
+-- claims keeps what the inviter chose. Emits `directoryAdmitted`, and
+-- `userTypeAssigned` from `corporateLoginDefault` when the default was given.
+-- Outcomes, all a success answer (refusing a login is the caller's decision,
+-- and the caller's words):
 --   * `admitted`    — a membership row was created, or an invited row for the same
 --                     person in that tenant was activated (the invitation's roles
 --                     are kept; `claimedInvitation` says so in the event);
@@ -819,13 +858,22 @@ BEGIN
                 v_admitted := jsonb_build_array(jsonb_build_object('userId', v_user.id, 'tenantId', v_tenant));
         END CASE;
     ELSE
-        INSERT INTO rolebyte.user_account (id, tenant_id, subject_key, display_name, status)
-        VALUES (util.generate_ulid(), v_tenant, v_subject, v_display, 'active')
+        INSERT INTO rolebyte.user_account (id, tenant_id, subject_key, display_name, status,
+                                           user_type_id, user_type_source)
+        SELECT util.generate_ulid(), v_tenant, v_subject, v_display, 'active',
+               t.corporate_login_user_type_id,
+               CASE WHEN t.corporate_login_user_type_id IS NOT NULL THEN 'corporateLoginDefault' END
+          FROM rolebyte.tenant t WHERE t.id = v_tenant
         RETURNING * INTO v_user;
 
         INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
         VALUES (util.generate_ulid(), v_actor, v_tenant, v_user.id, 'directoryAdmitted',
                 jsonb_build_object('subjectKey', v_subject, 'issuer', v_issuer, 'displayName', v_display));
+        IF v_user.user_type_id IS NOT NULL THEN
+            INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+            VALUES (util.generate_ulid(), v_actor, v_tenant, v_user.id, 'userTypeAssigned',
+                    jsonb_build_object('userTypeId', v_user.user_type_id, 'from', '', 'source', 'corporateLoginDefault'));
+        END IF;
 
         v_outcome  := 'admitted';
         v_admitted := jsonb_build_array(jsonb_build_object('userId', v_user.id, 'tenantId', v_tenant));
@@ -1346,7 +1394,11 @@ BEGIN
                                  FROM rolebyte.tenant_role_assignment ta
                                  JOIN rolebyte.tenant_role_permission tp ON tp.tenant_role_id = ta.tenant_role_id
                                 WHERE ta.user_id = u.id AND ta.tenant_id = u.tenant_id AND ta.state = 'granted'
-                                  AND tp.permission_id = sp.id)))
+                                  AND tp.permission_id = sp.id))
+                           -- A person's user type: tenant-wide permissions only.
+                           OR (sp.class = 'ordinary' AND sp.plane = 'tenant' AND EXISTS (
+                               SELECT 1 FROM rolebyte.user_type_permission up
+                                WHERE up.user_type_id = u.user_type_id AND up.permission_id = sp.id)))
                       AND EXISTS (
                           SELECT 1 FROM rolebyte.tenant_entitlement e
                            WHERE e.tenant_id = u.tenant_id
@@ -2330,6 +2382,7 @@ BEGIN
 
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
                'id',          r.id,
+               'seed',        r.seed,
                'name',        r.name,
                'description', r.description,
                'permissions', COALESCE((
@@ -2911,9 +2964,11 @@ REVOKE ALL ON PROCEDURE rolebyte.entitlement_list(jsonb, jsonb) FROM PUBLIC;
 -- ===========================================================================
 
 -- tenant_open — a new tenant with its first administrator, invited until their
--- first sign-in. The administrator is named by the subject key the identity
--- store gave them, as every invitation is. Emits `tenantCreated`, `userInvited`,
--- `roleGranted` and `administratorSetByOperator`.
+-- first sign-in, and the roles it starts with: Guest, Worker and Manager, holding
+-- what the services declared for them, named in `language` (English unless
+-- "lv"). The administrator is named by the subject key the identity store gave
+-- them, as every invitation is. Emits `tenantCreated`, `userInvited`,
+-- `roleGranted`, `administratorSetByOperator` and a `tenantRoleSeeded` per role.
 CREATE OR REPLACE PROCEDURE rolebyte.tenant_open(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -2927,6 +2982,7 @@ DECLARE
     v_display text;
     v_tenant  rolebyte.tenant%ROWTYPE;
     v_made    jsonb;
+    v_roles   jsonb;
 BEGIN
     v_actor := NULLIF(trim(pi_data->>'actor'), '');
     v_name  := NULLIF(trim(pi_data->>'name'), '');
@@ -2970,6 +3026,8 @@ BEGIN
     VALUES (util.generate_ulid(), v_actor, v_tenant.id, v_made->'data'->>'userId',
             'administratorSetByOperator', '{}'::jsonb);
 
+    v_roles := rolebyte.seed_roles(v_actor, v_tenant.id, NULLIF(btrim(pi_data->>'language'), ''));
+
     po_data := util.result_success(jsonb_build_object(
         'tenant', jsonb_build_object(
             'id',        v_tenant.id,
@@ -2978,7 +3036,8 @@ BEGIN
             'createdAt', v_tenant.created_at),
         'administrator', jsonb_build_object(
             'id',     v_made->'data'->>'userId',
-            'status', v_made->'data'->>'status')
+            'status', v_made->'data'->>'status'),
+        'roles', v_roles
     ));
 EXCEPTION
     WHEN sqlstate 'P0001' THEN

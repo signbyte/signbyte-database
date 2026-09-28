@@ -122,13 +122,13 @@ BEGIN
     -- 1. DEFINE. A role is made with a name, a description and nothing ticked, and
     --    the history names who made it.
     v := pg_temp.ok('tenant_role_define', jsonb_build_object('actor', 'adm-a', 'tenantId', v_ta,
-        'name', '  Manager  ', 'description', 'Runs a project'), 'define in A');
+        'name', '  Site lead  ', 'description', 'Runs a project'), 'define in A');
     v_role := v->>'id';
     IF length(v_role) <> 26 THEN RAISE EXCEPTION 'a role is identified by a generated id: %', v; END IF;
-    IF v->>'name' IS DISTINCT FROM 'Manager' THEN RAISE EXCEPTION 'the name is stored trimmed: %', v; END IF;
+    IF v->>'name' IS DISTINCT FROM 'Site lead' THEN RAISE EXCEPTION 'the name is stored trimmed: %', v; END IF;
     IF v->'permissions' IS DISTINCT FROM '[]'::jsonb THEN RAISE EXCEPTION 'a new role holds nothing: %', v; END IF;
     v := pg_temp.event_of('tenantRoleDefined', v_role, 'adm-a', v_ta);
-    IF v->>'name' IS DISTINCT FROM 'Manager' OR v->>'description' IS DISTINCT FROM 'Runs a project' THEN
+    IF v->>'name' IS DISTINCT FROM 'Site lead' OR v->>'description' IS DISTINCT FROM 'Runs a project' THEN
         RAISE EXCEPTION 'the definition event carries the label: %', v;
     END IF;
 
@@ -136,7 +136,7 @@ BEGIN
     PERFORM pg_temp.refused('tenant_role_define', jsonb_build_object('actor', 'adm-a', 'tenantId', v_ta, 'name', 'MANAGER'),
         'membership:conflict', 'the same name in another case');
     v_rb := pg_temp.ok('tenant_role_define', jsonb_build_object('actor', 'adm-b', 'tenantId', v_tb,
-        'name', 'Manager', 'description', 'B''s own'), 'the same name in tenant B')->>'id';
+        'name', 'Site lead', 'description', 'B''s own'), 'the same name in tenant B')->>'id';
     IF v_rb = v_role THEN RAISE EXCEPTION 'two tenants must get two roles'; END IF;
 
     -- Every malformed definition is refused and stores nothing.
@@ -175,7 +175,7 @@ BEGIN
         RAISE EXCEPTION 'an absent description keeps the one there: %', v;
     END IF;
     v := pg_temp.event_of('tenantRoleRenamed', v_role, 'adm-a', v_ta);
-    IF v->>'from' IS DISTINCT FROM 'Manager' OR v->>'to' IS DISTINCT FROM 'Meistars' THEN
+    IF v->>'from' IS DISTINCT FROM 'Site lead' OR v->>'to' IS DISTINCT FROM 'Meistars' THEN
         RAISE EXCEPTION 'the rename event says from what to what: %', v;
     END IF;
 
@@ -210,7 +210,7 @@ BEGIN
     v := pg_temp.ok('tenant_role_update', jsonb_build_object('actor', 'adm-a', 'tenantId', v_ta,
         'roleId', v_role, 'name', 'Meistars'), 'back to the name');
     v_other := pg_temp.ok('tenant_role_define', jsonb_build_object('actor', 'adm-a', 'tenantId', v_ta,
-        'name', 'Worker'), 'a second role in A')->>'id';
+        'name', 'Yard hand'), 'a second role in A')->>'id';
     PERFORM pg_temp.refused('tenant_role_update', jsonb_build_object('actor', 'adm-a', 'tenantId', v_ta,
         'roleId', v_other, 'name', 'meistars'), 'membership:conflict', 'renaming onto another role''s name');
     PERFORM pg_temp.refused('tenant_role_update', jsonb_build_object('actor', 'adm-a', 'tenantId', v_ta,
@@ -405,15 +405,16 @@ BEGIN
     -- 6. THE OTHER TENANT, after all four: its role is exactly as it made it, and
     --    its history holds nothing but its own act.
     v := pg_temp.ok('tenant_role_list', jsonb_build_object('tenantId', v_tb), 'list B');
-    IF jsonb_array_length(v->'roles') <> 1
-       OR v->'roles'->0->>'id' IS DISTINCT FROM v_rb
-       OR v->'roles'->0->>'name' IS DISTINCT FROM 'Manager'
-       OR v->'roles'->0->>'description' IS DISTINCT FROM 'B''s own'
-       OR v->'roles'->0->'permissions' IS DISTINCT FROM '[]'::jsonb THEN
+    -- (Beside the roles every new tenant starts with, which nobody here touched.)
+    IF (SELECT count(*) FROM rolebyte.tenant_role WHERE tenant_id = v_tb AND seed = '') IS DISTINCT FROM 1
+       OR (SELECT r->>'name' FROM jsonb_array_elements(v->'roles') r WHERE r->>'id' = v_rb) IS DISTINCT FROM 'Site lead'
+       OR (SELECT r->>'description' FROM jsonb_array_elements(v->'roles') r WHERE r->>'id' = v_rb) IS DISTINCT FROM 'B''s own'
+       OR (SELECT r->'permissions' FROM jsonb_array_elements(v->'roles') r WHERE r->>'id' = v_rb) IS DISTINCT FROM '[]'::jsonb THEN
         RAISE EXCEPTION 'tenant B''s role must be untouched: %', v;
     END IF;
     v := pg_temp.ok('history', jsonb_build_object('tenantId', v_tb), 'history B');
-    IF (SELECT count(*) FROM jsonb_array_elements(v->'events') e WHERE e->>'kind' LIKE 'tenantRole%') <> 1
+    IF (SELECT count(*) FROM jsonb_array_elements(v->'events') e
+         WHERE e->>'kind' LIKE 'tenantRole%' AND e->>'kind' <> 'tenantRoleSeeded') IS DISTINCT FROM 1
        OR NOT EXISTS (SELECT 1 FROM jsonb_array_elements(v->'events') e
                       WHERE e->>'kind' = 'tenantRoleDefined' AND e->>'actor' = 'adm-b') THEN
         RAISE EXCEPTION 'tenant B''s history holds only its own definition: %', v;
@@ -421,10 +422,11 @@ BEGIN
 
     -- A's list holds what is left, ordered by name, each with what it holds.
     v := pg_temp.ok('tenant_role_list', jsonb_build_object('tenantId', v_ta), 'list A');
-    IF jsonb_array_length(v->'roles') <> 2
-       OR v->'roles'->0->>'id' IS DISTINCT FROM v_long
-       OR v->'roles'->1->>'id' IS DISTINCT FROM v_other
-       OR v->'roles'->1->'permissions' IS DISTINCT FROM '[]'::jsonb THEN
+    -- (Beside the roles every new tenant starts with.)
+    IF (SELECT count(*) FROM rolebyte.tenant_role WHERE tenant_id = v_ta AND seed = '') IS DISTINCT FROM 2
+       OR (SELECT array_agg(r.value->>'id' ORDER BY r.ordinality) FROM jsonb_array_elements(v->'roles') WITH ORDINALITY r
+            WHERE r.value->>'id' IN (v_long, v_other)) IS DISTINCT FROM ARRAY[v_long, v_other]
+       OR (SELECT r->'permissions' FROM jsonb_array_elements(v->'roles') r WHERE r->>'id' = v_other) IS DISTINCT FROM '[]'::jsonb THEN
         RAISE EXCEPTION 'tenant A lists its two remaining roles by name: %', v;
     END IF;
     PERFORM pg_temp.refused('tenant_role_list', '{}'::jsonb, 'membership:invalid', 'a list with no tenant');
