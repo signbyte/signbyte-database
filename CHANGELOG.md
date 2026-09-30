@@ -4,6 +4,228 @@ Notable changes to the signbyte database — the schema set and the migration im
 newest first, per release. Written for whoever applies the image to a database or
 integrates against the procedures.
 
+## v0.3.0
+
+### Added — a family of permissions, one per field
+
+Migration `V13` widens `rolebyte.service_permission`'s class check to `perField`, requires such a permission to be on
+the object plane, adds a nullable `param` column to `rolebyte.tenant_role_permission` and moves that table's key to a
+unique key over `(tenant_role_id, permission_id, param)` that treats two NULLs as equal, rewriting nothing. **A
+deployment whose services declare no per-field family behaves exactly as before.** Apply it before a service's
+permission section that declares one: an older register refuses the class.
+
+A service whose tenants add fields of their own declares one family per kind of field (class `perField`, object
+plane, no `seeds`), and a role holds it one field at a time, spelled `<family>@<key>.<generation>`.
+`rolebyte.tenant_role_permissions_set` takes such names, and refuses the bare family (every field of its kind, held
+only by the Administrator checkbox) and `@` on any other permission with `membership:invalid`. The new
+`rolebyte.field_permission_roles_set({actor, tenantId, permission, roleIds})` sets which of a tenant's roles hold one
+field as a whole set, touching no other tick, and is granted to the register's own role.
+`rolebyte.tenant_role_definitions`, `tenant_role_list` and the reconfiguration events spell a field's tick with its
+`@` part; `rolebyte.resolve` never puts one on a token, and an administrator's token carries the bare family.
+
+### Changed — the CSC signing flow is two flows
+
+Migrations `envelope` `V9` and `signflow` `V6` each replace one `CHECK` constraint (`ck_slot_flow`,
+`ck_signing_job_flow`) by drop and re-add, rewriting nothing. The single `csc` flow is now two, named for how the eID
+card is read: `cscEidScan` (a phone reads it) and `cscEidPlugin` (a card reader, through the provider's browser
+extension). `envelope.add_slot` and the signing procedures accept the two names and refuse `csc` with `invalid flow`;
+rows already stored with `csc` stay valid and are not touched. **Deploy together with signing services that send the
+new names.**
+
+### Added — roles a new tenant can start with, and user types
+
+Migration `V12` adds columns to `rolebyte.service_permission`, `rolebyte.tenant_role`, `rolebyte.user_account` and
+`rolebyte.tenant`, and two tables (`rolebyte.user_type`, `rolebyte.user_type_permission`), rewriting nothing. **A
+deployment whose services declare no shipped roles behaves exactly as before**: its tenants open with no roles.
+
+A permission declaration may carry `seeds`, `"worker"`, `"manager"` or both, on an ordinary permission of the object
+plane only (anything else is `membership:invalid`). Once any service declares one, `rolebyte.tenant_create` and
+`rolebyte.tenant_open` create three roles with every new tenant: *Guest* (holding nothing), *Worker* and *Manager*,
+each holding the permissions whose `seeds` name it, named in Latvian when the tenant is opened with `"language":
+"lv"`. `rolebyte.tenant_open` answers them under `roles`, and `rolebyte.tenant_role_definitions` names each one's
+`seed`. A tenant changes or deletes them like any other role. Tenants already open are not touched until the operator
+runs `rolebyte.tenant_seed_roles({actor, tenantId})` for them, which creates the shipped roles a tenant lacks from what
+is declared now, leaves what it has alone, and changes nothing when run again.
+
+User types are named sets of a tenant's **tenant-wide** permissions, given to a member across the tenant:
+`rolebyte.user_type_define`, `user_type_update`, `user_type_delete` (refused while anybody holds it),
+`user_type_list` and `user_type_assign`, with `rolebyte.resolve` adding what the member's user type holds. A tenant
+may also choose one user type for people arriving through its attached directory
+(`rolebyte.corporate_login_default_set` / `_get`); `rolebyte.directory_admit` gives it once, to a person admitted for
+the first time, never to one claiming an invitation. Every act is an attributed event, and each event carries the
+state it left, so the history alone rebuilds every role and user type. All new procedures are granted to the
+register's own role.
+
+```
+CALL rolebyte.user_type_define('{"actor":"sub:…","tenantId":"01K6…","name":"Office",
+      "permissions":["work/project:create"]}'::jsonb, NULL);
+→ {"id":"01K6…","name":"Office","description":"","permissions":["work/project:create"],
+   "members":0,"corporateLoginDefault":false}
+```
+
+### Added — who holds what in a tenant
+
+A new procedure, `rolebyte.access_list`, with no migration and nothing to provision: every member of a tenant,
+ordered by name, with what the register holds for them — `kind` (`person` or `service`), `status`,
+`administrator`, `arrival`, `serviceRoles` (service, group, level) and `tenantRoles` (id, name). It answers what is
+stored: a member whose access was revoked is listed with the grants still on record, and service accounts are
+listed and marked. `arrival` is an active person holding nothing. It is granted to the register's own role and
+writes nothing.
+
+### Changed — a declared permission says where it may be granted, carries a label per language, and can be retired
+
+Migration `V11` adds three columns to `rolebyte.service_permission` without rewriting it.
+
+**A declaration without `plane` is now refused**, so a service that declares permissions must send it from the
+same release as this image. `plane` is `tenant` (granted to the whole tenant) or `object` (placed on one object the
+service owns), and like `class` it never changes: naming the other one is refused with `membership:conflict`. A
+permission declared before this migration takes its plane from its next declaration.
+
+`labels` is an optional map from a language tag to a label (`{"lv": "…"}`); `description` stays the fallback. A
+declaration with `"retired": true` retires the permission, and one without the mark brings it back. A retired
+permission keeps working for every tenant role that already ticks it, cannot be added to any other
+(`membership:invalid`, *"‹permission› is retired: a role that holds it keeps it, and no role can be given it
+again"*), and no longer reaches a tenant's administrators. The configuration section answers and accepts all three,
+so an export applied back changes nothing.
+
+```
+CALL rolebyte.permission_declare('{"actor":"svc:you","service":"work","permission":
+      {"feature":"task/comment","act":"add","class":"ordinary","plane":"object",
+       "labels":{"lv":"Komentēt uzdevumu"}}}'::jsonb, NULL);
+→ {"permission":"work/task/comment:add","status":"added"}
+```
+
+### Added — a tenant keeps its last administrator, and the operator has a way back
+
+A tenant's administrator is a member holding the `membership:admin` role whose access is not revoked. Revoking
+that role from the tenant's last administrator, or revoking their access, is now refused with
+`membership:conflict` and *"‹name› is this tenant's last administrator; make someone else an administrator
+first"*. An invited administrator counts. Two administrators removing each other at the same moment cannot both
+succeed.
+
+The deployment's operator, as the location's owner (the service role cannot), can now open a tenant with its first
+administrator, make someone an administrator, remove one, and list every tenant with its administrators:
+
+```
+CALL rolebyte.tenant_open('{"actor":"op:you","name":"Workshop","administrator":{"subjectKey":"sub:01J…","displayName":"Ilze"}}'::jsonb, NULL);
+CALL rolebyte.administrator_set('{"actor":"op:you","tenantId":"01J…","subjectKey":"sub:01J…","displayName":"Ilze"}'::jsonb, NULL);
+CALL rolebyte.administrator_unset('{"actor":"op:you","tenantId":"01J…","userId":"01J…"}'::jsonb, NULL);
+CALL rolebyte.tenant_overview('{}'::jsonb, NULL);
+```
+
+An administrator can also be named in the service's environment and is applied at start, once per value, through
+the new `rolebyte.administrator_seed`, remembered in the new table `rolebyte.administrator_seed` (migration `V10`,
+a new empty table). A seed never removes anyone.
+
+**Changed:** an administrator now also resolves every permission the tenant has, and no role can hold a permission
+that changes the tenant's own setup. Where no service declares permissions, which is the signbyte case today,
+every resolve answers exactly as before. Nothing to do on upgrade.
+
+### Added — a service that places a tenant's roles reads them, and a role in use cannot be deleted
+
+A member service that places the tenant's roles on its own objects reads what each role carries with the new
+`rolebyte.tenant_role_definitions`: each role's id, name and description, and its permissions narrowed to what the
+tenant has. It reports how many times it placed each role with the new `rolebyte.tenant_role_placements_set`,
+stored in the new table `rolebyte.tenant_role_placement` (migration `V9`, a new empty table).
+
+```
+CALL rolebyte.tenant_role_definitions('{"tenantId":"01J…"}'::jsonb, NULL);
+CALL rolebyte.tenant_role_placements_set('{"tenantId":"01J…","reporterId":"01J…","placements":{"01J…":12}}'::jsonb, NULL);
+```
+
+**Changed:** `rolebyte.tenant_role_delete` now also refuses a role that an active member service reports placed,
+with `membership:conflict` and the count. Nothing to do on upgrade: until a service reports a placement, every
+delete answers as before.
+
+### Added — what a tenant has decides which of its roles' permissions reach a token
+
+A tenant now has a part of the catalog services declare: a whole service, or one feature of it, recorded in
+the new table `rolebyte.tenant_entitlement` (migration `V8`, a new empty table). A permission a tenant role ticks
+reaches `rolebyte.resolve` only while the tenant has its feature; a feature covers the features nested under it.
+
+```
+CALL rolebyte.entitlement_grant('{"actor":"op:you","tenantId":"01J…","service":"projects"}'::jsonb, NULL);
+CALL rolebyte.entitlement_revoke('{"actor":"op:you","tenantId":"01J…","service":"projects"}'::jsonb, NULL);
+CALL rolebyte.entitlement_list('{"tenantId":"01J…"}'::jsonb, NULL);
+```
+
+Revoking deletes nothing the tenant configured: its roles keep their permissions, which come back when the
+entitlement does. The three procedures are **not** granted to `rolebyte_public`; the deployment's operator calls
+them as the location's owner. A service's `group:level` role is never filtered, so **a person holding no tenant
+role resolves exactly as before**. **If you grant tenant roles:** entitle each such tenant after applying this
+image, or its roles' permissions stop reaching tokens.
+
+### Changed — `rolebyte.resolve` answers what a granted tenant role holds
+
+Each membership's `scopes` now carries every permission a granted tenant role of that membership ticks,
+spelled as it travels, beside the `group:level` strings its service roles give:
+
+```
+{"subjectKey":"sub:01J…"}
+→ {"memberships":[{"tenantId":"01J…","userId":"01J…","displayName":"…",
+                   "scopes":["projects/spentTime:view","projects/task:edit","projects:log"]}]}
+```
+
+**A person holding no tenant role resolves byte for byte as before** (asserted by `unit.rolebyte_resolve.sql`
+against the previous aggregation). The list stays distinct; its order is the database collation's and is not
+part of the contract. No signature change and no new migration.
+
+### Added — a tenant defines its own roles
+
+A role was always a service's: one `group:level` rung, the same on every tenant. A tenant can now make
+**its own roles** out of the permissions services declare, name them as it names them, and change them at
+will. A tenant role is identified by its id; its name is a label, unique in the tenant ignoring case, and
+one role may hold permissions of several services. What a granted role holds reaches `rolebyte.resolve`
+(below).
+
+```
+rolebyte.tenant_role_define        {"actor":"…","tenantId":"…","name":"Manager"}
+  → {"id":"…","name":"Manager","description":"","permissions":[]}
+rolebyte.tenant_role_permissions_set {"actor":"…","tenantId":"…","roleId":"…",
+                                    "permissions":["projects/task:edit","projects/spentTime:view"]}
+  → {"id":"…","permissions":[…],"added":[…],"removed":[],"changed":true}
+```
+
+Beside them: `tenant_role_list`, `tenant_role_update` (rename; an absent description keeps the one there),
+`tenant_role_delete` (**refused with `membership:conflict` while anybody holds the role**), and
+`tenant_role_grant` / `tenant_role_revoke` by the role's id. A tick naming a permission nobody declared is
+`membership:unknown_permission` and changes nothing. A role of another tenant answers exactly as one that
+never existed. Every change is an attributed event under new kinds (`tenantRoleDefined` … `tenantRoleRevoked`),
+none of which carries a `service`.
+
+New migration `rolebyte/V7__tenant_role.sql`. It rewrites no row. It adds `UNIQUE (tenant_id, id)` to
+`rolebyte.user_account`, which refuses nothing and builds one index, so that a grant can reference a person
+and a role **together with their tenant**: a grant joining two tenants cannot be stored at all. Apply the
+schema before a rolebyte service that uses these procedures; an older service is unaffected.
+
+### Added — `rolebyte.permission_declare`: a service declares the permissions it enforces
+
+A service could declare its roles (one `group:level` rung each) and nothing finer. It can now also
+declare **permissions**: one act on one feature, spelled `<service>/<feature path>:<act>`, for example
+`projects/task/attachment:deleteAny`. The feature path may nest, and nesting grants nothing. Declaring
+changes nothing that anybody holds: no role carries a permission and no token contains one yet.
+
+```
+{"actor":"…","service":"projects",
+ "permission":{"feature":"task/attachment","act":"deleteAny","description":"…","class":"ordinary"}}
+→ {"permission":"projects/task/attachment:deleteAny","status":"added"}
+```
+
+The status is `added`, `unchanged`, or `changed` for a new description. **A permission's `class`**
+(`ordinary` · `tenantConfiguration` · `roleManagement`) **never changes**: a declaration naming a
+different class is refused with `membership:conflict`, naming the permission. **An unknown property is
+refused** with `membership:invalid` rather than dropped. The configuration section carries
+`services[].permissions[]` beside `roles`: `config_get` answers it, and `config_apply` declares it and
+rolls the whole section back on any refused entry.
+
+New migration `rolebyte/V6__service_permission.sql`. It rewrites no row.
+
+### Changed — a role's group may no longer contain `/`
+
+`/` now marks a permission, so `rolebyte.role_define` refuses such a group with `membership:invalid`
+and the table checks it too. The migration confirms first that no existing role group contains one; if
+one does, it stops and says so rather than rewriting anything.
+
 ## v0.2.0
 
 ### Added — `rolebyte.user_list`: the tenant's people, by name, for a picker

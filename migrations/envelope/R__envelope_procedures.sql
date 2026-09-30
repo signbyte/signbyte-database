@@ -412,7 +412,7 @@ BEGIN
     IF v_role NOT IN ('signer', 'approver', 'observer') THEN
         po_data := util.result_error('envelope:invalid', 'invalid role'); RETURN;
     END IF;
-    IF v_flow IS NOT NULL AND v_flow NOT IN ('webEid', 'eidScan', 'eparakstsMobile', 'eparakstsMobileEseal', 'csc') THEN
+    IF v_flow IS NOT NULL AND v_flow NOT IN ('webEid', 'eidScan', 'eparakstsMobile', 'eparakstsMobileEseal', 'cscEidScan', 'cscEidPlugin') THEN
         po_data := util.result_error('envelope:invalid', 'invalid flow'); RETURN;
     END IF;
     -- An absent identity_ref is the owner's own slot and stays absent. A present one
