@@ -90,9 +90,13 @@ jobs:
           exit 0
         fi
         rc=0
+        # A versioned migration is migrations/<location>/V<n>__<what>.sql, the only
+        # shape the runner applies. A test fixture named for the version it tests
+        # (migrations/testing/fixtures/<location>/V<n>.seed.sql) is never applied, and
+        # changes when a later version changes what it can assert.
         for base in $bases; do
           changed=$(git diff --diff-filter=MD --name-only "$base" "${{ github.sha }}" -- migrations/ \
-                    | grep -E '/V[0-9][^/]*\.sql$' || true)
+                    | grep -E '^migrations/[^/]+/V[0-9]+__[^/]*\.sql$' || true)
           if [ -n "$changed" ]; then
             echo "::error::Modifying or deleting an already-applied versioned migration is not allowed — add a NEW V*.sql instead. Offending file(s) since ${base}:"
             echo "$changed"
