@@ -6,6 +6,23 @@ integrates against the procedures.
 
 ## v0.3.0
 
+### Added — a family of permissions, one per field
+
+Migration `V13` widens `rolebyte.service_permission`'s class check to `perField`, requires such a permission to be on
+the object plane, adds a nullable `param` column to `rolebyte.tenant_role_permission` and moves that table's key to a
+unique key over `(tenant_role_id, permission_id, param)` that treats two NULLs as equal, rewriting nothing. **A
+deployment whose services declare no per-field family behaves exactly as before.** Apply it before a service's
+permission section that declares one: an older register refuses the class.
+
+A service whose tenants add fields of their own declares one family per kind of field (class `perField`, object
+plane, no `seeds`), and a role holds it one field at a time, spelled `<family>@<key>.<generation>`.
+`rolebyte.tenant_role_permissions_set` takes such names, and refuses the bare family (every field of its kind, held
+only by the Administrator checkbox) and `@` on any other permission with `membership:invalid`. The new
+`rolebyte.field_permission_roles_set({actor, tenantId, permission, roleIds})` sets which of a tenant's roles hold one
+field as a whole set, touching no other tick, and is granted to the register's own role.
+`rolebyte.tenant_role_definitions`, `tenant_role_list` and the reconfiguration events spell a field's tick with its
+`@` part; `rolebyte.resolve` never puts one on a token, and an administrator's token carries the bare family.
+
 ### Changed — the CSC signing flow is two flows
 
 Migrations `envelope` `V9` and `signflow` `V6` each replace one `CHECK` constraint (`ck_slot_flow`,
