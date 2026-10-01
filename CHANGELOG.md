@@ -6,6 +6,13 @@ integrates against the procedures.
 
 ## v0.4.0
 
+### Added — one helper for a configuration's version
+
+Migration `util/V3` adds `util.config_token(schema, scope, section)`, a pure function that computes the version token
+of a section of configuration (`sha256:` and the hex SHA-256 of the schema name, the scope and the section's text). It
+creates no table, writes no row and is granted to no service role. Every deployment records one more applied
+migration in `flyway_schema_history_util`; nothing else changes.
+
 ### Added — an organisation chart, and a user type for every member
 
 Migration `V14` adds three tables to `rolebyte` — `chart_position` (a tree of positions, one top per tenant),
