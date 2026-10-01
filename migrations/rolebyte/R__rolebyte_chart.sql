@@ -270,6 +270,10 @@ BEGIN
         po_data := util.result_error('membership:invalid', 'a position needs a name of 1 to 100 characters on one line');
         RETURN;
     END IF;
+    IF NOT rolebyte.chart_entitled(v_tenant) THEN
+        po_data := util.result_error('membership:conflict', 'the workspace does not include the chart of authority');
+        RETURN;
+    END IF;
     SELECT name INTO v_before FROM rolebyte.chart_position WHERE tenant_id = v_tenant AND id = v_id FOR UPDATE;
     IF NOT FOUND THEN
         po_data := util.result_error('membership:not_found', 'no such position');
@@ -311,6 +315,10 @@ DECLARE
 BEGIN
     IF v_actor IS NULL OR v_tenant IS NULL OR v_id IS NULL OR v_parent IS NULL THEN
         po_data := util.result_error('membership:invalid', 'actor, tenantId, positionId and parentId are required');
+        RETURN;
+    END IF;
+    IF NOT rolebyte.chart_entitled(v_tenant) THEN
+        po_data := util.result_error('membership:conflict', 'the workspace does not include the chart of authority');
         RETURN;
     END IF;
     -- One lock per tenant: two moves at once could each look safe and together make a loop.
@@ -375,6 +383,10 @@ BEGIN
         po_data := util.result_error('membership:invalid', 'actor, tenantId and positionId are required');
         RETURN;
     END IF;
+    IF NOT rolebyte.chart_entitled(v_tenant) THEN
+        po_data := util.result_error('membership:conflict', 'the workspace does not include the chart of authority');
+        RETURN;
+    END IF;
     PERFORM 1 FROM rolebyte.chart_position WHERE tenant_id = v_tenant AND id = v_id FOR UPDATE;
     IF NOT FOUND THEN
         po_data := util.result_error('membership:not_found', 'no such position');
@@ -423,6 +435,10 @@ DECLARE
 BEGIN
     IF v_actor IS NULL OR v_tenant IS NULL OR v_id IS NULL THEN
         po_data := util.result_error('membership:invalid', 'actor, tenantId and positionId are required');
+        RETURN;
+    END IF;
+    IF NOT rolebyte.chart_entitled(v_tenant) THEN
+        po_data := util.result_error('membership:conflict', 'the workspace does not include the chart of authority');
         RETURN;
     END IF;
     v_ids := rolebyte.chart_permission_ids(pi_data->'permissions');
@@ -478,6 +494,10 @@ BEGIN
         po_data := util.result_error('membership:invalid', 'actor, tenantId and positionId are required');
         RETURN;
     END IF;
+    IF NOT rolebyte.chart_entitled(v_tenant) THEN
+        po_data := util.result_error('membership:conflict', 'the workspace does not include the chart of authority');
+        RETURN;
+    END IF;
     SELECT user_type_id INTO v_before FROM rolebyte.chart_position WHERE tenant_id = v_tenant AND id = v_id FOR UPDATE;
     IF NOT FOUND THEN
         po_data := util.result_error('membership:not_found', 'no such position');
@@ -524,6 +544,10 @@ DECLARE
 BEGIN
     IF v_actor IS NULL OR v_tenant IS NULL OR v_user IS NULL OR v_pos IS NULL THEN
         po_data := util.result_error('membership:invalid', 'actor, tenantId, userId and positionId are required');
+        RETURN;
+    END IF;
+    IF NOT rolebyte.chart_entitled(v_tenant) THEN
+        po_data := util.result_error('membership:conflict', 'the workspace does not include the chart of authority');
         RETURN;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM rolebyte.chart_position WHERE tenant_id = v_tenant AND id = v_pos) THEN
@@ -579,6 +603,10 @@ DECLARE
 BEGIN
     IF v_actor IS NULL OR v_tenant IS NULL OR v_user IS NULL THEN
         po_data := util.result_error('membership:invalid', 'actor, tenantId and userId are required');
+        RETURN;
+    END IF;
+    IF NOT rolebyte.chart_entitled(v_tenant) THEN
+        po_data := util.result_error('membership:conflict', 'the workspace does not include the chart of authority');
         RETURN;
     END IF;
     SELECT position_id INTO v_before

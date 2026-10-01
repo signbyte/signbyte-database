@@ -98,6 +98,7 @@ DECLARE
     v_office  text;
     v_site    text;
     v_crew    text;
+    v_spare   text;
     v_pm      text;
     v_role    text;
     v_foreign text;
@@ -268,6 +269,11 @@ BEGIN
     v_foreign := (SELECT id FROM rolebyte.user_account WHERE tenant_id = v_tb LIMIT 1);
     PERFORM pg_temp.refused('chart_person_place', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta, 'userId', v_foreign,
         'positionId', v_crew), 'membership:not_found', 'another tenant''s member');
+    -- Without the chart, B is refused before anything is looked up; with it, A's
+    -- position is not found from B.
+    PERFORM pg_temp.refused('chart_person_place', jsonb_build_object('actor', 'op:test', 'tenantId', v_tb, 'userId', v_foreign,
+        'positionId', v_crew), 'membership:conflict', 'a placement in a workspace without the chart');
+    PERFORM pg_temp.ok('entitlement_grant', jsonb_build_object('actor', 'op:test', 'tenantId', v_tb, 'service', 'authority'), 'entitle B');
     PERFORM pg_temp.refused('chart_person_place', jsonb_build_object('actor', 'op:test', 'tenantId', v_tb, 'userId', v_foreign,
         'positionId', v_crew), 'membership:not_found', 'another tenant''s position');
 
@@ -384,17 +390,48 @@ BEGIN
     ----------------------------------------------------------------
     -- 6. The chart lapses and returns: nothing is deleted.
     ----------------------------------------------------------------
+    -- An empty position, so that removing it is refused by the lapse alone.
+    v_spare := pg_temp.ok('chart_position_add', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta,
+        'name', 'Spare', 'parentId', v_office), 'spare')->>'id';
     PERFORM pg_temp.ok('entitlement_revoke', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta, 'service', 'authority'), 'lapse');
     IF pg_temp.scopes(v_sanna, v_ta) ? 'authority/project:view' THEN RAISE EXCEPTION 'a lapsed chart gives no box'; END IF;
     v := pg_temp.ok('chart_document', jsonb_build_object('tenantId', v_ta), 'document after lapse');
     IF v->'below' IS DISTINCT FROM '{}'::jsonb THEN RAISE EXCEPTION 'a lapsed chart answers empty: %', v; END IF;
     v := pg_temp.ok('chart_get', jsonb_build_object('tenantId', v_ta), 'get after lapse');
-    IF (v->>'included')::boolean OR jsonb_array_length(v->'positions') <> 5 THEN
+    IF (v->>'included')::boolean OR jsonb_array_length(v->'positions') <> 6 THEN
         RAISE EXCEPTION 'the positions stay, and the editor says the chart is not included: %', v;
     END IF;
     PERFORM pg_temp.refused('chart_position_add', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta, 'name', 'More',
         'parentId', v_office), 'membership:conflict', 'a write after the lapse');
+    -- Every other write is refused as well, and none of them writes anything.
+    SELECT count(*) INTO v_n FROM rolebyte.event WHERE tenant_id = v_ta AND kind LIKE 'chart%';
+    PERFORM pg_temp.refused('chart_position_rename', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta,
+        'positionId', v_crew, 'name', 'Renamed'), 'membership:conflict', 'a rename after the lapse');
+    PERFORM pg_temp.refused('chart_position_move', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta,
+        'positionId', v_crew, 'parentId', v_office), 'membership:conflict', 'a move after the lapse');
+    PERFORM pg_temp.refused('chart_position_remove', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta,
+        'positionId', v_spare), 'membership:conflict', 'a removal after the lapse');
+    PERFORM pg_temp.refused('chart_position_permissions_set', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta,
+        'positionId', v_director, 'permissions', '[]'::jsonb), 'membership:conflict', 'a position''s boxes after the lapse');
+    PERFORM pg_temp.refused('chart_position_user_type_set', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta,
+        'positionId', v_site, 'userTypeId', v_def), 'membership:conflict', 'a position''s user type after the lapse');
+    PERFORM pg_temp.refused('chart_person_place', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta,
+        'userId', v_ilze, 'positionId', v_crew), 'membership:conflict', 'a person placed after the lapse');
+    PERFORM pg_temp.refused('chart_person_remove', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta,
+        'userId', v_janis), 'membership:conflict', 'a person taken out after the lapse');
+    IF (SELECT count(*) FROM rolebyte.event WHERE tenant_id = v_ta AND kind LIKE 'chart%') IS DISTINCT FROM v_n::bigint THEN
+        RAISE EXCEPTION 'a refused chart write leaves no event';
+    END IF;
+    IF (SELECT name FROM rolebyte.chart_position WHERE id = v_crew) IS DISTINCT FROM 'Site team'
+       OR (SELECT parent_id FROM rolebyte.chart_position WHERE id = v_crew) IS DISTINCT FROM v_site
+       OR (SELECT position_id FROM rolebyte.chart_holder WHERE user_id = v_janis) IS DISTINCT FROM v_crew
+       OR (SELECT position_id FROM rolebyte.chart_holder WHERE user_id = v_ilze) IS DISTINCT FROM v_office
+       OR NOT EXISTS (SELECT 1 FROM rolebyte.chart_position WHERE id = v_spare) THEN
+        RAISE EXCEPTION 'a refused chart write changes nothing';
+    END IF;
     PERFORM pg_temp.ok('entitlement_grant', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta, 'service', 'authority'), 'again');
+    PERFORM pg_temp.ok('chart_position_remove', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta,
+        'positionId', v_spare), 'entitled again, the empty position is removed');
     IF NOT (pg_temp.scopes(v_sanna, v_ta) ? 'authority/project:view') THEN RAISE EXCEPTION 'entitled again, the box returns as left'; END IF;
     v := pg_temp.ok('chart_document', jsonb_build_object('tenantId', v_ta), 'document again');
     IF jsonb_array_length(v->'below'->v_sanna) <> 4 THEN RAISE EXCEPTION 'entitled again, the chart returns as left: %', v; END IF;
