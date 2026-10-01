@@ -262,6 +262,15 @@ BEGIN
                                  AND EXISTS (SELECT 1 FROM rolebyte.tenant_entitlement e
                                                JOIN rolebyte.service_permission sp ON sp.service_key = e.service_key
                                               WHERE e.tenant_id = u3.tenant_id AND e.state = 'entitled'));
+        -- A person who sits in a chart position, or holds a user type that carries
+        -- something, has a contributor the reference predates; unit.rolebyte_chart
+        -- and unit.rolebyte_seeds_user_types assert theirs.
+        CONTINUE WHEN EXISTS (SELECT 1 FROM rolebyte.user_account u4
+                               WHERE u4.subject_key = k
+                                 AND (EXISTS (SELECT 1 FROM rolebyte.chart_holder h
+                                               WHERE h.tenant_id = u4.tenant_id AND h.user_id = u4.id)
+                                      OR EXISTS (SELECT 1 FROM rolebyte.user_type_permission up
+                                                  WHERE up.user_type_id = u4.user_type_id)));
         PERFORM pg_temp.same_as_before(k, 'subject ' || k);
         v_n := v_n + 1;
     END LOOP;

@@ -288,11 +288,12 @@ BEGIN
     v := pg_temp.ok('corporate_login_default_get', jsonb_build_object('tenantId', v_ta), 'get empty');
     IF v->>'userTypeId' is distinct from '' THEN RAISE EXCEPTION 'empty until set: %', v; END IF;
 
-    -- Empty: Jānis arrives holding nothing.
+    -- Empty: Jānis arrives with the workspace's own default.
     PERFORM pg_temp.ok('directory_admit', jsonb_build_object('actor', 'idp', 'subjectKey', v_janis, 'issuer', v_iss,
         'displayName', 'Jānis Bērziņš'), 'admit Jānis');
-    IF (SELECT user_type_id FROM rolebyte.user_account WHERE tenant_id = v_ta AND subject_key = v_janis) IS NOT NULL THEN
-        RAISE EXCEPTION 'with no default a newcomer holds no user type';
+    IF (SELECT user_type_id || '/' || user_type_source FROM rolebyte.user_account WHERE tenant_id = v_ta AND subject_key = v_janis)
+       IS DISTINCT FROM (SELECT default_user_type_id FROM rolebyte.tenant WHERE id = v_ta) || '/workspaceDefault' THEN
+        RAISE EXCEPTION 'with no corporate default a newcomer receives the workspace default';
     END IF;
 
     PERFORM pg_temp.ok('corporate_login_default_set', jsonb_build_object('actor', v_admin, 'tenantId', v_ta,
@@ -311,11 +312,12 @@ BEGIN
         RAISE EXCEPTION 'the history says what the corporate login gave her, and that it did';
     END IF;
     IF EXISTS (SELECT 1 FROM rolebyte.event e JOIN rolebyte.user_account u ON u.id = e.user_id
-                WHERE e.kind = 'userTypeAssigned' AND u.tenant_id = v_ta AND u.subject_key = v_janis) THEN
-        RAISE EXCEPTION 'nothing given, nothing recorded';
+                WHERE e.kind = 'userTypeAssigned' AND u.tenant_id = v_ta AND u.subject_key = v_janis
+                  AND e.payload->>'source' IS DISTINCT FROM 'workspaceDefault') THEN
+        RAISE EXCEPTION 'what Jānis was given is recorded as the workspace default, never as the corporate login''s';
     END IF;
-    IF (SELECT user_type_id FROM rolebyte.user_account WHERE tenant_id = v_ta AND subject_key = v_janis) IS NOT NULL THEN
-        RAISE EXCEPTION 'setting the default never rewrites somebody already in';
+    IF (SELECT user_type_id FROM rolebyte.user_account WHERE tenant_id = v_ta AND subject_key = v_janis) IS DISTINCT FROM (SELECT default_user_type_id FROM rolebyte.tenant WHERE id = v_ta) THEN
+        RAISE EXCEPTION 'setting the corporate default never rewrites somebody already in';
     END IF;
 
     -- An invitation the person claims keeps what the inviter chose.
@@ -325,8 +327,9 @@ BEGIN
         'displayName', 'Toms Krūmiņš', 'roles', '[]'::jsonb), 'invite Toms');
     PERFORM pg_temp.ok('directory_admit', jsonb_build_object('actor', 'idp', 'subjectKey', v_admin2, 'issuer', v_iss,
         'displayName', 'Toms Krūmiņš'), 'Toms claims his invitation');
-    IF (SELECT user_type_id FROM rolebyte.user_account WHERE tenant_id = v_ta AND subject_key = v_admin2) IS NOT NULL THEN
-        RAISE EXCEPTION 'a claimed invitation keeps what the inviter chose, never the default';
+    IF (SELECT user_type_id || '/' || user_type_source FROM rolebyte.user_account WHERE tenant_id = v_ta AND subject_key = v_admin2)
+       IS DISTINCT FROM (SELECT default_user_type_id FROM rolebyte.tenant WHERE id = v_ta) || '/workspaceDefault' THEN
+        RAISE EXCEPTION 'a claimed invitation keeps what it was given at the invitation, never the corporate login''s';
     END IF;
 
     PERFORM pg_temp.refused('user_type_delete', jsonb_build_object('actor', v_admin, 'tenantId', v_ta, 'userTypeId', v_field),
@@ -334,7 +337,8 @@ BEGIN
     PERFORM pg_temp.refused('corporate_login_default_set', jsonb_build_object('actor', v_admin, 'tenantId', v_ta,
         'userTypeId', 'no-such-type'), 'membership:invalid', 'a user type the tenant does not have');
     PERFORM pg_temp.ok('corporate_login_default_set', jsonb_build_object('actor', v_admin, 'tenantId', v_ta, 'userTypeId', ''), 'clear');
-    UPDATE rolebyte.user_account SET user_type_id = NULL, user_type_source = NULL WHERE tenant_id = v_ta AND subject_key = v_ilze;
+    UPDATE rolebyte.user_account SET user_type_id = (SELECT default_user_type_id FROM rolebyte.tenant WHERE id = v_ta), user_type_source = 'workspaceDefault'
+     WHERE tenant_id = v_ta AND subject_key = v_ilze;
     PERFORM pg_temp.ok('user_type_delete', jsonb_build_object('actor', v_admin, 'tenantId', v_ta, 'userTypeId', v_field), 'delete Field');
     IF EXISTS (SELECT 1 FROM rolebyte.user_type WHERE id = v_field) THEN RAISE EXCEPTION 'a free user type is deleted'; END IF;
 

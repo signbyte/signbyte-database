@@ -4,6 +4,38 @@ Notable changes to the signbyte database — the schema set and the migration im
 newest first, per release. Written for whoever applies the image to a database or
 integrates against the procedures.
 
+## v0.4.0
+
+### Added — an organisation chart, and a user type for every member
+
+Migration `V14` adds three tables to `rolebyte` — `chart_position` (a tree of positions, one top per tenant),
+`chart_holder` (a member in a position, at most one each) and `chart_position_permission` — accepts a third plane,
+`chart`, on `rolebyte.service_permission`, and adds `rolebyte.tenant.default_user_type_id`. **It rewrites every
+`rolebyte.user_account` row once:** each tenant gains a user type named *Member*, holding nothing (an existing type of
+that name, in any letter case, is adopted instead), every member without a type receives it with the source
+`workspaceDefault`, and `user_type_id` and `user_type_source` then become NOT NULL, with one event written per member
+given the type. Run it in a quiet window on a large register.
+
+A permission declared on the `chart` plane is carried by a position, never by a role or a user type
+(`rolebyte.tenant_role_permissions_set` refuses one with `membership:invalid`), must be ordinary in class and seeds no
+role. Ten new procedures, granted to the register's own role, edit and read the chart: `chart_get`, `chart_document`
+(for each member in a position, the subject keys of everyone in a position below theirs), `chart_position_add`,
+`_rename`, `_move`, `_remove`, `_permissions_set`, `_user_type_set`, `chart_person_place` and `chart_person_remove`.
+The chart is in force for a tenant only while it is entitled to the service key `authority`: until then a write is
+refused with `membership:conflict`, `chart_document` answers an empty chart, and **a deployment that never entitles it
+behaves exactly as before, apart from the user type below.** While it is in force, `rolebyte.resolve` adds a
+position's chart permissions to its members' scopes, and a member in a position that names a user type receives that
+type's permissions in place of their own. An administrator's scopes never include a chart permission.
+
+### Changed — every member holds a user type
+
+`rolebyte.tenant_open`, `user_invite`, `directory_admit` and the administrator seed give every arriving member the
+tenant's default user type (the corporate-login default still wins for people arriving through the tenant's
+directory). `rolebyte.user_type_assign` refuses an empty type with `membership:invalid`: a type is changed, never taken
+away. `rolebyte.user_type_delete` refuses the default and a type a chart position names with `membership:conflict`,
+and `user_type_list` marks the default with `workspaceDefault`. A caller that took a member's type away by sending an
+empty one must stop doing so before applying this image.
+
 ## v0.3.0
 
 ### Added — a family of permissions, one per field

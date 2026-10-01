@@ -344,8 +344,13 @@ BEGIN
             'class must be ordinary, tenantConfiguration, roleManagement or perField');
         RETURN;
     END IF;
-    IF v_plane NOT IN ('tenant', 'object') THEN
-        po_data := util.result_error('membership:invalid', 'plane must be tenant or object');
+    IF v_plane NOT IN ('tenant', 'object', 'chart') THEN
+        po_data := util.result_error('membership:invalid', 'plane must be tenant, object or chart');
+        RETURN;
+    END IF;
+    IF v_plane = 'chart' AND v_class <> 'ordinary' THEN
+        po_data := util.result_error('membership:invalid',
+            'a permission a position in the chart carries is ordinary in class');
         RETURN;
     END IF;
     IF v_class = 'perField' AND v_plane <> 'object' THEN
@@ -489,6 +494,7 @@ DECLARE
     v_defs    text[] := '{}'::text[];
     v_def_id  text;
     v_user    rolebyte.user_account%ROWTYPE;
+    v_type    text;
 BEGIN
     v_actor := NULLIF(trim(pi_data->>'actor'), '');
     IF v_actor IS NULL THEN
@@ -559,13 +565,18 @@ BEGIN
         v_defs := array_append(v_defs, v_def_id);
     END LOOP;
 
-    INSERT INTO rolebyte.user_account (id, tenant_id, subject_key, display_name, status)
-    VALUES (util.generate_ulid(), v_tenant, v_subject, v_display, 'invited')
+    v_type := rolebyte.ensure_default_user_type(v_actor, v_tenant, NULL);
+    INSERT INTO rolebyte.user_account (id, tenant_id, subject_key, display_name, status,
+                                       user_type_id, user_type_source)
+    VALUES (util.generate_ulid(), v_tenant, v_subject, v_display, 'invited', v_type, 'workspaceDefault')
     RETURNING * INTO v_user;
 
     INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
     VALUES (util.generate_ulid(), v_actor, v_tenant, v_user.id, 'userInvited',
             jsonb_build_object('subjectKey', v_subject, 'displayName', v_display));
+    INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+    VALUES (util.generate_ulid(), v_actor, v_tenant, v_user.id, 'userTypeAssigned',
+            jsonb_build_object('userTypeId', v_type, 'from', '', 'source', 'workspaceDefault'));
 
     FOR i IN 1 .. COALESCE(array_length(v_defs, 1), 0) LOOP
         INSERT INTO rolebyte.assignment (id, user_id, role_definition_id)
@@ -863,22 +874,22 @@ BEGIN
                 v_admitted := jsonb_build_array(jsonb_build_object('userId', v_user.id, 'tenantId', v_tenant));
         END CASE;
     ELSE
+        PERFORM rolebyte.ensure_default_user_type(v_actor, v_tenant, NULL);
         INSERT INTO rolebyte.user_account (id, tenant_id, subject_key, display_name, status,
                                            user_type_id, user_type_source)
         SELECT util.generate_ulid(), v_tenant, v_subject, v_display, 'active',
-               t.corporate_login_user_type_id,
-               CASE WHEN t.corporate_login_user_type_id IS NOT NULL THEN 'corporateLoginDefault' END
+               COALESCE(t.corporate_login_user_type_id, t.default_user_type_id),
+               CASE WHEN t.corporate_login_user_type_id IS NOT NULL THEN 'corporateLoginDefault'
+                    ELSE 'workspaceDefault' END
           FROM rolebyte.tenant t WHERE t.id = v_tenant
         RETURNING * INTO v_user;
 
         INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
         VALUES (util.generate_ulid(), v_actor, v_tenant, v_user.id, 'directoryAdmitted',
                 jsonb_build_object('subjectKey', v_subject, 'issuer', v_issuer, 'displayName', v_display));
-        IF v_user.user_type_id IS NOT NULL THEN
-            INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
-            VALUES (util.generate_ulid(), v_actor, v_tenant, v_user.id, 'userTypeAssigned',
-                    jsonb_build_object('userTypeId', v_user.user_type_id, 'from', '', 'source', 'corporateLoginDefault'));
-        END IF;
+        INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+        VALUES (util.generate_ulid(), v_actor, v_tenant, v_user.id, 'userTypeAssigned',
+                jsonb_build_object('userTypeId', v_user.user_type_id, 'from', '', 'source', v_user.user_type_source));
 
         v_outcome  := 'admitted';
         v_admitted := jsonb_build_array(jsonb_build_object('userId', v_user.id, 'tenantId', v_tenant));
@@ -1068,6 +1079,7 @@ DECLARE
     v_rung    text;
     v_invited boolean := false;
     v_changed boolean := false;
+    v_type    text;
 BEGIN
     -- The message does not echo the key: this text reaches logs.
     IF p_subject IS NULL OR NOT rolebyte.is_typed_subject_key(p_subject) THEN
@@ -1092,13 +1104,18 @@ BEGIN
     END IF;
 
     IF NOT FOUND THEN
-        INSERT INTO rolebyte.user_account (id, tenant_id, subject_key, display_name, status)
-        VALUES (util.generate_ulid(), p_tenant, p_subject, p_display, 'invited')
+        v_type := rolebyte.ensure_default_user_type(p_actor, p_tenant, NULL);
+        INSERT INTO rolebyte.user_account (id, tenant_id, subject_key, display_name, status,
+                                           user_type_id, user_type_source)
+        VALUES (util.generate_ulid(), p_tenant, p_subject, p_display, 'invited', v_type, 'workspaceDefault')
         RETURNING * INTO v_user;
 
         INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
         VALUES (util.generate_ulid(), p_actor, p_tenant, v_user.id, 'userInvited',
                 jsonb_build_object('subjectKey', p_subject, 'displayName', p_display));
+        INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+        VALUES (util.generate_ulid(), p_actor, p_tenant, v_user.id, 'userTypeAssigned',
+                jsonb_build_object('userTypeId', v_type, 'from', '', 'source', 'workspaceDefault'));
         v_invited := true;
     END IF;
 
@@ -1398,17 +1415,28 @@ BEGIN
                     -- from the roles they copy.
                     SELECT sp.service_key || '/' || sp.feature_key || ':' || sp.act
                     FROM rolebyte.service_permission sp
-                    WHERE ((adm.yes AND sp.retired_at IS NULL)
+                    WHERE ((adm.yes AND sp.retired_at IS NULL AND sp.plane IS DISTINCT FROM 'chart')
                            OR (sp.class = 'ordinary' AND EXISTS (
                                SELECT 1
                                  FROM rolebyte.tenant_role_assignment ta
                                  JOIN rolebyte.tenant_role_permission tp ON tp.tenant_role_id = ta.tenant_role_id
                                 WHERE ta.user_id = u.id AND ta.tenant_id = u.tenant_id AND ta.state = 'granted'
                                   AND tp.permission_id = sp.id AND tp.param IS NULL))
-                           -- A person's user type: tenant-wide permissions only.
+                           -- A person's user type: tenant-wide permissions only. It
+                           -- is the type of the position they sit in while the tenant
+                           -- holds the chart, and their own otherwise.
                            OR (sp.class = 'ordinary' AND sp.plane = 'tenant' AND EXISTS (
                                SELECT 1 FROM rolebyte.user_type_permission up
-                                WHERE up.user_type_id = u.user_type_id AND up.permission_id = sp.id)))
+                                WHERE up.user_type_id = rolebyte.effective_user_type(u.tenant_id, u.id)
+                                  AND up.permission_id = sp.id))
+                           -- A box the position they sit in carries; the entitlement
+                           -- clause below keeps it off a token once the chart lapses.
+                           OR (sp.class = 'ordinary' AND sp.plane = 'chart' AND EXISTS (
+                               SELECT 1
+                                 FROM rolebyte.chart_holder h
+                                 JOIN rolebyte.chart_position_permission cp ON cp.position_id = h.position_id
+                                WHERE h.tenant_id = u.tenant_id AND h.user_id = u.id
+                                  AND cp.permission_id = sp.id)))
                       AND EXISTS (
                           SELECT 1 FROM rolebyte.tenant_entitlement e
                            WHERE e.tenant_id = u.tenant_id
@@ -2039,6 +2067,7 @@ DECLARE
     v_base    text;
     v_pid     text;
     v_class   text;
+    v_plane   text;
     v_retired boolean;
     v_ids     text[] := '{}'::text[];
     v_params  text[] := '{}'::text[];
@@ -2080,12 +2109,18 @@ BEGIN
         END IF;
         v_base := v_parts.service || '/' || v_parts.feature || ':' || v_parts.act;
 
-        SELECT id, class, retired_at IS NOT NULL INTO v_pid, v_class, v_retired
+        SELECT id, class, plane, retired_at IS NOT NULL INTO v_pid, v_class, v_plane, v_retired
           FROM rolebyte.service_permission
          WHERE service_key = v_parts.service AND feature_key = v_parts.feature AND act = v_parts.act;
         IF v_pid IS NULL THEN
             po_data := util.result_error('membership:unknown_permission',
                 format('%s is not a declared permission', v_base));
+            RETURN;
+        END IF;
+        -- A box a position in the chart carries is on no other list.
+        IF v_plane = 'chart' THEN
+            po_data := util.result_error('membership:invalid',
+                format('%s is held by a position in the chart of authority; no role carries it', v_base));
             RETURN;
         END IF;
         -- A per-field family is ticked one field at a time. The bare family is
@@ -3240,6 +3275,8 @@ BEGIN
     INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
     VALUES (util.generate_ulid(), v_actor, v_tenant.id, 'tenantCreated',
             jsonb_build_object('name', v_tenant.name));
+
+    PERFORM rolebyte.ensure_default_user_type(v_actor, v_tenant.id, NULLIF(btrim(pi_data->>'language'), ''));
 
     v_made := rolebyte.administrator_make(v_actor, v_tenant.id, v_subject, v_display);
     IF v_made->>'result' IS DISTINCT FROM 'success' THEN
