@@ -240,12 +240,15 @@ BEGIN
     --      own answer re-applies as unchanged, a document without one leaves it,
     --      and a malformed one writes nothing.
     CALL rolebyte.config_get(jsonb_build_object('tenantId', v_a), v);
-    IF v->'data'->'tenant'->'directory'->>'issuer' IS DISTINCT FROM v_iss_1 THEN
+    IF v->'data'->'section'->'tenant'->'directory'->>'issuer' IS DISTINCT FROM v_iss_1 THEN
         RAISE EXCEPTION 'config_get should carry the attached directory: %', v;
     END IF;
     CALL rolebyte.config_apply(jsonb_build_object('tenantId', v_a, 'actor', v_actor,
-        'section', jsonb_build_object('tenant', jsonb_build_object('directory', jsonb_build_object('issuer', v_iss_2)))), v);
-    IF v->>'result' IS DISTINCT FROM 'success' OR v->'data'->'tenant'->'directory'->>'status' IS DISTINCT FROM 'changed' THEN
+        'expectedVersion', v->'data'->>'version',
+        'section', jsonb_build_object('schema', 'rolebyte-config/1',
+            'tenant', jsonb_build_object('directory', jsonb_build_object('issuer', v_iss_2)))), v);
+    IF v->>'result' IS DISTINCT FROM 'success' OR (v->'data'->>'applied')::boolean IS NOT TRUE
+       OR v->'data'->'directory'->>'status' IS DISTINCT FROM 'changed' THEN
         RAISE EXCEPTION 'a document should be able to change the directory: %', v;
     END IF;
     IF (SELECT directory_issuer FROM rolebyte.tenant WHERE id = v_a) IS DISTINCT FROM v_iss_2 THEN
@@ -256,28 +259,29 @@ BEGIN
         RAISE EXCEPTION 'a change through the document should log the attach with the previous issuer';
     END IF;
     CALL rolebyte.config_get(jsonb_build_object('tenantId', v_a), v);
-    CALL rolebyte.config_apply(jsonb_build_object('tenantId', v_a, 'actor', v_actor, 'section', v->'data'), v);
-    IF v->'data'->'tenant'->'directory'->>'status' IS DISTINCT FROM 'unchanged'
+    CALL rolebyte.config_apply(jsonb_build_object('tenantId', v_a, 'actor', v_actor,
+        'section', v->'data'->'section', 'expectedVersion', v->'data'->>'version'), v);
+    IF v->'data'->'directory'->>'status' IS DISTINCT FROM 'unchanged'
        OR v->'data'->'tenant'->>'status' IS DISTINCT FROM 'unchanged' THEN
         RAISE EXCEPTION 'the round trip should change nothing: %', v;
     END IF;
     CALL rolebyte.config_apply(jsonb_build_object('tenantId', v_a, 'actor', v_actor,
-        'section', '{"services":[]}'::jsonb), v);
-    IF v->>'result' IS DISTINCT FROM 'success' OR v->'data'->'tenant' IS DISTINCT FROM 'null'::jsonb THEN
+        'expectedVersion', v->'data'->>'version',
+        'section', '{"schema":"rolebyte-config/1","services":[]}'::jsonb), v);
+    IF v->>'result' IS DISTINCT FROM 'success' OR v->'data' ? 'tenant' OR v->'data' ? 'directory' THEN
         RAISE EXCEPTION 'a document without a tenant section should report no tenant change: %', v;
     END IF;
     IF (SELECT directory_issuer FROM rolebyte.tenant WHERE id = v_a) IS DISTINCT FROM v_iss_2 THEN
         RAISE EXCEPTION 'a document without a directory detached it';
     END IF;
-    BEGIN
-        CALL rolebyte.config_apply(jsonb_build_object('tenantId', v_a, 'actor', v_actor,
-            'section', '{"tenant":{"directory":{"issuer":"not an issuer"}}}'::jsonb), v);
-        RAISE EXCEPTION 'a malformed directory in a document should have been refused';
-    EXCEPTION WHEN sqlstate 'P0001' THEN
-        IF SQLERRM NOT LIKE '%membership:invalid%' THEN
-            RAISE EXCEPTION 'a malformed directory raised the wrong code: %', SQLERRM;
-        END IF;
-    END;
+    CALL rolebyte.config_apply(jsonb_build_object('tenantId', v_a, 'actor', v_actor,
+        'expectedVersion', v->'data'->>'version',
+        'section', '{"schema":"rolebyte-config/1","tenant":{"directory":{"issuer":"not an issuer"}}}'::jsonb), v);
+    IF (v->'data'->>'applied')::boolean IS NOT FALSE
+       OR v->'data'->'directory'->>'status' IS DISTINCT FROM 'refused'
+       OR v->'data'->'directory'->>'reason' IS DISTINCT FROM 'config_bad_document' THEN
+        RAISE EXCEPTION 'a malformed directory in a document should have been refused: %', v;
+    END IF;
     IF (SELECT directory_issuer FROM rolebyte.tenant WHERE id = v_a) IS DISTINCT FROM v_iss_2 THEN
         RAISE EXCEPTION 'a refused document changed the directory';
     END IF;

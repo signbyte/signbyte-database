@@ -167,15 +167,16 @@ BEGIN
     -- 10. The configuration document carries permissions beside roles.
     CALL rolebyte.tenant_create('{"actor":"permission-test","name":"Permission demo"}'::jsonb, v);
     v_tenant := v->'data'->>'id';
+    CALL rolebyte.config_version(jsonb_build_object('tenantId', v_tenant), v);
     CALL rolebyte.config_apply(jsonb_build_object(
-        'tenantId', v_tenant, 'actor', 'permission-test',
-        'section', '{"services":[{"key":"permcfg","displayName":"Permission config demo",
+        'tenantId', v_tenant, 'actor', 'permission-test', 'expectedVersion', v->'data'->>'version',
+        'section', '{"schema":"rolebyte-config/1","services":[{"key":"permcfg","displayName":"Permission config demo",
             "roles":[],
             "permissions":[
               {"feature":"spentTime","act":"viewAll","description":"See everybody''s hours","class":"ordinary","plane":"object"},
               {"feature":"configuration","act":"edit","description":"","class":"tenantConfiguration","plane":"tenant",
                "labels":{"lv":"Mainīt konfigurāciju","de":"Konfiguration ändern"}}]}]}'::jsonb), v);
-    IF v->>'result' IS DISTINCT FROM 'success' THEN
+    IF v->>'result' IS DISTINCT FROM 'success' OR (v->'data'->>'applied')::boolean IS NOT TRUE THEN
         RAISE EXCEPTION 'apply with permissions failed: %', v;
     END IF;
     IF jsonb_array_length(v->'data'->'permissions') <> 2
@@ -183,13 +184,13 @@ BEGIN
         RAISE EXCEPTION 'both permissions should be added: %', v;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM jsonb_array_elements(v->'data'->'permissions') e
-                   WHERE e->>'permission' = 'permcfg/spentTime:viewAll') THEN
+                   WHERE e->>'key' = 'permcfg/spentTime:viewAll') THEN
         RAISE EXCEPTION 'the apply report should name each permission as it travels: %', v;
     END IF;
 
     -- config_get answers them, with the class.
     CALL rolebyte.config_get(jsonb_build_object('tenantId', v_tenant), v);
-    SELECT s INTO v_section FROM jsonb_array_elements(v->'data'->'services') s WHERE s->>'key' = 'permcfg';
+    SELECT s INTO v_section FROM jsonb_array_elements(v->'data'->'section'->'services') s WHERE s->>'key' = 'permcfg';
     IF jsonb_array_length(v_section->'permissions') <> 2 THEN
         RAISE EXCEPTION 'config_get should answer the service''s permissions: %', v_section;
     END IF;
@@ -206,48 +207,46 @@ BEGIN
         RAISE EXCEPTION 'config_get should carry each permission''s plane, labels and retired mark: %', v_section;
     END IF;
 
-    -- The whole document read back re-applies as all-unchanged.
+    -- The whole section read back re-applies as all-unchanged.
     CALL rolebyte.config_apply(jsonb_build_object(
-        'tenantId', v_tenant, 'actor', 'permission-test', 'section', v->'data'), v);
-    IF v->>'result' IS DISTINCT FROM 'success' THEN
+        'tenantId', v_tenant, 'actor', 'permission-test',
+        'section', v->'data'->'section', 'expectedVersion', v->'data'->>'version'), v);
+    IF v->>'result' IS DISTINCT FROM 'success' OR (v->'data'->>'applied')::boolean IS NOT TRUE THEN
         RAISE EXCEPTION 'round-trip apply failed: %', v;
     END IF;
     IF EXISTS (SELECT 1 FROM jsonb_array_elements(v->'data'->'permissions') e WHERE e->>'status' <> 'unchanged') THEN
         RAISE EXCEPTION 'a round trip should change no permission: %', v;
     END IF;
 
-    -- 11. One refused entry rolls the whole section back — the service before it and
-    --     the permission before it included.
-    BEGIN
-        CALL rolebyte.config_apply(jsonb_build_object(
-            'tenantId', v_tenant, 'actor', 'permission-test',
-            'section', '{"services":[
-              {"key":"permpoison","displayName":"Should not survive","roles":[],
-               "permissions":[{"feature":"task","act":"view","class":"ordinary","plane":"object"}]},
-              {"key":"permcfg","displayName":"Permission config demo","roles":[],
-               "permissions":[{"feature":"spentTime","act":"viewAll","class":"tenantConfiguration","plane":"tenant"}]}
-            ]}'::jsonb), v);
-        RAISE EXCEPTION 'a re-classing document should have been refused';
-    EXCEPTION WHEN sqlstate 'P0001' THEN
-        IF SQLERRM NOT LIKE '%membership:conflict%' THEN
-            RAISE EXCEPTION 'the refused document raised the wrong code: %', SQLERRM;
-        END IF;
-    END;
+    -- 11. One refused entry writes nothing — the service before it and the
+    --     permission before it included — and the report names it.
+    CALL rolebyte.config_version(jsonb_build_object('tenantId', v_tenant), v);
+    CALL rolebyte.config_apply(jsonb_build_object(
+        'tenantId', v_tenant, 'actor', 'permission-test', 'expectedVersion', v->'data'->>'version',
+        'section', '{"schema":"rolebyte-config/1","services":[
+          {"key":"permpoison","displayName":"Should not survive","roles":[],
+           "permissions":[{"feature":"task","act":"view","class":"ordinary","plane":"object"}]},
+          {"key":"permcfg","displayName":"Permission config demo","roles":[],
+           "permissions":[{"feature":"spentTime","act":"viewAll","class":"tenantConfiguration","plane":"tenant"}]}
+        ]}'::jsonb), v);
+    IF (v->'data'->>'applied')::boolean IS NOT FALSE
+       OR NOT EXISTS (SELECT 1 FROM jsonb_array_elements(v->'data'->'permissions') e
+                       WHERE e->>'key' = 'permcfg/spentTime:viewAll' AND e->>'status' = 'refused'
+                         AND e->>'reason' = 'config_key_conflict') THEN
+        RAISE EXCEPTION 'a re-classing document should have been refused, naming the permission: %', v;
+    END IF;
     IF EXISTS (SELECT 1 FROM rolebyte.service WHERE key = 'permpoison')
        OR EXISTS (SELECT 1 FROM rolebyte.service_permission WHERE service_key = 'permpoison') THEN
         RAISE EXCEPTION 'a refused document must write nothing';
     END IF;
 
-    BEGIN
-        CALL rolebyte.config_apply(jsonb_build_object(
-            'tenantId', v_tenant, 'actor', 'permission-test',
-            'section', '{"services":[{"key":"permcfg","roles":[],"permissions":{"feature":"task"}}]}'::jsonb), v);
-        RAISE EXCEPTION 'permissions that are not a list should have been refused';
-    EXCEPTION WHEN sqlstate 'P0001' THEN
-        IF SQLERRM NOT LIKE '%membership:config_bad_document%' THEN
-            RAISE EXCEPTION 'a non-list permissions entry raised the wrong code: %', SQLERRM;
-        END IF;
-    END;
+    CALL rolebyte.config_apply(jsonb_build_object(
+        'tenantId', v_tenant, 'actor', 'permission-test', 'dryRun', true,
+        'section', '{"schema":"rolebyte-config/1","services":[{"key":"permcfg","roles":[],"permissions":{"feature":"task"}}]}'::jsonb), v);
+    IF NOT EXISTS (SELECT 1 FROM jsonb_array_elements(v->'data'->'services') e
+                    WHERE e->>'key' = 'permcfg' AND e->>'status' = 'refused' AND e->>'reason' = 'config_bad_document') THEN
+        RAISE EXCEPTION 'permissions that are not a list should be refused: %', v;
+    END IF;
 
     -- 12. Every permission says where it may be granted, and that never changes.
     IF (SELECT plane FROM rolebyte.service_permission

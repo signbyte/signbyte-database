@@ -6,6 +6,30 @@ integrates against the procedures.
 
 ## v0.4.0
 
+### Changed — rolebyte's configuration section answers the whole contract, and records every import and export
+
+No migration and no table changes; the repeatable procedures change, and two of them answer a different shape.
+**Apply with the rolebyte service of the same date**, and switch any deployment script that registers the
+services' permissions through `config_apply` in the same change.
+
+- `rolebyte.config_get` answers `{section, version}` instead of the section itself. The section carries
+  `"schema": "rolebyte-config/1"` and, on each permission a new tenant's roles start with, its `seeds`, so a section
+  read back and applied changes nothing. The version is `util.config_token('rolebyte-config/1', tenant, section)`.
+- `rolebyte.config_version` (new, granted to the register's role) answers the version alone. The vocabulary is
+  every tenant's, so a vocabulary change moves every tenant's version.
+- `rolebyte.config_apply` requires the schema, reads `dryRun`, `expectedVersion`, `partHash` and `documentHash`,
+  needs `expectedVersion` for a writing apply (`config_version_required`) and compares it under one lock for the
+  whole deployment (`config_version_moved`). A preview and an apply are one pass, undone for a preview or when an
+  item is refused, and **a refused item is a line of the report, not an error**; a changed class or plane is
+  `config_key_conflict` (was `conflict`). An apply that was not refused writes one `configApplied` line in the
+  tenant's history with the counts, the part's hash and the document's.
+- `rolebyte.config_exported` (new, granted to the register's role) writes one `configExported` line naming who took
+  the section out and the part's hash.
+- `rolebyte.permissions_register` (new, granted to nobody) is how a deployment registers the permissions each
+  service prints, as the location's owner: no tenant, no version, no history line, and one refused entry writes
+  nothing.
+- `rolebyte.permission_declare` also answers `changes`, the members a declaration changed.
+
 ### Added — one helper for a configuration's version
 
 Migration `util/V3` adds `util.config_token(schema, scope, section)`, a pure function that computes the version token
