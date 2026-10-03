@@ -12,7 +12,9 @@
 --   * a position's boxes reach a token while the tenant holds the chart, and
 --     never a role's, a user type's or the administrator's;
 --   * the user type a position names applies while the person sits there and
---     the tenant holds the chart, and the person's own returns after.
+--     the tenant holds the chart, and the person's own returns after;
+--   * the administration read names both, and a seat carrying a box ends a
+--     person's being an arrival while the chart is held.
 --
 -- Self-contained, seed-then-assert, one RAISE EXCEPTION per failed assertion.
 --
@@ -68,6 +70,20 @@ DECLARE
 BEGIN
     UPDATE rolebyte.user_account SET status = 'active' WHERE id = v->>'id';
     RETURN v->>'id';
+END $$;
+
+-- One member's row in the administration read of the tenant.
+CREATE OR REPLACE FUNCTION pg_temp.access_row(p_tenant text, p_user text) RETURNS jsonb
+LANGUAGE plpgsql AS $$
+DECLARE
+    v jsonb := pg_temp.ok('access_list', jsonb_build_object('tenantId', p_tenant), 'access_list');
+    r jsonb;
+BEGIN
+    SELECT m INTO r FROM jsonb_array_elements(v->'members') m WHERE m->>'id' = p_user;
+    IF r IS NULL THEN
+        RAISE EXCEPTION 'member % is not in the access list', p_user;
+    END IF;
+    RETURN r;
 END $$;
 
 DO $$
@@ -393,8 +409,18 @@ BEGIN
     -- An empty position, so that removing it is refused by the lapse alone.
     v_spare := pg_temp.ok('chart_position_add', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta,
         'name', 'Spare', 'parentId', v_office), 'spare')->>'id';
+    -- A seat carrying a box gives its holder something; a seat carrying none does not.
+    IF (pg_temp.access_row(v_ta, v_anna)->>'arrival')::boolean THEN
+        RAISE EXCEPTION 'Anna''s seat carries boxes, so she is no arrival: %', pg_temp.access_row(v_ta, v_anna);
+    END IF;
+    IF NOT (pg_temp.access_row(v_ta, v_janis)->>'arrival')::boolean THEN
+        RAISE EXCEPTION 'Jānis''s seat carries nothing, so he still holds nothing: %', pg_temp.access_row(v_ta, v_janis);
+    END IF;
     PERFORM pg_temp.ok('entitlement_revoke', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta, 'service', 'authority'), 'lapse');
     IF pg_temp.scopes(v_sanna, v_ta) ? 'authority/project:view' THEN RAISE EXCEPTION 'a lapsed chart gives no box'; END IF;
+    IF NOT (pg_temp.access_row(v_ta, v_anna)->>'arrival')::boolean THEN
+        RAISE EXCEPTION 'a lapsed chart gives Anna nothing, so she is an arrival again: %', pg_temp.access_row(v_ta, v_anna);
+    END IF;
     v := pg_temp.ok('chart_document', jsonb_build_object('tenantId', v_ta), 'document after lapse');
     IF v->'below' IS DISTINCT FROM '{}'::jsonb THEN RAISE EXCEPTION 'a lapsed chart answers empty: %', v; END IF;
     v := pg_temp.ok('chart_get', jsonb_build_object('tenantId', v_ta), 'get after lapse');
@@ -455,12 +481,26 @@ BEGIN
     IF (SELECT user_type_id FROM rolebyte.user_account WHERE id = v_karlis) IS DISTINCT FROM v_def THEN
         RAISE EXCEPTION 'his own user type is untouched underneath';
     END IF;
+    -- The administration read says both: his own, and the position's in force.
+    v := pg_temp.access_row(v_ta, v_karlis);
+    IF v->'userType' IS DISTINCT FROM jsonb_build_object('id', v_def, 'name', 'Member')
+       OR v->'chartUserType' IS DISTINCT FROM jsonb_build_object('id', v_pm, 'name', 'Project manager')
+       OR (v->>'arrival')::boolean THEN
+        RAISE EXCEPTION 'Kārlis reads Member as his own, Project manager from the chart, and no arrival: %', v;
+    END IF;
+    IF pg_temp.access_row(v_ta, v_janis)->'chartUserType' IS DISTINCT FROM 'null'::jsonb THEN
+        RAISE EXCEPTION 'a position naming no type gives no chart type: %', pg_temp.access_row(v_ta, v_janis);
+    END IF;
     IF pg_temp.scopes(v_sjanis, v_ta) ? (v_svc || '/project:create') THEN RAISE EXCEPTION 'only the position''s holders'; END IF;
     PERFORM pg_temp.refused('user_type_delete', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta, 'userTypeId', v_pm),
         'membership:conflict', 'a user type a position names');
 
     PERFORM pg_temp.ok('entitlement_revoke', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta, 'service', 'authority'), 'lapse');
     IF pg_temp.scopes(v_skarlis, v_ta) ? (v_svc || '/project:create') THEN RAISE EXCEPTION 'a lapse returns him to his own type'; END IF;
+    v := pg_temp.access_row(v_ta, v_karlis);
+    IF v->'chartUserType' IS DISTINCT FROM 'null'::jsonb OR NOT (v->>'arrival')::boolean THEN
+        RAISE EXCEPTION 'a lapsed chart gives no type, and Member holds nothing: %', v;
+    END IF;
     PERFORM pg_temp.ok('entitlement_grant', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta, 'service', 'authority'), 'again');
     IF NOT (pg_temp.scopes(v_skarlis, v_ta) ? (v_svc || '/project:create')) THEN RAISE EXCEPTION 'and back'; END IF;
 
@@ -472,6 +512,9 @@ BEGIN
     PERFORM pg_temp.ok('chart_position_user_type_set', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta,
         'positionId', v_site, 'userTypeId', ''), 'none');
     IF pg_temp.scopes(v_skarlis, v_ta) ? (v_svc || '/project:create') THEN RAISE EXCEPTION 'a position naming none keeps his own'; END IF;
+    IF pg_temp.access_row(v_ta, v_karlis)->'chartUserType' IS DISTINCT FROM 'null'::jsonb THEN
+        RAISE EXCEPTION 'a position naming none gives no chart type: %', pg_temp.access_row(v_ta, v_karlis);
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM rolebyte.event WHERE kind = 'chartPositionUserTypeSet' AND payload->>'positionId' = v_site
                     AND payload->>'from' = v_pm) THEN
         RAISE EXCEPTION 'naming a user type is an event carrying the previous one';

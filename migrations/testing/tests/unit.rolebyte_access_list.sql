@@ -4,8 +4,11 @@
 -- them; the checkbox is never also a service role; a revoked member stays listed
 -- with their grants on record; a service account is listed and marked; an
 -- arrival is exactly an active person holding nothing; a renamed role is read by
--- its new name and a revoked grant is gone; the read writes nothing; a missing
--- or unknown tenant is refused; and the register's own role may run it.
+-- its new name and a revoked grant is gone; each member's user type is read by
+-- name, and a type that holds something ends an arrival; the day a member was
+-- last given access is read, only for a membership that was; the read writes
+-- nothing; a missing or unknown tenant is refused; and the register's own role
+-- may run it.
 --   psql -v ON_ERROR_STOP=1 -f migrations/testing/tests/unit.rolebyte_access_list.sql
 
 -- Calls one register procedure and returns its answer.
@@ -108,6 +111,8 @@ DECLARE
     v          jsonb;
     v_before   text;
     v_key      text;
+    v_def      text;
+    v_worker   text;
     NONE       CONSTANT jsonb := '[]';
     READS      CONSTANT jsonb := '[{"service":"alsvc","group":"alsvc","level":"read"}]';
     WRITES     CONSTANT jsonb := '[{"service":"alsvc","group":"alsvc","level":"write"}]';
@@ -273,7 +278,45 @@ BEGIN
     PERFORM pg_temp.says(v_row, 'administrator', 'false', 'Anna unticked');
     PERFORM pg_temp.says(v_row, 'arrival', 'true', 'Anna now holds nothing');
 
-    -- ------------------------------------------------------- (12) refusals
+    -- ------------- (12) the user type each holds, and the day each last signed in
+    SELECT default_user_type_id INTO v_def FROM rolebyte.tenant WHERE id = v_ta;
+    FOR v_row IN SELECT m FROM jsonb_array_elements(v_list) m LOOP
+        PERFORM pg_temp.says(v_row, 'userType', jsonb_build_object('id', v_def, 'name', 'Member'),
+            'every member arrived with the default');
+        PERFORM pg_temp.says(v_row, 'chartUserType', 'null', 'no chart, no chart type');
+        PERFORM pg_temp.says(v_row, 'lastSignedInOn', 'null', 'nobody has been given access since the date was kept');
+    END LOOP;
+
+    --      Jānis and Mārtiņš are given access today; Mārtiņš's access in B has
+    --      ended, so only his row in A is dated. A second answer the same day
+    --      changes nothing the list shows.
+    PERFORM pg_temp.ok('resolve', jsonb_build_object('subjectKey', v_s[5], 'issuing', true), 'resolve Jānis');
+    PERFORM pg_temp.ok('resolve', jsonb_build_object('subjectKey', v_s[3], 'issuing', true), 'resolve Mārtiņš');
+    PERFORM pg_temp.ok('resolve', jsonb_build_object('subjectKey', v_s[3], 'issuing', true), 'resolve Mārtiņš again');
+    v_list := pg_temp.access(v_ta);
+    PERFORM pg_temp.says(pg_temp.member(v_list, v_janis), 'lastSignedInOn',
+        to_jsonb((now() AT TIME ZONE 'UTC')::date), 'Jānis, today');
+    PERFORM pg_temp.says(pg_temp.member(v_list, v_martins), 'lastSignedInOn',
+        to_jsonb((now() AT TIME ZONE 'UTC')::date), 'Mārtiņš in A, today');
+    PERFORM pg_temp.says(pg_temp.member(v_list, v_karlis), 'lastSignedInOn', 'null', 'Kārlis was not given access');
+    PERFORM pg_temp.says(pg_temp.member(pg_temp.access(v_tb), v_martinsb), 'lastSignedInOn', 'null',
+        'Mārtiņš''s ended access in B is not dated');
+
+    --      A user type that holds something gives its holder something.
+    PERFORM pg_temp.ok('permission_declare', jsonb_build_object('actor', 'op:test', 'service', 'alsvc', 'permission',
+        jsonb_build_object('feature', 'project', 'act', 'create', 'description', 'Register a project',
+                           'class', 'ordinary', 'plane', 'tenant')), 'declare alsvc/project:create');
+    v_worker := pg_temp.ok('user_type_define', jsonb_build_object('actor', v_s[7], 'tenantId', v_ta, 'name', 'Darbinieks',
+        'permissions', jsonb_build_array('alsvc/project:create')), 'define Darbinieks')->>'id';
+    PERFORM pg_temp.ok('user_type_assign', jsonb_build_object('actor', v_s[7], 'tenantId', v_ta, 'userId', v_janis,
+        'userTypeId', v_worker), 'Jānis is a Darbinieks');
+    v_list := pg_temp.access(v_ta);
+    v_row := pg_temp.member(v_list, v_janis);
+    PERFORM pg_temp.says(v_row, 'userType', jsonb_build_object('id', v_worker, 'name', 'Darbinieks'), 'Jānis''s new type');
+    PERFORM pg_temp.says(v_row, 'arrival', 'false', 'a user type that holds something is something');
+    PERFORM pg_temp.says(pg_temp.member(v_list, v_karlis), 'arrival', 'true', 'Member holds nothing');
+
+    -- ------------------------------------------------------- (13) refusals
     v_before := pg_temp.state();
     v := pg_temp.rb('access_list', '{}');
     IF v->>'result' IS DISTINCT FROM 'error' OR v->>'code' IS DISTINCT FROM 'membership:invalid'
@@ -292,7 +335,7 @@ BEGIN
         RAISE EXCEPTION 'a refused read changed something';
     END IF;
 
-    -- ------------------------------------ (13) the register's own role runs it
+    -- ------------------------------------ (14) the register's own role runs it
     IF NOT has_function_privilege('rolebyte_public', 'rolebyte.access_list(jsonb, jsonb)', 'EXECUTE') THEN
         RAISE EXCEPTION 'the register''s own role must be able to read who holds what';
     END IF;

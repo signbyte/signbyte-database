@@ -6,6 +6,21 @@ integrates against the procedures.
 
 ## v0.4.0
 
+### Changed — rolebyte records the day each member last signed in, its people read names each member's user type, and its history reads a page at a time
+
+One new migration, `rolebyte/V15`, adds a nullable date column to `rolebyte.user_account` (no rewrite, a brief
+lock); three procedures change behaviour. **Apply with the rolebyte service of the same date.**
+
+- `rolebyte.resolve` reads a new optional input, `issuing` (a JSON boolean). With `issuing: true` it writes the day
+  (UTC) on each membership it answers, at most once a day per membership, skipping a row another session holds
+  locked; without it nothing is written. Its answer is unchanged and it writes no event.
+- `rolebyte.access_list` gives each member `userType` (`{id, name}`), `chartUserType` (the chart position's type while
+  the tenant has the chart, else `null`) and `lastSignedInOn` (`"YYYY-MM-DD"` or `null`). `arrival` now also needs
+  the user type in force to hold nothing and no chart position carrying a box.
+- `rolebyte.history` answers newest first, a page at a time, with `more`: `limit` (100 by default, at most 500),
+  `before` (an event id of the same tenant) and `kindPrefix` beside `service`, `from` and `to`. A bad `limit` or
+  `before` is `membership:invalid`. It used to answer up to 1,000 events oldest first.
+
 ### Changed — rolebyte's configuration section answers the whole contract, and records every import and export
 
 No migration and no table changes; the repeatable procedures change, and two of them answer a different shape.

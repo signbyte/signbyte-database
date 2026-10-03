@@ -1357,8 +1357,19 @@ GRANT EXECUTE ON PROCEDURE rolebyte.user_revoke(jsonb, jsonb) TO rolebyte_public
 -- resolve — the identity provider's hot path at token issue: an authenticated
 -- subject key answers the memberships it may act under, each with one flat scope
 -- set from what is currently granted there: a service's role as `group:level`,
--- and each permission a tenant's own role ticks as `service/feature:act`. Reads
--- only; a stranger resolves to an empty list.
+-- and each permission a tenant's own role ticks as `service/feature:act`. A
+-- stranger resolves to an empty list.
+--
+-- Its one write, only when the caller says it is issuing the person's access
+-- (`issuing: true`, the identity provider's door): the day each answered
+-- membership was given access, at most once a day. The register's own checks of
+-- who may administer what read the same answer without it, so using the register
+-- is never taken for signing in. A later answer the same day finds the date
+-- already there and writes nothing, and a row another session holds locked is
+-- skipped rather than waited for, so the hot path never queues behind a write.
+-- The day is UTC's. A person in two tenants is dated in both, because the
+-- register answers every tenant at once and which one the sign-in picks is
+-- decided after it.
 --
 -- Both kinds feed ONE distinct aggregate, so a person who holds no tenant role
 -- resolves exactly as before tenant roles existed, and a box ticked by two roles
@@ -1389,11 +1400,29 @@ AS $$
 DECLARE
     v_subject     text;
     v_memberships jsonb;
+    v_today       date := (now() AT TIME ZONE 'UTC')::date;
 BEGIN
     v_subject := NULLIF(trim(pi_data->>'subjectKey'), '');
     IF v_subject IS NULL THEN
         po_data := util.result_error('membership:invalid', 'subjectKey is required');
         RETURN;
+    END IF;
+
+    -- The day each membership answered below was last given access, when this
+    -- answer issues it. Only a date older than today is written, so the second
+    -- answer of a day changes nothing.
+    IF pi_data->'issuing' = 'true'::jsonb THEN
+        UPDATE rolebyte.user_account u
+           SET last_signed_in_on = v_today
+         WHERE u.id IN (
+               SELECT a.id
+                 FROM rolebyte.user_account a
+                 JOIN rolebyte.tenant t ON t.id = a.tenant_id
+                WHERE a.subject_key = v_subject
+                  AND a.status = 'active'
+                  AND t.status = 'active'
+                  AND (a.last_signed_in_on IS NULL OR a.last_signed_in_on < v_today)
+                  FOR UPDATE OF a SKIP LOCKED);
     END IF;
 
     -- Matching is plain equality on the stored key: a person's key is their
@@ -1558,10 +1587,17 @@ GRANT EXECUTE ON PROCEDURE rolebyte.user_list(jsonb, jsonb) TO rolebyte_public;
 -- to; this read is for the administrator, who has to be able to see every
 -- holder of a grant in their tenant, a machine's included.
 --
+-- `userType` is the user type the member holds, the one an administrator sets.
+-- `chartUserType` is the one the chart position they sit in gives while the
+-- tenant has the chart, which is then the type in force; otherwise it is null.
+-- `lastSignedInOn` is the day the register last gave them access (null: not
+-- since that date was first kept).
+--
 -- `arrival` marks a person who has signed in and holds nothing yet: an active
 -- account (an invitation becomes active only at its first sign-in, and a
 -- directory admits a person active and with nothing), no service role, no
--- tenant role, not an administrator. A person whose last grant was taken away
+-- tenant role, not an administrator, a user type in force that holds nothing,
+-- and no chart position carrying a box. A person whose last grant was taken away
 -- is one again: they can sign in and do nothing, which is what an administrator
 -- looking at arrivals is there to change. A service account never is one: it
 -- does not sign in to be given something. It is decided here so that every
@@ -1597,14 +1633,37 @@ BEGIN
                'administrator', m.administrator,
                'arrival',       m.kind = 'person' AND m.status = 'active' AND NOT m.administrator
                                 AND jsonb_array_length(m.service_roles) = 0
-                                AND jsonb_array_length(m.tenant_roles) = 0,
+                                AND jsonb_array_length(m.tenant_roles) = 0
+                                AND NOT m.type_holds AND NOT m.seat_holds,
                'serviceRoles',  m.service_roles,
-               'tenantRoles',   m.tenant_roles
+               'tenantRoles',   m.tenant_roles,
+               'userType',      m.user_type,
+               'chartUserType', m.chart_user_type,
+               'lastSignedInOn', to_jsonb(m.last_signed_in_on)
            ) ORDER BY lower(m.display_name), m.id), '[]'::jsonb)
       INTO v_items
       FROM (
-          SELECT u.id, u.subject_key, u.display_name, u.status,
+          SELECT u.id, u.subject_key, u.display_name, u.status, u.last_signed_in_on,
                  CASE WHEN u.subject_key LIKE 'svc:%' THEN 'service' ELSE 'person' END AS kind,
+                 (SELECT jsonb_build_object('id', t.id, 'name', t.name)
+                    FROM rolebyte.user_type t
+                   WHERE t.tenant_id = u.tenant_id AND t.id = u.user_type_id) AS user_type,
+                 (SELECT jsonb_build_object('id', t.id, 'name', t.name)
+                    FROM rolebyte.chart_holder h
+                    JOIN rolebyte.chart_position p ON p.tenant_id = h.tenant_id AND p.id = h.position_id
+                    JOIN rolebyte.user_type t ON t.tenant_id = p.tenant_id AND t.id = p.user_type_id
+                   WHERE h.tenant_id = u.tenant_id AND h.user_id = u.id
+                     AND rolebyte.chart_entitled(u.tenant_id)) AS chart_user_type,
+                 EXISTS (
+                     SELECT 1 FROM rolebyte.user_type_permission up
+                      WHERE up.user_type_id = rolebyte.effective_user_type(u.tenant_id, u.id)
+                 ) AS type_holds,
+                 rolebyte.chart_entitled(u.tenant_id) AND EXISTS (
+                     SELECT 1
+                       FROM rolebyte.chart_holder h
+                       JOIN rolebyte.chart_position_permission cp ON cp.position_id = h.position_id
+                      WHERE h.tenant_id = u.tenant_id AND h.user_id = u.id
+                 ) AS seat_holds,
                  EXISTS (
                      SELECT 1
                        FROM rolebyte.assignment a
@@ -1647,8 +1706,16 @@ REVOKE ALL ON PROCEDURE rolebyte.access_list(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.access_list(jsonb, jsonb) TO rolebyte_public;
 
 -- history — the append-only promise made queryable: a tenant's membership
--- events in a time window, optionally narrowed to one service (the events
--- carry the service in their payload). The billing seat-count source.
+-- events, newest first, one page at a time. The billing seat-count source.
+--
+-- Narrowed by a time window (`from` inclusive, `to` exclusive), by one service
+-- (the events carry the service in their payload) and by `kindPrefix`, the
+-- family of kinds whose name starts with it (`chart` is every chart line). A
+-- page is at most `limit` lines (100 when not given, never more than 500);
+-- `before` names a line already read, and the page holds the lines older than
+-- it, so a reader walks the whole history page by page with no line missed or
+-- repeated, lines sharing a moment included. `more` says whether older lines
+-- exist beyond the page.
 CREATE OR REPLACE PROCEDURE rolebyte.history(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1657,9 +1724,15 @@ AS $$
 DECLARE
     v_tenant  text;
     v_service text;
+    v_prefix  text;
     v_from    timestamptz;
     v_to      timestamptz;
+    v_limit   text;
+    v_n       int := 100;
+    v_before  text;
+    v_at      timestamptz;
     v_events  jsonb;
+    v_more    boolean;
 BEGIN
     v_tenant := NULLIF(trim(pi_data->>'tenantId'), '');
     IF v_tenant IS NULL THEN
@@ -1668,30 +1741,62 @@ BEGIN
     END IF;
 
     v_service := NULLIF(trim(pi_data->>'service'), '');
+    v_prefix  := NULLIF(trim(pi_data->>'kindPrefix'), '');
     v_from    := NULLIF(trim(pi_data->>'from'), '')::timestamptz;
     v_to      := NULLIF(trim(pi_data->>'to'), '')::timestamptz;
 
-    SELECT COALESCE(jsonb_agg(jsonb_build_object(
-        'id',      e.id,
-        'at',      e.at,
-        'actor',   e.actor,
-        'userId',  COALESCE(e.user_id, ''),
-        'kind',    e.kind,
-        'payload', e.payload
-    ) ORDER BY e.at, e.id), '[]'::jsonb)
-    INTO v_events
-    FROM (
-        SELECT *
-        FROM rolebyte.event
-        WHERE tenant_id = v_tenant
-          AND (v_from IS NULL OR at >= v_from)
-          AND (v_to IS NULL OR at < v_to)
-          AND (v_service IS NULL OR payload->>'service' = v_service)
-        ORDER BY at, id
-        LIMIT 1000
-    ) e;
+    v_limit := NULLIF(trim(pi_data->>'limit'), '');
+    IF v_limit IS NOT NULL THEN
+        -- Checked as text before any cast: SQL does not promise to stop an OR at
+        -- its first true side, so a word must never reach the cast.
+        IF v_limit !~ '^[0-9]{1,6}$' THEN
+            po_data := util.result_error('membership:invalid', 'limit must be a whole number from 1');
+            RETURN;
+        END IF;
+        v_n := LEAST(v_limit::int, 500);
+        IF v_n < 1 THEN
+            po_data := util.result_error('membership:invalid', 'limit must be a whole number from 1');
+            RETURN;
+        END IF;
+    END IF;
 
-    po_data := util.result_success(jsonb_build_object('events', v_events));
+    v_before := NULLIF(trim(pi_data->>'before'), '');
+    IF v_before IS NOT NULL THEN
+        SELECT ev.at INTO v_at FROM rolebyte.event ev WHERE ev.id = v_before AND ev.tenant_id = v_tenant;
+        IF NOT FOUND THEN
+            po_data := util.result_error('membership:invalid', 'before names no line of this history');
+            RETURN;
+        END IF;
+    END IF;
+
+    -- One line past the page is read to learn whether older lines exist.
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+               'id',      e.id,
+               'at',      e.at,
+               'actor',   e.actor,
+               'userId',  COALESCE(e.user_id, ''),
+               'kind',    e.kind,
+               'payload', e.payload
+           ) ORDER BY e.at DESC, e.id DESC) FILTER (WHERE e.n <= v_n), '[]'::jsonb),
+           count(*) > v_n
+      INTO v_events, v_more
+      FROM (
+          SELECT ev.*, row_number() OVER (ORDER BY ev.at DESC, ev.id DESC) AS n
+            FROM (
+                SELECT *
+                  FROM rolebyte.event
+                 WHERE tenant_id = v_tenant
+                   AND (v_from IS NULL OR at >= v_from)
+                   AND (v_to IS NULL OR at < v_to)
+                   AND (v_service IS NULL OR payload->>'service' = v_service)
+                   AND (v_prefix IS NULL OR starts_with(kind, v_prefix))
+                   AND (v_before IS NULL OR (at, id) < (v_at, v_before))
+                 ORDER BY at DESC, id DESC
+                 LIMIT v_n + 1
+            ) ev
+      ) e;
+
+    po_data := util.result_success(jsonb_build_object('events', v_events, 'more', v_more));
 EXCEPTION
     WHEN sqlstate 'P0001' THEN
         RAISE;
