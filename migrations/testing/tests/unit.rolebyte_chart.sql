@@ -348,6 +348,34 @@ BEGIN
     PERFORM pg_temp.refused('chart_person_remove', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta, 'userId', v_toms),
         'membership:not_found', 'removing a person who is in no position');
 
+    -- Taking a person's access away takes them out of their position in the
+    -- same act, with its own line beside the revocation.
+    v := pg_temp.ok('user_invite', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta,
+        'subjectKey', 'sub:' || util.generate_ulid(), 'displayName', 'Laima Krūmiņa'), 'invite Laima');
+    PERFORM pg_temp.ok('chart_person_place', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta,
+        'userId', v->>'id', 'positionId', v_crew), 'Laima joins the crew');
+    PERFORM pg_temp.ok('user_revoke', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta,
+        'userId', v->>'id'), 'Laima''s access taken away');
+    IF EXISTS (SELECT 1 FROM rolebyte.chart_holder WHERE tenant_id = v_ta AND user_id = v->>'id') THEN
+        RAISE EXCEPTION 'a person whose access was taken away still sits in the crew';
+    END IF;
+    IF (SELECT count(*) FROM rolebyte.event WHERE tenant_id = v_ta AND user_id = v->>'id' AND kind = 'chartPersonRemoved'
+           AND payload->>'positionId' = v_crew AND payload->>'revoked' = 'true' AND actor = 'op:test')
+       IS DISTINCT FROM 1::bigint THEN
+        RAISE EXCEPTION 'leaving the chart with the revocation is one line naming the position';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM rolebyte.event WHERE tenant_id = v_ta AND user_id = v->>'id' AND kind = 'userRevoked') THEN
+        RAISE EXCEPTION 'the revocation keeps its own line';
+    END IF;
+    --      A person in no position is revoked with no chart line.
+    v := pg_temp.ok('user_invite', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta,
+        'subjectKey', 'sub:' || util.generate_ulid(), 'displayName', 'Roberts Egle'), 'invite Roberts');
+    PERFORM pg_temp.ok('user_revoke', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta,
+        'userId', v->>'id'), 'Roberts''s access taken away');
+    IF EXISTS (SELECT 1 FROM rolebyte.event WHERE user_id = v->>'id' AND kind = 'chartPersonRemoved') THEN
+        RAISE EXCEPTION 'a person in no position leaves no chart line';
+    END IF;
+
     -- A position with people or positions in it is not removed.
     PERFORM pg_temp.refused('chart_position_remove', jsonb_build_object('actor', 'op:test', 'tenantId', v_ta, 'positionId', v_site),
         'membership:conflict', 'a position with a crew under it');

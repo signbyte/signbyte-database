@@ -164,20 +164,19 @@ BEGIN
         RAISE EXCEPTION 'an ordinary role must still be definable: %', v;
     END IF;
 
-    -- 10. The configuration document carries permissions beside roles.
+    -- 10. The deployment registers permissions beside roles, and the
+    --     configuration document carries them.
     CALL rolebyte.tenant_create('{"actor":"permission-test","name":"Permission demo"}'::jsonb, v);
     v_tenant := v->'data'->>'id';
-    CALL rolebyte.config_version(jsonb_build_object('tenantId', v_tenant), v);
-    CALL rolebyte.config_apply(jsonb_build_object(
-        'tenantId', v_tenant, 'actor', 'permission-test', 'expectedVersion', v->'data'->>'version',
-        'section', '{"schema":"rolebyte-config/1","services":[{"key":"permcfg","displayName":"Permission config demo",
+    CALL rolebyte.permissions_register(jsonb_build_object('actor', 'permission-test',
+        'section', '{"services":[{"key":"permcfg","displayName":"Permission config demo",
             "roles":[],
             "permissions":[
               {"feature":"spentTime","act":"viewAll","description":"See everybody''s hours","class":"ordinary","plane":"object"},
               {"feature":"configuration","act":"edit","description":"","class":"tenantConfiguration","plane":"tenant",
                "labels":{"lv":"Mainīt konfigurāciju","de":"Konfiguration ändern"}}]}]}'::jsonb), v);
-    IF v->>'result' IS DISTINCT FROM 'success' OR (v->'data'->>'applied')::boolean IS NOT TRUE THEN
-        RAISE EXCEPTION 'apply with permissions failed: %', v;
+    IF v->>'result' IS DISTINCT FROM 'success' THEN
+        RAISE EXCEPTION 'registering permissions failed: %', v;
     END IF;
     IF jsonb_array_length(v->'data'->'permissions') <> 2
        OR EXISTS (SELECT 1 FROM jsonb_array_elements(v->'data'->'permissions') e WHERE e->>'status' <> 'added') THEN
@@ -185,7 +184,7 @@ BEGIN
     END IF;
     IF NOT EXISTS (SELECT 1 FROM jsonb_array_elements(v->'data'->'permissions') e
                    WHERE e->>'key' = 'permcfg/spentTime:viewAll') THEN
-        RAISE EXCEPTION 'the apply report should name each permission as it travels: %', v;
+        RAISE EXCEPTION 'the registration should name each permission as it travels: %', v;
     END IF;
 
     -- config_get answers them, with the class.
@@ -218,8 +217,9 @@ BEGIN
         RAISE EXCEPTION 'a round trip should change no permission: %', v;
     END IF;
 
-    -- 11. One refused entry writes nothing — the service before it and the
-    --     permission before it included — and the report names it.
+    -- 11. An import never writes the list: a re-classing entry and a service the
+    --     list does not hold are each skipped, naming the permission, and
+    --     nothing is written.
     CALL rolebyte.config_version(jsonb_build_object('tenantId', v_tenant), v);
     CALL rolebyte.config_apply(jsonb_build_object(
         'tenantId', v_tenant, 'actor', 'permission-test', 'expectedVersion', v->'data'->>'version',
@@ -229,15 +229,17 @@ BEGIN
           {"key":"permcfg","displayName":"Permission config demo","roles":[],
            "permissions":[{"feature":"spentTime","act":"viewAll","class":"tenantConfiguration","plane":"tenant"}]}
         ]}'::jsonb), v);
-    IF (v->'data'->>'applied')::boolean IS NOT FALSE
+    IF (v->'data'->>'applied')::boolean IS NOT TRUE
        OR NOT EXISTS (SELECT 1 FROM jsonb_array_elements(v->'data'->'permissions') e
-                       WHERE e->>'key' = 'permcfg/spentTime:viewAll' AND e->>'status' = 'refused'
-                         AND e->>'reason' = 'config_key_conflict') THEN
-        RAISE EXCEPTION 'a re-classing document should have been refused, naming the permission: %', v;
+                       WHERE e->>'key' = 'permcfg/spentTime:viewAll' AND e->>'status' = 'skipped'
+                         AND e->>'reason' = 'config_deployment_owned') THEN
+        RAISE EXCEPTION 'a re-classing entry is skipped, naming the permission: %', v;
     END IF;
     IF EXISTS (SELECT 1 FROM rolebyte.service WHERE key = 'permpoison')
-       OR EXISTS (SELECT 1 FROM rolebyte.service_permission WHERE service_key = 'permpoison') THEN
-        RAISE EXCEPTION 'a refused document must write nothing';
+       OR EXISTS (SELECT 1 FROM rolebyte.service_permission WHERE service_key = 'permpoison')
+       OR (SELECT class FROM rolebyte.service_permission
+            WHERE service_key = 'permcfg' AND feature_key = 'spentTime' AND act = 'viewAll') IS DISTINCT FROM 'ordinary' THEN
+        RAISE EXCEPTION 'an import must write nothing to the list';
     END IF;
 
     CALL rolebyte.config_apply(jsonb_build_object(

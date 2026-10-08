@@ -6,6 +6,23 @@ integrates against the procedures.
 
 ## v0.4.0
 
+### Changed — rolebyte: only the deployment writes the list of services, an import keeps the workspace's name and login, a workspace and one person's history can be read, and revoked people leave the chart
+
+One new migration, `rolebyte/V16`: two indexes on `rolebyte.event`, and every person whose access was revoked taken
+out of their chart position with one `chartPersonRemoved` line each (touches only those rows). **Apply with the
+rolebyte service of the same date**, whose one-time bootstrap door calls the new `own_rung_register`.
+
+- **Operators: register services, roles and permissions as the location's owner.** `service_register`,
+  `role_define` and `permission_declare` are no longer executable by `rolebyte_public`; the list every tenant of a
+  deployment shares is written only by the deployment (`permissions_register` or the three procedures, as owner).
+- New `rolebyte.tenant_get` (a workspace's name and the entitlements in force) and `rolebyte.own_rung_register`
+  (the register's own administrator rung, naming nothing else), both granted to `rolebyte_public`.
+- `config_section` no longer carries the workspace's name or corporate login; `config_apply` compares a document
+  with the list and never writes it — entries `unchanged` or `skipped`, a file's name and login answered as a
+  `workspace` list of `skipped` items.
+- `history` takes `actor` (a typed key, or `operator` for whoever runs the deployment); `user_revoke` also takes
+  the person out of the chart.
+
 ### Changed — rolebyte records the day each member last signed in, its people read names each member's user type, and its history reads a page at a time
 
 One new migration, `rolebyte/V15`, adds a nullable date column to `rolebyte.user_account` (no rewrite, a brief

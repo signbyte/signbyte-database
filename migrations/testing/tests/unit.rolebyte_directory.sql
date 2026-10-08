@@ -235,55 +235,47 @@ BEGIN
         RAISE EXCEPTION 'a revoked person resolves after a directory login: %', v;
     END IF;
 
-    -- (12) The configuration document carries the directory: it reads back, a
-    --      document changes it through the same act (event included), the read's
-    --      own answer re-applies as unchanged, a document without one leaves it,
-    --      and a malformed one writes nothing.
+    -- (12) The corporate login never travels: the section leaves it out, and a
+    --      document naming one — another company's, or one malformed — attaches
+    --      nothing and is told the workspace keeps its own; a document without
+    --      one is told nothing.
     CALL rolebyte.config_get(jsonb_build_object('tenantId', v_a), v);
-    IF v->'data'->'section'->'tenant'->'directory'->>'issuer' IS DISTINCT FROM v_iss_1 THEN
-        RAISE EXCEPTION 'config_get should carry the attached directory: %', v;
+    IF v->'data'->'section' ? 'tenant' OR (v->'data'->'section')::text LIKE '%' || v_iss_1 || '%' THEN
+        RAISE EXCEPTION 'config_get carries the attached directory: %', v;
     END IF;
     CALL rolebyte.config_apply(jsonb_build_object('tenantId', v_a, 'actor', v_actor,
         'expectedVersion', v->'data'->>'version',
         'section', jsonb_build_object('schema', 'rolebyte-config/1',
             'tenant', jsonb_build_object('directory', jsonb_build_object('issuer', v_iss_2)))), v);
     IF v->>'result' IS DISTINCT FROM 'success' OR (v->'data'->>'applied')::boolean IS NOT TRUE
-       OR v->'data'->'directory'->>'status' IS DISTINCT FROM 'changed' THEN
-        RAISE EXCEPTION 'a document should be able to change the directory: %', v;
+       OR (SELECT string_agg(e->>'key' || '=' || (e->>'status'), ',') FROM jsonb_array_elements(v->'data'->'workspace') e)
+           IS DISTINCT FROM 'directory=skipped' THEN
+        RAISE EXCEPTION 'a document naming another directory is told the workspace keeps its own: %', v;
     END IF;
-    IF (SELECT directory_issuer FROM rolebyte.tenant WHERE id = v_a) IS DISTINCT FROM v_iss_2 THEN
-        RAISE EXCEPTION 'the directory did not follow the document';
+    IF (SELECT directory_issuer FROM rolebyte.tenant WHERE id = v_a) IS DISTINCT FROM v_iss_1 THEN
+        RAISE EXCEPTION 'a document replaced the workspace''s corporate login';
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM rolebyte.event WHERE tenant_id = v_a AND kind = 'directoryAttached'
-                     AND payload->>'issuer' = v_iss_2 AND payload->>'from' = v_iss_1) THEN
-        RAISE EXCEPTION 'a change through the document should log the attach with the previous issuer';
+    IF EXISTS (SELECT 1 FROM rolebyte.event WHERE tenant_id = v_a AND kind = 'directoryAttached'
+                 AND payload->>'issuer' = v_iss_2) THEN
+        RAISE EXCEPTION 'a document attached a directory';
     END IF;
     CALL rolebyte.config_get(jsonb_build_object('tenantId', v_a), v);
     CALL rolebyte.config_apply(jsonb_build_object('tenantId', v_a, 'actor', v_actor,
-        'section', v->'data'->'section', 'expectedVersion', v->'data'->>'version'), v);
-    IF v->'data'->'directory'->>'status' IS DISTINCT FROM 'unchanged'
-       OR v->'data'->'tenant'->>'status' IS DISTINCT FROM 'unchanged' THEN
-        RAISE EXCEPTION 'the round trip should change nothing: %', v;
-    END IF;
-    CALL rolebyte.config_apply(jsonb_build_object('tenantId', v_a, 'actor', v_actor,
         'expectedVersion', v->'data'->>'version',
         'section', '{"schema":"rolebyte-config/1","services":[]}'::jsonb), v);
-    IF v->>'result' IS DISTINCT FROM 'success' OR v->'data' ? 'tenant' OR v->'data' ? 'directory' THEN
-        RAISE EXCEPTION 'a document without a tenant section should report no tenant change: %', v;
-    END IF;
-    IF (SELECT directory_issuer FROM rolebyte.tenant WHERE id = v_a) IS DISTINCT FROM v_iss_2 THEN
-        RAISE EXCEPTION 'a document without a directory detached it';
+    IF v->>'result' IS DISTINCT FROM 'success' OR v->'data' ? 'workspace' OR v->'data' ? 'tenant'
+       OR v->'data' ? 'directory' THEN
+        RAISE EXCEPTION 'a document naming no workspace detail is told nothing about one: %', v;
     END IF;
     CALL rolebyte.config_apply(jsonb_build_object('tenantId', v_a, 'actor', v_actor,
         'expectedVersion', v->'data'->>'version',
         'section', '{"schema":"rolebyte-config/1","tenant":{"directory":{"issuer":"not an issuer"}}}'::jsonb), v);
-    IF (v->'data'->>'applied')::boolean IS NOT FALSE
-       OR v->'data'->'directory'->>'status' IS DISTINCT FROM 'refused'
-       OR v->'data'->'directory'->>'reason' IS DISTINCT FROM 'config_bad_document' THEN
-        RAISE EXCEPTION 'a malformed directory in a document should have been refused: %', v;
+    IF (v->'data'->>'applied')::boolean IS NOT TRUE
+       OR v->'data'->'workspace'->0->>'status' IS DISTINCT FROM 'skipped' THEN
+        RAISE EXCEPTION 'a malformed directory in a document is not read, only named as kept: %', v;
     END IF;
-    IF (SELECT directory_issuer FROM rolebyte.tenant WHERE id = v_a) IS DISTINCT FROM v_iss_2 THEN
-        RAISE EXCEPTION 'a refused document changed the directory';
+    IF (SELECT directory_issuer FROM rolebyte.tenant WHERE id = v_a) IS DISTINCT FROM v_iss_1 THEN
+        RAISE EXCEPTION 'a document changed the directory';
     END IF;
 
     -- (13) Detach: an attributed event, the tenant admits nobody afterwards, and
@@ -293,7 +285,7 @@ BEGIN
     IF v->>'result' IS DISTINCT FROM 'success' OR (v->'data'->>'changed')::boolean IS NOT TRUE OR v->'data'->>'issuer' IS NOT NULL THEN
         RAISE EXCEPTION 'detach failed: %', v;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM rolebyte.event WHERE tenant_id = v_a AND kind = 'directoryDetached' AND payload->>'issuer' = v_iss_2) THEN
+    IF NOT EXISTS (SELECT 1 FROM rolebyte.event WHERE tenant_id = v_a AND kind = 'directoryDetached' AND payload->>'issuer' = v_iss_1) THEN
         RAISE EXCEPTION 'the detach should log the issuer it removed';
     END IF;
     CALL rolebyte.directory_admit(jsonb_build_object(

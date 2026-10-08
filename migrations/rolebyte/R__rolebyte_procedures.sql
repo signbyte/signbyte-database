@@ -95,8 +95,8 @@ $$;
 REVOKE ALL ON PROCEDURE rolebyte.tenant_create(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.tenant_create(jsonb, jsonb) TO rolebyte_public;
 
--- service_register — a consumer service registers itself (idempotent upsert).
--- Emits `serviceRegistered` only when the row is new.
+-- service_register — a consumer service is registered (idempotent upsert), by
+-- whoever runs the deployment. Emits `serviceRegistered` only when the row is new.
 CREATE OR REPLACE PROCEDURE rolebyte.service_register(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -145,11 +145,15 @@ EXCEPTION
 END;
 $$;
 
+-- The deployment's list, not a tenant's: the procedures that write it run as the
+-- location's owner, from the deployment's own tools, and the register's role is
+-- refused them. A grant an earlier release gave is taken back here, because a
+-- repeatable file's CREATE OR REPLACE keeps it.
 REVOKE ALL ON PROCEDURE rolebyte.service_register(jsonb, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON PROCEDURE rolebyte.service_register(jsonb, jsonb) TO rolebyte_public;
+REVOKE EXECUTE ON PROCEDURE rolebyte.service_register(jsonb, jsonb) FROM rolebyte_public;
 
--- role_define — a service defines one (group, level) role as data (idempotent
--- upsert). Emits `roleDefined` only when the row is new.
+-- role_define — one (group, level) role of a service, as data (idempotent
+-- upsert), defined by whoever runs the deployment. Emits `roleDefined` only when the row is new.
 CREATE OR REPLACE PROCEDURE rolebyte.role_define(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -219,8 +223,12 @@ EXCEPTION
 END;
 $$;
 
+-- The deployment's list, not a tenant's: the procedures that write it run as the
+-- location's owner, from the deployment's own tools, and the register's role is
+-- refused them. A grant an earlier release gave is taken back here, because a
+-- repeatable file's CREATE OR REPLACE keeps it.
 REVOKE ALL ON PROCEDURE rolebyte.role_define(jsonb, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON PROCEDURE rolebyte.role_define(jsonb, jsonb) TO rolebyte_public;
+REVOKE EXECUTE ON PROCEDURE rolebyte.role_define(jsonb, jsonb) FROM rolebyte_public;
 
 -- permission_declare — a service declares one act it enforces on one of its
 -- features. Additive: a new permission is created, an identical one reports
@@ -480,8 +488,12 @@ EXCEPTION
 END;
 $$;
 
+-- The deployment's list, not a tenant's: the procedures that write it run as the
+-- location's owner, from the deployment's own tools, and the register's role is
+-- refused them. A grant an earlier release gave is taken back here, because a
+-- repeatable file's CREATE OR REPLACE keeps it.
 REVOKE ALL ON PROCEDURE rolebyte.permission_declare(jsonb, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON PROCEDURE rolebyte.permission_declare(jsonb, jsonb) TO rolebyte_public;
+REVOKE EXECUTE ON PROCEDURE rolebyte.permission_declare(jsonb, jsonb) FROM rolebyte_public;
 
 -- user_invite — a tenant admin adds a person by typed subject key, with the
 -- role grants they should hold, status `invited`. All requested roles are
@@ -1065,6 +1077,38 @@ $$;
 
 REVOKE ALL ON FUNCTION rolebyte.administrator_rung(text) FROM PUBLIC;
 
+-- own_rung_register — the register's own service and its administrator rung put
+-- on the deployment's list, for the one-time bootstrap door, which runs as the
+-- register's own role. It names nothing a caller chooses: the service and the
+-- rung are fixed, so the register's role can add nothing else to the list
+-- through it. Idempotent.
+CREATE OR REPLACE PROCEDURE rolebyte.own_rung_register(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_actor text := NULLIF(trim(pi_data->>'actor'), '');
+BEGIN
+    IF v_actor IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'actor is required');
+        RETURN;
+    END IF;
+
+    PERFORM rolebyte.administrator_rung(v_actor);
+    po_data := util.result_success(jsonb_build_object(
+        'service', 'rolebyte', 'group', 'membership', 'level', 'admin'));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.own_rung_register(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.own_rung_register(jsonb, jsonb) TO rolebyte_public;
+
 -- administrator_make — the one step the operator's acts share: make the person
 -- with this subject key an administrator of this tenant, whatever anyone else's
 -- state. A member receives the rung; someone not yet a member is added,
@@ -1303,7 +1347,10 @@ GRANT EXECUTE ON PROCEDURE rolebyte.role_revoke(jsonb, jsonb) TO rolebyte_public
 -- user_revoke — the offboarding switch: the user stops resolving everywhere
 -- at the next session refresh. Assignment rows are left as they stand — the
 -- user-level status gates resolution, and the event stream keeps the truth.
--- Revoking the tenant's last administrator is refused
+-- A person who lost access also leaves their place in the chart of authority,
+-- in the same act and with its own line (`chartPersonRemoved`, marked
+-- `revoked`), so the chart's editor never lists or counts someone who lifts
+-- nothing. Revoking the tenant's last administrator is refused
 -- (administrator_removal_refusal).
 CREATE OR REPLACE PROCEDURE rolebyte.user_revoke(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
@@ -1315,6 +1362,7 @@ DECLARE
     v_tenant  text;
     v_user_id text;
     v_refusal jsonb;
+    v_left    text;
 BEGIN
     v_actor   := NULLIF(trim(pi_data->>'actor'), '');
     v_tenant  := NULLIF(trim(pi_data->>'tenantId'), '');
@@ -1341,6 +1389,15 @@ BEGIN
 
     INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
     VALUES (util.generate_ulid(), v_actor, v_tenant, v_user_id, 'userRevoked', '{}'::jsonb);
+
+    DELETE FROM rolebyte.chart_holder
+     WHERE tenant_id = v_tenant AND user_id = v_user_id
+    RETURNING position_id INTO v_left;
+    IF v_left IS NOT NULL THEN
+        INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+        VALUES (util.generate_ulid(), v_actor, v_tenant, v_user_id, 'chartPersonRemoved',
+                jsonb_build_object('positionId', v_left, 'revoked', true));
+    END IF;
 
     po_data := util.result_success(jsonb_build_object('revoked', true));
 EXCEPTION
@@ -1716,6 +1773,15 @@ GRANT EXECUTE ON PROCEDURE rolebyte.access_list(jsonb, jsonb) TO rolebyte_public
 -- it, so a reader walks the whole history page by page with no line missed or
 -- repeated, lines sharing a moment included. `more` says whether older lines
 -- exist beyond the page.
+--
+-- `actor` narrows to one actor. A typed key (`sub:…` a person, `svc:…` a
+-- service) keeps the lines that key wrote; for a person of this tenant it also
+-- keeps the lines about them that no person wrote — their arrival through an
+-- invitation claim or the corporate login, and the deployment's own acts on
+-- them — so a person's story begins where they joined. `operator` keeps the
+-- lines written by whoever runs the deployment: an actor that is neither a
+-- person nor a service. It only narrows: nothing outside the tenant's history
+-- is ever answered.
 CREATE OR REPLACE PROCEDURE rolebyte.history(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1733,11 +1799,27 @@ DECLARE
     v_at      timestamptz;
     v_events  jsonb;
     v_more    boolean;
+    v_actor   text;
+    v_about   text;
 BEGIN
     v_tenant := NULLIF(trim(pi_data->>'tenantId'), '');
     IF v_tenant IS NULL THEN
         po_data := util.result_error('membership:invalid', 'tenantId is required');
         RETURN;
+    END IF;
+
+    v_actor := NULLIF(trim(pi_data->>'actor'), '');
+    IF v_actor IS NOT NULL AND v_actor <> 'operator' THEN
+        IF v_actor !~ '^[a-z]+:.+$' THEN
+            po_data := util.result_error('membership:invalid',
+                'actor is a typed key, such as sub:<person>, or operator');
+            RETURN;
+        END IF;
+        IF starts_with(v_actor, 'sub:') THEN
+            SELECT u.id INTO v_about
+              FROM rolebyte.user_account u
+             WHERE u.tenant_id = v_tenant AND u.subject_key = v_actor;
+        END IF;
     END IF;
 
     v_service := NULLIF(trim(pi_data->>'service'), '');
@@ -1790,6 +1872,12 @@ BEGIN
                    AND (v_to IS NULL OR at < v_to)
                    AND (v_service IS NULL OR payload->>'service' = v_service)
                    AND (v_prefix IS NULL OR starts_with(kind, v_prefix))
+                   AND (v_actor IS NULL
+                        OR (v_actor = 'operator' AND actor !~ '^(sub|svc):')
+                        OR (v_actor <> 'operator'
+                            AND (actor = v_actor
+                                 OR (v_about IS NOT NULL AND user_id = v_about
+                                     AND NOT starts_with(actor, 'sub:')))))
                    AND (v_before IS NULL OR (at, id) < (v_at, v_before))
                  ORDER BY at DESC, id DESC
                  LIMIT v_n + 1
@@ -2882,25 +2970,27 @@ REVOKE ALL ON PROCEDURE rolebyte.tenant_role_placements_set(jsonb, jsonb) FROM P
 GRANT EXECUTE ON PROCEDURE rolebyte.tenant_role_placements_set(jsonb, jsonb) TO rolebyte_public;
 
 -- ---------------------------------------------------------------------------
--- Configuration transport. The vocabulary (services with their role
--- definitions and the permissions they declare), the tenant's display name and
--- its attached directory travel in a configuration document, the section
--- `rolebyte-config/1`. The vocabulary is shared by every tenant on a
--- deployment, so a document only ever ADDS to it — defining what is missing,
--- reporting what is already present — and never removes: retiring a role
--- people may hold somewhere is an administration act performed in place, not a
--- side effect of importing a file. People and their assignments never travel.
+-- Configuration transport. The section `rolebyte-config/1` carries the
+-- deployment's list of services, with their role definitions and the
+-- permissions they declare, so an export says what the tenant's configuration
+-- was made against. An import never writes that list: it is the deployment's,
+-- shared by every tenant on it, and only whoever runs the deployment adds to it.
+-- Each entry of a document is reported `unchanged` where the list already says
+-- the same, and `skipped` where it does not, naming why. The workspace's own
+-- name and corporate login never travel: an export leaves them out, and an
+-- import never changes them, whatever a file holds. People and their
+-- assignments never travel at all.
 --
 -- The section's version is a hash of the section's own bytes, salted with the
 -- tenant, computed when asked; nothing stores it and no writer maintains it, so
 -- no writer can leave it lying. An apply names the version its preview
 -- answered, and is refused when the section has moved since.
 --
--- A preview and an apply are one pass: the document is written item by item
--- through the same registering procedures every other caller uses, each
--- refusal kept as a line of the report, and for a preview — or a document with
--- a refused item — the whole pass is undone again. The two cannot disagree
--- about a document, because they are the same run.
+-- A preview and an apply are one pass: the document is compared item by item
+-- through the same registering procedures every other caller uses, and the
+-- pass is always undone again, so what the list already holds is read exactly
+-- as a registration would read it. The two cannot disagree about a document,
+-- because they are the same run.
 -- ---------------------------------------------------------------------------
 
 -- config_section — the tenant's section as it travels; NULL for no such
@@ -2914,12 +3004,6 @@ SET search_path = rolebyte, pg_temp
 AS $$
     SELECT jsonb_build_object(
         'schema', 'rolebyte-config/1',
-        -- The attached directory travels with the display name: an address, not
-        -- a secret, and part of what makes a tenant ready to use.
-        'tenant', jsonb_build_object(
-            'displayName', t.name,
-            'directory',   CASE WHEN t.directory_issuer IS NULL THEN NULL::jsonb
-                                ELSE jsonb_build_object('issuer', t.directory_issuer) END),
         'services', COALESCE((
             SELECT jsonb_agg(jsonb_build_object(
                        'key',         s.key,
@@ -3133,10 +3217,15 @@ $$;
 REVOKE ALL ON FUNCTION rolebyte.config_vocabulary(text, jsonb) FROM PUBLIC;
 
 -- config_apply — preview or apply one section. `dryRun` answers the report and
--- writes nothing; a document with a refused item writes nothing either; a clean
--- one lands whole, every act recorded under the importing person, and one
--- `configApplied` line in the tenant's history names the part's hash and the
--- document it arrived in.
+-- writes nothing. An apply writes one thing, the `configApplied` line in the
+-- tenant's history, naming the counts, the part's hash and the document it
+-- arrived in: the list of services is the deployment's, so every entry is
+-- compared and none is written — `unchanged` where the list already says the
+-- same, `skipped` where it does not (`config_deployment_owned`). An entry that
+-- cannot be read is `refused` (`config_bad_document`), and a document with one
+-- writes nothing at all. A file that still names the workspace's name or its
+-- corporate login gets a `workspace` list saying neither is taken
+-- (`config_workspace_owned`).
 CREATE OR REPLACE PROCEDURE rolebyte.config_apply(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -3150,13 +3239,11 @@ DECLARE
     v_part_hash text := NULLIF(trim(pi_data->>'partHash'), '');
     v_document  text := NULLIF(trim(pi_data->>'documentHash'), '');
     v_dry       boolean;
-    v_name      text;
-    v_new_name  text;
-    v_new_dir   text;
-    v_out       jsonb;
-    v_report    jsonb;
-    v_tenant_r  jsonb;
-    v_dir_r     jsonb;
+    v_pass      jsonb;
+    v_report    jsonb := '{}'::jsonb;
+    v_items     jsonb;
+    v_item      jsonb;
+    v_workspace jsonb := '[]'::jsonb;
     v_part      text;
     v_refused   boolean := false;
     v_counts    jsonb := '{}'::jsonb;
@@ -3193,22 +3280,17 @@ BEGIN
         po_data := util.result_error('membership:config_bad_document', 'services must be a list');
         RETURN;
     END IF;
-    IF v_section ? 'tenant' AND jsonb_typeof(v_section->'tenant') NOT IN ('object', 'null') THEN
-        po_data := util.result_error('membership:config_bad_document', 'tenant must be an object');
-        RETURN;
-    END IF;
 
-    SELECT name INTO v_name FROM rolebyte.tenant WHERE id = v_tenant;
-    IF v_name IS NULL THEN
+    IF NOT EXISTS (SELECT 1 FROM rolebyte.tenant WHERE id = v_tenant) THEN
         po_data := util.result_error('membership:not_found', 'no such tenant');
         RETURN;
     END IF;
 
     -- A writing apply names the version its preview answered: without it,
     -- nothing says the document is being applied to the configuration the
-    -- person looked at. The vocabulary is shared by every tenant, so two
-    -- tenants' imports write the same rows: one writing apply at a time across
-    -- the deployment, compared under that lock.
+    -- person looked at. The list is shared by every tenant and the deployment
+    -- may be registering a service at this moment, so the version is compared
+    -- under the lock the registration takes.
     IF NOT v_dry THEN
         IF v_expected IS NULL THEN
             po_data := util.result_error('membership:config_version_required',
@@ -3224,75 +3306,69 @@ BEGIN
         END IF;
     END IF;
 
-    -- The pass. Written for real, then undone again for a preview or for a
-    -- document with a refused item; what it reported stands either way.
+    -- The pass: each entry run through the registering procedures, which say
+    -- what a registration would do, and then always undone. What it found
+    -- stands.
     BEGIN
-        v_report := rolebyte.config_vocabulary(v_actor, v_section->'services');
-
-        IF jsonb_typeof(v_section->'tenant'->'displayName') = 'string' THEN
-            v_new_name := NULLIF(trim(v_section->'tenant'->>'displayName'), '');
-        END IF;
-        IF v_new_name IS NOT NULL THEN
-            IF v_new_name = v_name THEN
-                v_tenant_r := rolebyte.config_item('tenant', 'unchanged');
-            ELSE
-                UPDATE rolebyte.tenant SET name = v_new_name WHERE id = v_tenant;
-                INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
-                VALUES (util.generate_ulid(), v_actor, v_tenant, 'tenantRenamed',
-                        jsonb_build_object('from', v_name, 'to', v_new_name));
-                v_tenant_r := rolebyte.config_item('tenant', 'changed', NULL, 'displayName');
-            END IF;
-        END IF;
-
-        -- The attached directory follows the document through the same act a
-        -- direct attach uses, so the event lands identically. A document never
-        -- detaches: an absent or empty directory leaves the tenant's as it is.
-        IF jsonb_typeof(v_section->'tenant'->'directory') = 'object' THEN
-            v_new_dir := NULLIF(trim(v_section->'tenant'->'directory'->>'issuer'), '');
-        END IF;
-        IF v_new_dir IS NOT NULL THEN
-            v_out := NULL;
-            CALL rolebyte.directory_attach(jsonb_build_object(
-                'actor', v_actor, 'tenantId', v_tenant, 'issuer', v_new_dir), v_out);
-            IF v_out->>'result' IS DISTINCT FROM 'success' THEN
-                v_dir_r := rolebyte.config_item('directory', 'refused',
-                    CASE WHEN v_out->>'code' = 'membership:invalid' THEN 'config_bad_document'
-                         ELSE split_part(v_out->>'code', ':', 2) END,
-                    v_out->>'message');
-            ELSE
-                v_dir_r := rolebyte.config_item('directory',
-                    CASE WHEN (v_out->'data'->>'changed')::boolean THEN 'changed' ELSE 'unchanged' END,
-                    NULL, CASE WHEN (v_out->'data'->>'changed')::boolean THEN 'issuer' END);
-            END IF;
-        END IF;
-
-        FOREACH v_part IN ARRAY ARRAY['services', 'roles', 'permissions'] LOOP
-            v_refused := v_refused OR EXISTS (
-                SELECT 1 FROM jsonb_array_elements(v_report->v_part) e WHERE e->>'status' = 'refused');
-        END LOOP;
-        v_refused := v_refused OR v_dir_r->>'status' IS NOT DISTINCT FROM 'refused';
-
-        IF v_dry OR v_refused THEN
-            RAISE EXCEPTION 'rolebyte.config_apply: the pass is undone' USING ERRCODE = 'RB001';
-        END IF;
+        v_pass := rolebyte.config_vocabulary(v_actor, v_section->'services');
+        RAISE EXCEPTION 'rolebyte.config_apply: the pass is undone' USING ERRCODE = 'RB001';
     EXCEPTION
         WHEN sqlstate 'RB001' THEN
             NULL;
     END;
 
-    IF v_tenant_r IS NOT NULL THEN
-        v_report := v_report || jsonb_build_object('tenant', v_tenant_r);
+    -- An entry the list already holds as the document says is unchanged. One
+    -- it does not hold, or holds otherwise, is skipped: only the deployment
+    -- changes its list. One that cannot be read is refused.
+    FOREACH v_part IN ARRAY ARRAY['services', 'roles', 'permissions'] LOOP
+        v_items := '[]'::jsonb;
+        FOR v_item IN SELECT * FROM jsonb_array_elements(COALESCE(v_pass->v_part, '[]'::jsonb)) LOOP
+            v_items := v_items || CASE
+                WHEN v_item->>'status' = 'unchanged' THEN v_item
+                WHEN v_item->>'status' = 'added' THEN rolebyte.config_item(v_item->>'key', 'skipped',
+                    'config_deployment_owned',
+                    'not on this deployment''s list; only whoever runs the deployment adds to it')
+                WHEN v_item->>'status' = 'changed' THEN rolebyte.config_item(v_item->>'key', 'skipped',
+                    'config_deployment_owned',
+                    'this deployment''s list says otherwise (' || COALESCE(v_item->>'detail', '') ||
+                    '); only whoever runs the deployment changes it')
+                WHEN v_item->>'reason' = 'config_key_conflict' THEN rolebyte.config_item(v_item->>'key', 'skipped',
+                    'config_deployment_owned',
+                    'this deployment''s list holds it otherwise (' || COALESCE(v_item->>'detail', '') ||
+                    '); only whoever runs the deployment changes it')
+                ELSE v_item
+            END;
+        END LOOP;
+        v_report := v_report || jsonb_build_object(v_part, v_items);
+        v_refused := v_refused OR EXISTS (
+            SELECT 1 FROM jsonb_array_elements(v_items) e WHERE e->>'status' = 'refused');
+    END LOOP;
+
+    -- The workspace's name and corporate login are its own. A file that still
+    -- names them is told so, item by item; nothing is read from it.
+    IF jsonb_typeof(v_section->'tenant') = 'object' THEN
+        IF jsonb_typeof(v_section->'tenant'->'displayName') = 'string'
+           AND NULLIF(trim(v_section->'tenant'->>'displayName'), '') IS NOT NULL THEN
+            v_workspace := v_workspace || rolebyte.config_item('displayName', 'skipped', 'config_workspace_owned',
+                'a workspace keeps its own name; a file never changes it');
+        END IF;
+        IF jsonb_typeof(v_section->'tenant'->'directory') = 'object'
+           AND NULLIF(trim(v_section->'tenant'->'directory'->>'issuer'), '') IS NOT NULL THEN
+            v_workspace := v_workspace || rolebyte.config_item('directory', 'skipped', 'config_workspace_owned',
+                'a workspace keeps its own corporate login; a file never changes it');
+        END IF;
     END IF;
-    IF v_dir_r IS NOT NULL THEN
-        v_report := v_report || jsonb_build_object('directory', v_dir_r);
+    IF jsonb_array_length(v_workspace) > 0 THEN
+        v_report := v_report || jsonb_build_object('workspace', v_workspace);
     END IF;
 
     IF NOT v_dry AND NOT v_refused THEN
         FOREACH v_part IN ARRAY ARRAY['services', 'roles', 'permissions'] LOOP
             v_counts := v_counts || jsonb_build_object(v_part, jsonb_build_object(
-                'added',     (SELECT count(*) FROM jsonb_array_elements(v_report->v_part) e WHERE e->>'status' = 'added'),
-                'changed',   (SELECT count(*) FROM jsonb_array_elements(v_report->v_part) e WHERE e->>'status' = 'changed'),
+                'added',     0,
+                'changed',   0,
                 'unchanged', (SELECT count(*) FROM jsonb_array_elements(v_report->v_part) e WHERE e->>'status' = 'unchanged'),
+                'skipped',   (SELECT count(*) FROM jsonb_array_elements(v_report->v_part) e WHERE e->>'status' = 'skipped'),
                 'refused',   0));
         END LOOP;
         INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
@@ -3357,6 +3433,49 @@ $$;
 
 REVOKE ALL ON PROCEDURE rolebyte.config_exported(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.config_exported(jsonb, jsonb) TO rolebyte_public;
+
+-- tenant_get — what a workspace is, for any of its members: its name, and the
+-- products it has (each entitlement in force: a whole service as an empty
+-- feature, or one feature of it), in a stable order. Who may ask is the
+-- service's check — a member of this tenant — as for the list of its people;
+-- nothing here is a secret from them.
+CREATE OR REPLACE PROCEDURE rolebyte.tenant_get(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_tenant text := NULLIF(trim(pi_data->>'tenantId'), '');
+    v_name   text;
+BEGIN
+    IF v_tenant IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'tenantId is required');
+        RETURN;
+    END IF;
+    SELECT name INTO v_name FROM rolebyte.tenant WHERE id = v_tenant;
+    IF NOT FOUND THEN
+        po_data := util.result_error('membership:not_found', 'no such tenant');
+        RETURN;
+    END IF;
+
+    po_data := util.result_success(jsonb_build_object(
+        'id',   v_tenant,
+        'name', v_name,
+        'entitlements', COALESCE((
+            SELECT jsonb_agg(jsonb_build_object('service', e.service_key, 'feature', e.feature_key)
+                             ORDER BY e.service_key COLLATE "C", e.feature_key COLLATE "C")
+              FROM rolebyte.tenant_entitlement e
+             WHERE e.tenant_id = v_tenant AND e.state = 'entitled'), '[]'::jsonb)));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.tenant_get(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.tenant_get(jsonb, jsonb) TO rolebyte_public;
 
 -- permissions_register — the deployment registers what each service enforces:
 -- the services' permission lists, as each service prints them, added to the

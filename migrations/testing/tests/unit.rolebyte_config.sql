@@ -1,11 +1,14 @@
 -- Unit test: the rolebyte configuration section, `rolebyte-config/1`.
--- The section reads with a version derived from its own bytes; a preview
--- reports exactly what an apply would do and writes nothing; an apply names
--- the version its preview answered and is refused without one or once it has
--- moved; a document with a refused item writes nothing, the clean item beside
--- it included; the vocabulary only ever grows; every import and every export
--- leaves one line in the tenant's history; and the deployment registers the
--- services' permissions through a procedure of its own.
+-- The section reads with a version derived from its own bytes and never carries
+-- the workspace's name or corporate login; a preview reports exactly what an
+-- apply would do and writes nothing; an apply names the version its preview
+-- answered and is refused without one or once it has moved; an import never
+-- writes the deployment's list of services — what the list holds as the file
+-- says is unchanged, anything else skipped — and never the workspace's name or
+-- login, whatever the file holds; a document with an unreadable entry writes
+-- nothing; every import and every export leaves one line in the tenant's
+-- history; and the deployment registers the services' permissions through a
+-- procedure of its own.
 --   psql -v ON_ERROR_STOP=1 -f migrations/testing/tests/unit.rolebyte_config.sql
 
 DO $$
@@ -25,6 +28,7 @@ DECLARE
     v_part     text := 'sha256:' || repeat('a', 64);
     v_file     text := 'sha256:' || repeat('b', 64);
     v_line     jsonb;
+    v_issuer   text;
 BEGIN
     -- Everything below is undone at the end, so the test leaves nothing behind:
     -- it registers a seeded permission, and a later test needs a database where
@@ -49,8 +53,8 @@ BEGIN
         RAISE EXCEPTION 'the deployment should register a service''s permissions: %', v;
     END IF;
 
-    -- 1. The section: its schema, the tenant, every service, keys and never
-    --    identifiers, the seeds aboard.
+    -- 1. The section: its schema and every service, keys and never identifiers,
+    --    the seeds aboard — and never the workspace's name or corporate login.
     CALL rolebyte.config_get(jsonb_build_object('tenantId', v_tenant), v);
     IF v->>'result' IS DISTINCT FROM 'success' THEN
         RAISE EXCEPTION 'config_get failed: %', v;
@@ -58,9 +62,11 @@ BEGIN
     v_section := v->'data'->'section';
     v0 := v->'data'->>'version';
     IF v_section->>'schema' IS DISTINCT FROM 'rolebyte-config/1'
-       OR v_section->'tenant'->>'displayName' IS DISTINCT FROM 'Config demo'
        OR jsonb_typeof(v_section->'services') IS DISTINCT FROM 'array' THEN
-        RAISE EXCEPTION 'the section should be rolebyte-config/1 with the tenant and the services: %', v_section;
+        RAISE EXCEPTION 'the section should be rolebyte-config/1 with the services: %', v_section;
+    END IF;
+    IF v_section ? 'tenant' OR v_section::text LIKE '%Config demo%' THEN
+        RAISE EXCEPTION 'the section carries the workspace''s name: %', v_section;
     END IF;
     IF v_section::text LIKE '%"id"%' THEN
         RAISE EXCEPTION 'the section carries identifiers: %', v_section;
@@ -87,7 +93,10 @@ BEGIN
         RAISE EXCEPTION 'two tenants share a version';
     END IF;
 
-    -- 3. A preview writes nothing and reports what an apply would do.
+    -- 3. A preview writes nothing and reports what an apply would do: a service
+    --    the deployment's list does not hold is skipped, with its roles and its
+    --    permissions, and the workspace's name the file still carries is skipped
+    --    too, saying the workspace keeps its own.
     v_doc := jsonb_build_object('schema', 'rolebyte-config/1',
         'tenant', jsonb_build_object('displayName', 'Config demo, renamed'),
         'services', '[{"key":"cfgdemo","displayName":"Config demo service",
@@ -105,11 +114,24 @@ BEGIN
        OR v_pre->>'version' IS DISTINCT FROM v0 OR v_pre->>'schema' IS DISTINCT FROM 'rolebyte-config/1' THEN
         RAISE EXCEPTION 'a preview answers dryRun, not applied, not refused, the current version: %', v_pre;
     END IF;
-    IF v_pre->'services' IS DISTINCT FROM '[{"key":"cfgdemo","status":"added"}]'::jsonb
-       OR v_pre->'roles' IS DISTINCT FROM '[{"key":"cfgdemo demo:read","status":"added"},{"key":"cfgdemo demo:admin","status":"added"}]'::jsonb
-       OR v_pre->'permissions' IS DISTINCT FROM '[{"key":"cfgdemo/thing:edit","status":"added"}]'::jsonb
-       OR v_pre->'tenant' IS DISTINCT FROM '{"key":"tenant","status":"changed","detail":"displayName"}'::jsonb THEN
-        RAISE EXCEPTION 'the preview should name each item by key: %', v_pre;
+    IF (SELECT string_agg(e->>'key' || '=' || (e->>'status') || '/' || (e->>'reason'), ',')
+          FROM jsonb_array_elements(v_pre->'services') e)
+           IS DISTINCT FROM 'cfgdemo=skipped/config_deployment_owned'
+       OR (SELECT string_agg(e->>'key' || '=' || (e->>'status'), ',') FROM jsonb_array_elements(v_pre->'roles') e)
+           IS DISTINCT FROM 'cfgdemo demo:read=skipped,cfgdemo demo:admin=skipped'
+       OR (SELECT string_agg(e->>'key' || '=' || (e->>'status'), ',') FROM jsonb_array_elements(v_pre->'permissions') e)
+           IS DISTINCT FROM 'cfgdemo/thing:edit=skipped'
+       OR (SELECT string_agg(e->>'key' || '=' || (e->>'status') || '/' || (e->>'reason'), ',')
+             FROM jsonb_array_elements(v_pre->'workspace') e)
+           IS DISTINCT FROM 'displayName=skipped/config_workspace_owned' THEN
+        RAISE EXCEPTION 'the preview should skip each entry the list does not hold, and the name: %', v_pre;
+    END IF;
+    IF v_pre->'services'->0->>'detail' NOT LIKE '%only whoever runs the deployment adds to it%'
+       OR v_pre->'workspace'->0->>'detail' NOT LIKE '%keeps its own name%' THEN
+        RAISE EXCEPTION 'a skipped entry says why: %', v_pre;
+    END IF;
+    IF v_pre ? 'tenant' OR v_pre ? 'directory' THEN
+        RAISE EXCEPTION 'the report keeps no single tenant or directory item any more: %', v_pre;
     END IF;
     IF EXISTS (SELECT 1 FROM rolebyte.service WHERE key = 'cfgdemo')
        OR (SELECT name FROM rolebyte.tenant WHERE id = v_tenant) <> 'Config demo'
@@ -132,8 +154,9 @@ BEGIN
         RAISE EXCEPTION 'a refused apply wrote something';
     END IF;
 
-    -- 5. The apply lands what the preview reported, and its line names the part
-    --    and the document it arrived in.
+    -- 5. The apply reports what the preview reported, writes neither the list
+    --    nor the name, and leaves one line naming the counts, the part and the
+    --    document it arrived in. The version stays: nothing it covers moved.
     CALL rolebyte.config_apply(jsonb_build_object('tenantId', v_tenant, 'actor', 'config-test', 'section', v_doc,
         'expectedVersion', v0, 'partHash', v_part, 'documentHash', v_file), v);
     IF v->>'result' IS DISTINCT FROM 'success' OR (v->'data'->>'applied')::boolean IS NOT TRUE
@@ -144,33 +167,56 @@ BEGIN
         RAISE EXCEPTION 'the apply reported other than its preview: % vs %', v->'data', v_pre;
     END IF;
     v1 := v->'data'->>'version';
-    CALL rolebyte.config_version(jsonb_build_object('tenantId', v_tenant), v);
-    IF v1 = v0 OR v->'data'->>'version' IS DISTINCT FROM v1 THEN
-        RAISE EXCEPTION 'a real change moves the version, and the apply answers the next read''s: % % %', v0, v1, v;
+    IF v1 IS DISTINCT FROM v0 THEN
+        RAISE EXCEPTION 'an import that writes nothing the section carries must not move its version: % %', v0, v1;
     END IF;
-    IF (SELECT name FROM rolebyte.tenant WHERE id = v_tenant) <> 'Config demo, renamed'
-       OR (SELECT count(*) FROM rolebyte.role_definition WHERE service_key = 'cfgdemo') <> 2
-       OR NOT EXISTS (SELECT 1 FROM rolebyte.service_permission WHERE service_key = 'cfgdemo' AND act = 'edit') THEN
-        RAISE EXCEPTION 'the apply did not land the document';
+    IF (SELECT name FROM rolebyte.tenant WHERE id = v_tenant) <> 'Config demo'
+       OR EXISTS (SELECT 1 FROM rolebyte.service WHERE key = 'cfgdemo')
+       OR EXISTS (SELECT 1 FROM rolebyte.role_definition WHERE service_key = 'cfgdemo')
+       OR EXISTS (SELECT 1 FROM rolebyte.service_permission WHERE service_key = 'cfgdemo') THEN
+        RAISE EXCEPTION 'an import wrote the deployment''s list or the workspace''s name';
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM rolebyte.event WHERE tenant_id = v_tenant AND kind = 'tenantRenamed') THEN
-        RAISE EXCEPTION 'a rename must land in the event stream';
+    IF (SELECT count(*) FROM rolebyte.event) <> v_events + 1 THEN
+        RAISE EXCEPTION 'an import writes one line and nothing else';
     END IF;
     SELECT payload INTO v_line FROM rolebyte.event
      WHERE tenant_id = v_tenant AND kind = 'configApplied' ORDER BY at DESC, id DESC LIMIT 1;
     IF v_line->>'partHash' IS DISTINCT FROM v_part OR v_line->>'documentHash' IS DISTINCT FROM v_file
-       OR (v_line->'services'->>'added')::int <> 1 OR (v_line->'roles'->>'added')::int <> 2
-       OR (v_line->'permissions'->>'added')::int <> 1 THEN
+       OR (v_line->'services'->>'skipped')::int IS DISTINCT FROM 1
+       OR (v_line->'roles'->>'skipped')::int IS DISTINCT FROM 2
+       OR (v_line->'permissions'->>'skipped')::int IS DISTINCT FROM 1
+       OR (v_line->'permissions'->>'added')::int IS DISTINCT FROM 0 THEN
         RAISE EXCEPTION 'the import line should carry the counts, the part''s hash and the document''s: %', v_line;
     END IF;
     IF EXISTS (SELECT 1 FROM rolebyte.event WHERE tenant_id = v_other AND kind = 'configApplied') THEN
         RAISE EXCEPTION 'an import left a line in another tenant''s history';
     END IF;
-
-    -- The vocabulary is every tenant's: the other tenant's section moved with it.
     CALL rolebyte.config_version(jsonb_build_object('tenantId', v_other), v);
-    IF v->'data'->>'version' = v_other0 THEN
-        RAISE EXCEPTION 'the shared vocabulary grew and another tenant''s version did not move';
+    IF v->'data'->>'version' IS DISTINCT FROM v_other0 THEN
+        RAISE EXCEPTION 'one tenant''s import moved another tenant''s version';
+    END IF;
+
+    -- 5b. The corporate login a file names is never attached, and the one the
+    --     workspace has stays.
+    v_issuer := 'https://login.example.test/' || v_tenant || '/v2.0';
+    UPDATE rolebyte.tenant SET directory_issuer = v_issuer WHERE id = v_tenant;
+    CALL rolebyte.config_apply(jsonb_build_object('tenantId', v_tenant, 'actor', 'config-test', 'dryRun', false,
+        'expectedVersion', v1, 'section', jsonb_build_object('schema', 'rolebyte-config/1',
+            'tenant', jsonb_build_object('directory', jsonb_build_object('issuer', 'https://elsewhere.example.test/v2.0')))), v);
+    IF v->>'result' IS DISTINCT FROM 'success' OR (v->'data'->>'applied')::boolean IS NOT TRUE
+       OR (SELECT string_agg(e->>'key' || '=' || (e->>'status'), ',') FROM jsonb_array_elements(v->'data'->'workspace') e)
+           IS DISTINCT FROM 'directory=skipped'
+       OR v->'data'->'workspace'->0->>'detail' NOT LIKE '%keeps its own corporate login%' THEN
+        RAISE EXCEPTION 'a file naming a corporate login is told the workspace keeps its own: %', v;
+    END IF;
+    IF (SELECT directory_issuer FROM rolebyte.tenant WHERE id = v_tenant) IS DISTINCT FROM v_issuer THEN
+        RAISE EXCEPTION 'an import replaced the workspace''s corporate login';
+    END IF;
+    -- A tenant member of any other shape is not read at all.
+    CALL rolebyte.config_apply(jsonb_build_object('tenantId', v_tenant, 'actor', 'config-test', 'dryRun', true,
+        'section', '{"schema":"rolebyte-config/1","tenant":"Somebody else"}'::jsonb), v);
+    IF v->>'result' IS DISTINCT FROM 'success' OR (v->'data'->>'refused')::boolean OR v->'data' ? 'workspace' THEN
+        RAISE EXCEPTION 'a tenant member that is not an object is ignored: %', v;
     END IF;
 
     -- 6. The round trip: the section read back re-applies as all-unchanged,
@@ -186,8 +232,9 @@ BEGIN
     END IF;
     IF EXISTS (SELECT 1 FROM jsonb_array_elements((v->'data'->'services') || (v->'data'->'roles') || (v->'data'->'permissions')) e
                 WHERE e->>'status' <> 'unchanged')
-       OR v->'data'->'tenant'->>'status' IS DISTINCT FROM 'unchanged' THEN
-        RAISE EXCEPTION 'the round trip should change nothing: %', v;
+       OR NOT EXISTS (SELECT 1 FROM jsonb_array_elements(v->'data'->'permissions') e WHERE e->>'key' = 'cfgseed/thing:view')
+       OR v->'data' ? 'workspace' THEN
+        RAISE EXCEPTION 'the round trip should report every entry unchanged: %', v;
     END IF;
     IF v->'data'->>'version' IS DISTINCT FROM v1 THEN
         RAISE EXCEPTION 'an unchanged apply moved the version';
@@ -208,34 +255,48 @@ BEGIN
         RAISE EXCEPTION 'a line names no hash its apply did not name: %', v_line;
     END IF;
 
-    -- 7. A changed permission names the members that change.
-    v_doc := jsonb_build_object('schema', 'rolebyte-config/1', 'services', '[{"key":"cfgdemo","permissions":[
-        {"feature":"thing","act":"edit","description":"Change any thing","class":"ordinary","plane":"object",
-         "labels":{"lv":"Mainīt jebkuru lietu"}}]}]'::jsonb);
+    -- 7. A permission the list holds with other words is skipped, naming the
+    --    members that differ; one it holds with another class is skipped too,
+    --    and neither is written.
+    v_doc := jsonb_build_object('schema', 'rolebyte-config/1', 'services', '[{"key":"cfgseed","permissions":[
+        {"feature":"thing","act":"view","description":"See any thing","class":"ordinary","plane":"object",
+         "labels":{"lv":"Redzēt jebkuru lietu"},"seeds":["worker","manager"]}]}]'::jsonb);
     CALL rolebyte.config_apply(jsonb_build_object('tenantId', v_tenant, 'actor', 'config-test',
         'section', v_doc, 'dryRun', 'true'), v);
-    IF v->'data'->'permissions' IS DISTINCT FROM
-       '[{"key":"cfgdemo/thing:edit","status":"changed","detail":"description, labels"}]'::jsonb THEN
-        RAISE EXCEPTION 'a changed permission should name its members: %', v;
+    IF v->'data'->'permissions'->0->>'key' IS DISTINCT FROM 'cfgseed/thing:view'
+       OR v->'data'->'permissions'->0->>'status' IS DISTINCT FROM 'skipped'
+       OR v->'data'->'permissions'->0->>'detail' NOT LIKE '%says otherwise (description, labels)%' THEN
+        RAISE EXCEPTION 'a permission held with other words is skipped, naming its members: %', v;
+    END IF;
+    v_doc := jsonb_build_object('schema', 'rolebyte-config/1', 'services', '[{"key":"cfgseed","permissions":[
+        {"feature":"thing","act":"view","class":"tenantConfiguration","plane":"tenant"}]}]'::jsonb);
+    CALL rolebyte.config_apply(jsonb_build_object('tenantId', v_tenant, 'actor', 'config-test',
+        'section', v_doc, 'expectedVersion', v1), v);
+    IF (v->'data'->>'refused')::boolean OR (v->'data'->>'applied')::boolean IS NOT TRUE
+       OR v->'data'->'permissions'->0->>'status' IS DISTINCT FROM 'skipped'
+       OR v->'data'->'permissions'->0->>'detail' NOT LIKE '%class never changes%' THEN
+        RAISE EXCEPTION 'a permission held with another class is skipped, not refused: %', v;
+    END IF;
+    IF (SELECT description || '/' || class FROM rolebyte.service_permission WHERE service_key = 'cfgseed' AND act = 'view')
+       IS DISTINCT FROM 'See a thing/ordinary' THEN
+        RAISE EXCEPTION 'an import changed a permission on the deployment''s list';
     END IF;
 
-    -- 8. A document with a refused item: the preview and the apply report the
-    --    same, nothing is written — the clean service beside it included — the
-    --    version stays and no line is left.
+    -- 8. A document with an entry that cannot be read: the preview and the
+    --    apply report the same, nothing is written, the version stays and no
+    --    line is left.
     v_doc := jsonb_build_object('schema', 'rolebyte-config/1', 'services', '[
         {"key":"cfgbeside","displayName":"Should not survive","roles":[]},
-        {"key":"cfgdemo","permissions":[{"feature":"thing","act":"edit","class":"tenantConfiguration","plane":"tenant"}]},
         {"displayName":"No key at all"}]'::jsonb);
     CALL rolebyte.config_apply(jsonb_build_object('tenantId', v_tenant, 'actor', 'config-test',
         'section', v_doc, 'dryRun', true), v);
     v_pre := v->'data';
     IF (v_pre->>'refused')::boolean IS NOT TRUE
-       OR NOT EXISTS (SELECT 1 FROM jsonb_array_elements(v_pre->'permissions') e
-                       WHERE e->>'key' = 'cfgdemo/thing:edit' AND e->>'status' = 'refused'
-                         AND e->>'reason' = 'config_key_conflict' AND e->>'detail' LIKE '%class never changes%')
+       OR NOT EXISTS (SELECT 1 FROM jsonb_array_elements(v_pre->'services') e
+                       WHERE e->>'key' = 'cfgbeside' AND e->>'status' = 'skipped')
        OR NOT EXISTS (SELECT 1 FROM jsonb_array_elements(v_pre->'services') e
                        WHERE e->>'key' = '' AND e->>'status' = 'refused' AND e->>'reason' = 'config_bad_document') THEN
-        RAISE EXCEPTION 'the preview should refuse the re-classed permission and the keyless service: %', v_pre;
+        RAISE EXCEPTION 'the preview should refuse the keyless service beside the skipped one: %', v_pre;
     END IF;
     SELECT count(*) INTO v_imports FROM rolebyte.event WHERE tenant_id = v_tenant AND kind = 'configApplied';
     CALL rolebyte.config_apply(jsonb_build_object('tenantId', v_tenant, 'actor', 'config-test',
@@ -246,8 +307,7 @@ BEGIN
     IF (v->'data') - 'dryRun' IS DISTINCT FROM v_pre - 'dryRun' THEN
         RAISE EXCEPTION 'the preview and the apply disagree: % vs %', v->'data', v_pre;
     END IF;
-    IF EXISTS (SELECT 1 FROM rolebyte.service WHERE key = 'cfgbeside')
-       OR (SELECT class FROM rolebyte.service_permission WHERE service_key = 'cfgdemo' AND act = 'edit') <> 'ordinary' THEN
+    IF EXISTS (SELECT 1 FROM rolebyte.service WHERE key = 'cfgbeside') THEN
         RAISE EXCEPTION 'a refused document wrote something';
     END IF;
     CALL rolebyte.config_version(jsonb_build_object('tenantId', v_tenant), v);

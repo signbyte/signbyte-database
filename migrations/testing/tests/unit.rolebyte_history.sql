@@ -5,7 +5,11 @@
 -- chart's lines are found by their family however old they are and however many
 -- other lines are newer; a page never exceeds 500; the service filter and the
 -- time window page the same way; another tenant's lines never appear; a bad
--- limit and a `before` naming no line of this history are refused.
+-- limit and a `before` naming no line of this history are refused. Narrowed to
+-- one person it answers what they wrote and what no person wrote about them,
+-- page by page, and never what another person wrote about them; narrowed to
+-- whoever runs the deployment it answers the lines no person and no service
+-- wrote; a service's own lines are found by its key.
 --   psql -v ON_ERROR_STOP=1 -f migrations/testing/tests/unit.rolebyte_history.sql
 
 -- Calls one register procedure and returns its answer, a refusal it raises
@@ -98,10 +102,14 @@ DECLARE
     v_b_line   text;
     v_events   bigint;
     v          jsonb;
+    v_anna     text := 'sub:' || util.generate_ulid();
+    v_p        text := 'sub:' || util.generate_ulid();
+    v_p_id     text;
+    v_invite   text;
 BEGIN
     -- ---------------------------------------------------------------- fixture
     v := pg_temp.ok('tenant_open', jsonb_build_object('actor', 'op:test', 'name', 'History A',
-        'administrator', jsonb_build_object('subjectKey', 'sub:' || util.generate_ulid(), 'displayName', 'Anna Ozola')), 'open A');
+        'administrator', jsonb_build_object('subjectKey', v_anna, 'displayName', 'Anna Ozola')), 'open A');
     v_ta := v->'tenant'->>'id';
     v := pg_temp.ok('tenant_open', jsonb_build_object('actor', 'op:test', 'name', 'History B',
         'administrator', jsonb_build_object('subjectKey', 'sub:' || util.generate_ulid(), 'displayName', 'Bēla Liepa')), 'open B');
@@ -126,6 +134,27 @@ BEGIN
            jsonb_build_object('service', 'hsvc', 'n', n)
       FROM generate_series(1, 10) n;
     SELECT id INTO v_b_line FROM rolebyte.event WHERE tenant_id = v_tb ORDER BY at DESC, id DESC LIMIT 1;
+
+    -- Pēteris, invited to A by Anna: the lines Anna wrote about him are hers.
+    -- Then his arrival, written by the sign-in service; two lines he wrote; one
+    -- the deployment wrote about him; one a service wrote on its own; and a
+    -- line he wrote in B.
+    v_p_id := pg_temp.ok('user_invite', jsonb_build_object('actor', v_anna, 'tenantId', v_ta,
+        'subjectKey', v_p, 'displayName', 'Pēteris Kalns'), 'invite Pēteris')->>'id';
+    SELECT id INTO v_invite FROM rolebyte.event WHERE tenant_id = v_ta AND user_id = v_p_id AND kind = 'userInvited';
+    INSERT INTO rolebyte.event (id, at, actor, tenant_id, user_id, kind, payload) VALUES
+        (util.generate_ulid(), v_base + interval '10 seconds', 'svc:authbyte', v_ta, v_p_id, 'claimAttached',
+         '{"mark":"arrival"}'),
+        (util.generate_ulid(), v_base + interval '20 seconds', v_p, v_ta, NULL, 'tenantRoleDefined',
+         '{"mark":"p-own-1"}'),
+        (util.generate_ulid(), v_base + interval '30 seconds', v_p, v_ta, v_p_id, 'roleGranted',
+         '{"mark":"p-own-2"}'),
+        (util.generate_ulid(), v_base + interval '40 seconds', 'op:test', v_ta, v_p_id, 'administratorSetByOperator',
+         '{"mark":"op-on-p"}'),
+        (util.generate_ulid(), v_base + interval '50 seconds', 'svc:flowbyte', v_ta, NULL, 'tenantRolePlacementsSet',
+         '{"mark":"svc"}'),
+        (util.generate_ulid(), v_base + interval '60 seconds', v_p, v_tb, NULL, 'tenantRoleDefined',
+         '{"mark":"p-in-b"}');
 
     SELECT array_agg(id ORDER BY at DESC, id DESC) INTO v_expected FROM rolebyte.event WHERE tenant_id = v_ta;
     IF cardinality(v_expected) < 1230 THEN
@@ -208,7 +237,66 @@ BEGIN
         RAISE EXCEPTION 'a history with no lines is empty and says so: %', v_page;
     END IF;
 
+    -- ------------------------------------------------- (6b) one person's story
+    --      What he wrote and what no person wrote about him, newest first, by twos.
+    SELECT array_agg(id ORDER BY at DESC, id DESC) INTO v_expected
+      FROM rolebyte.event WHERE tenant_id = v_ta AND payload->>'mark' IN ('arrival', 'p-own-1', 'p-own-2', 'op-on-p');
+    v_got := pg_temp.walk(jsonb_build_object('tenantId', v_ta, 'actor', v_p), 2, 'walk Pēteris''s story');
+    IF cardinality(v_expected) IS DISTINCT FROM 4 OR v_got IS DISTINCT FROM v_expected THEN
+        RAISE EXCEPTION 'his story is his two lines, his arrival and the deployment''s act on him: % of %',
+            cardinality(v_got), cardinality(v_expected);
+    END IF;
+    IF v_invite IS NULL OR v_invite = ANY (v_got) THEN
+        RAISE EXCEPTION 'the line Anna wrote about him is hers, not his';
+    END IF;
+    --      Anna's acts include inviting him.
+    v_got := pg_temp.walk(jsonb_build_object('tenantId', v_ta, 'actor', v_anna), 50, 'walk Anna''s story');
+    IF NOT (v_invite = ANY (v_got))
+       OR EXISTS (SELECT 1 FROM rolebyte.event WHERE id = ANY (v_got) AND payload->>'mark' IS NOT NULL) THEN
+        RAISE EXCEPTION 'Anna''s story holds her invitation and none of the marked lines';
+    END IF;
+    --      Narrowed further by family, it keeps narrowing.
+    v_page := pg_temp.ok('history', jsonb_build_object('tenantId', v_ta, 'actor', v_p, 'kindPrefix', 'tenantRole'),
+        'his tenant-role lines');
+    IF (SELECT array_agg(e->'payload'->>'mark') FROM jsonb_array_elements(v_page->'events') e)
+       IS DISTINCT FROM ARRAY['p-own-1'] THEN
+        RAISE EXCEPTION 'his tenant-role lines are the one he wrote: %', v_page;
+    END IF;
+    --      In B he is no member: only what he wrote there.
+    v_page := pg_temp.ok('history', jsonb_build_object('tenantId', v_tb, 'actor', v_p), 'his line in B');
+    IF (SELECT array_agg(e->'payload'->>'mark') FROM jsonb_array_elements(v_page->'events') e)
+       IS DISTINCT FROM ARRAY['p-in-b'] THEN
+        RAISE EXCEPTION 'in B his story is the one line he wrote there: %', v_page;
+    END IF;
+    --      Somebody who never acted here has no story here.
+    v_page := pg_temp.ok('history', jsonb_build_object('tenantId', v_ta, 'actor', 'sub:' || util.generate_ulid()),
+        'a stranger');
+    IF v_page->'events' IS DISTINCT FROM '[]'::jsonb OR (v_page->>'more')::boolean IS NOT FALSE THEN
+        RAISE EXCEPTION 'a stranger''s story is empty: %', v_page;
+    END IF;
+    --      A service's own lines, by its key.
+    v_page := pg_temp.ok('history', jsonb_build_object('tenantId', v_ta, 'actor', 'svc:flowbyte'), 'a service');
+    IF (SELECT array_agg(e->'payload'->>'mark') FROM jsonb_array_elements(v_page->'events') e)
+       IS DISTINCT FROM ARRAY['svc'] THEN
+        RAISE EXCEPTION 'a service''s story is the lines it wrote: %', v_page;
+    END IF;
+    --      Whoever runs the deployment: every line neither a person nor a service
+    --      wrote — the operator's tools here — and nothing else, walked by 97s.
+    SELECT array_agg(id ORDER BY at DESC, id DESC) INTO v_expected
+      FROM rolebyte.event WHERE tenant_id = v_ta AND actor IN ('op:test', 'adm:test');
+    v_got := pg_temp.walk(jsonb_build_object('tenantId', v_ta, 'actor', 'operator'), 97, 'walk the operator''s lines');
+    IF v_got IS DISTINCT FROM v_expected THEN
+        RAISE EXCEPTION 'the operator''s lines walked by 97s: % of %', cardinality(v_got), cardinality(v_expected);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM rolebyte.event WHERE id = ANY (v_got) AND payload->>'mark' = 'op-on-p') THEN
+        RAISE EXCEPTION 'the deployment''s act on Pēteris is among its lines';
+    END IF;
+
     -- ------------------------------------------------------------- (7) refusals
+    PERFORM pg_temp.refused('history', jsonb_build_object('tenantId', v_ta, 'actor', 'nobody'),
+        'membership:invalid', 'an actor that is neither a typed key nor operator');
+    PERFORM pg_temp.refused('history', jsonb_build_object('tenantId', v_ta, 'actor', 'SUB:01ABC'),
+        'membership:invalid', 'a type tag in capitals');
     PERFORM pg_temp.refused('history', jsonb_build_object('tenantId', v_ta, 'limit', '0'), 'membership:invalid', 'a limit of 0');
     PERFORM pg_temp.refused('history', jsonb_build_object('tenantId', v_ta, 'limit', '-3'), 'membership:invalid', 'a negative limit');
     PERFORM pg_temp.refused('history', jsonb_build_object('tenantId', v_ta, 'limit', 'ten'), 'membership:invalid', 'a word for a limit');
