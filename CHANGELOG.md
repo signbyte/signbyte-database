@@ -4,6 +4,14 @@ Notable changes to the signbyte database — the schema set and the migration im
 newest first, per release. Written for whoever applies the image to a database or
 integrates against the procedures.
 
+## v0.5.0
+
+### Changed — util: `util.labels_refusal` is declared STABLE
+
+`util/V5` declares `util.labels_refusal` STABLE, and `rolebyte.name_labels_refusal`, which calls it, says the same:
+the refusal sentence lists the app's languages with a function PostgreSQL declares STABLE, so neither may promise
+IMMUTABLE. Every answer is the same as before, and the migration changes the declaration only; nothing to act on.
+
 ## v0.4.0
 
 ### Added — e-signing: the `legacyEid` signing flow

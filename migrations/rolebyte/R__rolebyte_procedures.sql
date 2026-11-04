@@ -2072,7 +2072,7 @@ REVOKE ALL ON FUNCTION rolebyte.tenant_role_permission_names(text) FROM PUBLIC;
 CREATE OR REPLACE FUNCTION rolebyte.name_labels_refusal(p_labels jsonb)
 RETURNS text
 LANGUAGE plpgsql
-IMMUTABLE
+STABLE
 SET search_path = rolebyte, util, pg_temp
 AS $$
 DECLARE
