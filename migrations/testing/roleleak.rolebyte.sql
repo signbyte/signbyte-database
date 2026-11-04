@@ -1,5 +1,5 @@
 -- Role-leak acceptance for the `rolebyte` location: the membership register's EXECUTE-only
--- role reaches tenants, members, roles, assignments and the history ONLY through the
+-- role reaches tenants, members, roles, assignments, a person's own language and the history ONLY through the
 -- SECURITY DEFINER procedures — never a direct table read or write, and never another
 -- schema's tables — and the other service roles cannot read the register's tables either.
 -- The history table adds the append-only guarantee at the GRANT boundary: even the owner
@@ -81,6 +81,21 @@ BEGIN
     IF NOT has_function_privilege('rolebyte_public', 'rolebyte.tenant_get(jsonb, jsonb)', 'EXECUTE') THEN
         RAISE EXCEPTION 'the register''s role must run rolebyte.tenant_get';
     END IF;
+    -- a person's own language: read and set through its two procedures only, which
+    -- the register's role runs and no other role does (nothing is left to PUBLIC).
+    IF NOT has_function_privilege('rolebyte_public', 'rolebyte.person_language_get(jsonb, jsonb)', 'EXECUTE')
+       OR NOT has_function_privilege('rolebyte_public', 'rolebyte.person_language_set(jsonb, jsonb)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'the register''s role must run rolebyte.person_language_get and rolebyte.person_language_set';
+    END IF;
+    IF has_function_privilege('authbyte_public', 'rolebyte.person_language_get(jsonb, jsonb)', 'EXECUTE')
+       OR has_function_privilege('authbyte_public', 'rolebyte.person_language_set(jsonb, jsonb)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'ROLE LEAK: another service''s role may run a person''s language procedures';
+    END IF;
+    PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.person_setting');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'INSERT INTO rolebyte.person_setting(subject_key, language) VALUES (''sub:x'', ''en'')');
+    PERFORM pg_temp.deny('rolebyte_public', 'UPDATE rolebyte.person_setting SET language = NULL');
+    PERFORM pg_temp.deny('rolebyte_public', 'DELETE FROM rolebyte.person_setting');
     -- what a tenant has is the operator's to write: the register's own role can neither
     -- read nor write the table, nor run the procedures that do.
     PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.tenant_entitlement');
@@ -122,6 +137,7 @@ BEGIN
     PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.tenant_entitlement');
     PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.administrator_seed');
     PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.user_type');
+    PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.person_setting');
 END $$;
 
 SELECT 'ROLELEAK: PASS — the register role is table-isolated, its history is append-only at the grant boundary, and no other service role reads the register' AS result;

@@ -59,6 +59,12 @@ docker exec -e PGUSER=platform -e PGDATABASE=postgres -e RPW=testpw \
   "$PG" sh -c 'sh /provision-roles.sh' >/dev/null
 echo "   $(echo $ROLES | wc -w) service roles + $(echo $HUMAN_READ | wc -w) read + $(echo $HUMAN_WRITE | wc -w) write group role(s) provisioned"
 
+# Flyway is a Java program, and the runner starts one per location: about a
+# hundred starts here. These flags make each start cheaper and change nothing
+# Flyway does. They are passed only here; the image is untouched, so a deployment
+# runs exactly as before.
+JVM_FAST="-XX:TieredStopAtLevel=1 -XX:+UseSerialGC -Xshare:auto"
+
 # migrate <db> "<locations>" — run the image twice, assert schemas + history tables
 migrate() {
   db="$1"; locations="$2"
@@ -67,7 +73,7 @@ migrate() {
   for pass in 1 2; do
     out=$(docker run --rm --network "$NET" \
       -e PGHOST="$PG" -e PGDATABASE="$db" -e PGUSER=platform -e PGPASSWORD="$PW" \
-      -e LOCATIONS="$locations" "$IMG" 2>&1) \
+      -e LOCATIONS="$locations" -e JAVA_ARGS="$JVM_FAST" "$IMG" 2>&1) \
       || { echo "FATAL: migrate pass $pass failed for $db:"; echo "$out" | tail -20; exit 1; }
     if [ "$pass" = 2 ] && ! echo "$out" | grep -q "No migration necessary"; then
       echo "FATAL: second run for $db was not a no-op:"; echo "$out" | tail -20; exit 1

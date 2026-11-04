@@ -5,7 +5,8 @@
 -- with their grants on record; a service account is listed and marked; an
 -- arrival is exactly an active person holding nothing; a renamed role is read by
 -- its new name and a revoked grant is gone; each member's user type is read by
--- name, and a type that holds something ends an arrival; the day a member was
+-- name (each role and type with its names in other languages beside it), and a
+-- type that holds something ends an arrival; the day a member was
 -- last given access is read, only for a membership that was; the read writes
 -- nothing; a missing or unknown tenant is refused; and the register's own role
 -- may run it.
@@ -220,8 +221,8 @@ BEGIN
     -- ----------------------------------------- (6) tenant roles, by name
     v_row := pg_temp.member(v_list, v_laura);
     PERFORM pg_temp.says(v_row, 'tenantRoles', jsonb_build_array(
-        jsonb_build_object('id', v_brig, 'name', 'Brigadieris'),
-        jsonb_build_object('id', v_meistars, 'name', 'Meistars')), 'Laura''s two roles, by name');
+        jsonb_build_object('id', v_brig, 'name', 'Brigadieris', 'labels', '{}'::jsonb),
+        jsonb_build_object('id', v_meistars, 'name', 'Meistars', 'labels', '{}'::jsonb)), 'Laura''s two roles, by name');
     PERFORM pg_temp.says(v_row, 'serviceRoles', NONE, 'Laura');
     PERFORM pg_temp.says(v_row, 'arrival', 'false', 'a person with a tenant role is no arrival');
 
@@ -262,8 +263,8 @@ BEGIN
     PERFORM pg_temp.ok('tenant_role_update', jsonb_build_object('actor', v_s[1], 'tenantId', v_ta, 'roleId', v_meistars,
         'name', 'Vecākais meistars'), 'rename Meistars');
     PERFORM pg_temp.says(pg_temp.member(pg_temp.access(v_ta), v_laura), 'tenantRoles', jsonb_build_array(
-        jsonb_build_object('id', v_brig, 'name', 'Brigadieris'),
-        jsonb_build_object('id', v_meistars, 'name', 'Vecākais meistars')), 'the renamed role');
+        jsonb_build_object('id', v_brig, 'name', 'Brigadieris', 'labels', '{}'::jsonb),
+        jsonb_build_object('id', v_meistars, 'name', 'Vecākais meistars', 'labels', '{}'::jsonb)), 'the renamed role');
 
     -- --------------- (11) the checkbox moves: ticked on Laura, unticked on Anna
     PERFORM pg_temp.ok('role_grant', jsonb_build_object('actor', v_s[1], 'tenantId', v_ta, 'userId', v_laura,
@@ -281,8 +282,8 @@ BEGIN
     -- ------------- (12) the user type each holds, and the day each last signed in
     SELECT default_user_type_id INTO v_def FROM rolebyte.tenant WHERE id = v_ta;
     FOR v_row IN SELECT m FROM jsonb_array_elements(v_list) m LOOP
-        PERFORM pg_temp.says(v_row, 'userType', jsonb_build_object('id', v_def, 'name', 'Member'),
-            'every member arrived with the default');
+        PERFORM pg_temp.says(v_row, 'userType', jsonb_build_object('id', v_def, 'name', 'Member',
+            'labels', jsonb_build_object('lv', 'Dalībnieks')), 'every member arrived with the default');
         PERFORM pg_temp.says(v_row, 'chartUserType', 'null', 'no chart, no chart type');
         PERFORM pg_temp.says(v_row, 'lastSignedInOn', 'null', 'nobody has been given access since the date was kept');
     END LOOP;
@@ -312,7 +313,8 @@ BEGIN
         'userTypeId', v_worker), 'Jānis is a Darbinieks');
     v_list := pg_temp.access(v_ta);
     v_row := pg_temp.member(v_list, v_janis);
-    PERFORM pg_temp.says(v_row, 'userType', jsonb_build_object('id', v_worker, 'name', 'Darbinieks'), 'Jānis''s new type');
+    PERFORM pg_temp.says(v_row, 'userType', jsonb_build_object('id', v_worker, 'name', 'Darbinieks', 'labels', '{}'::jsonb),
+        'Jānis''s new type');
     PERFORM pg_temp.says(v_row, 'arrival', 'false', 'a user type that holds something is something');
     PERFORM pg_temp.says(pg_temp.member(v_list, v_karlis), 'arrival', 'true', 'Member holds nothing');
 

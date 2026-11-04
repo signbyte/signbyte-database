@@ -16,7 +16,9 @@
 --      filter on it, and a foreign tenant's row answers `not_found`,
 --      indistinguishable from absence. Only `claim_attach` and `resolve` are
 --      subject-keyed — they exist to answer "which tenants know this
---      authenticated person", which is the identity provider's question.
+--      authenticated person", which is the identity provider's question —
+--      and the person's own settings (`person_language_get` / `_set`), which
+--      belong to the person and to no tenant.
 
 -- ping — the data-path proof for the walking skeleton: echoes its input and
 -- returns a freshly generated id, proving that the EXECUTE-only role can call
@@ -320,11 +322,11 @@ BEGIN
     END IF;
     IF v_decl ? 'seeds' AND (jsonb_typeof(v_decl->'seeds') IS DISTINCT FROM 'array'
         OR EXISTS (SELECT 1 FROM jsonb_array_elements(v_decl->'seeds') e
-                    WHERE jsonb_typeof(e) <> 'string' OR (e #>> '{}') NOT IN ('worker', 'manager'))
+                    WHERE jsonb_typeof(e) <> 'string' OR (e #>> '{}') NOT IN ('worker', 'manager', 'assistant'))
         OR (SELECT count(DISTINCT e #>> '{}') FROM jsonb_array_elements(v_decl->'seeds') e)
            <> jsonb_array_length(v_decl->'seeds')) THEN
         po_data := util.result_error('membership:invalid',
-            'seeds name the roles a new tenant starts with that hold the permission: "worker", "manager", each once');
+            'seeds name the shipped roles that hold the permission: "worker", "manager", "assistant", each once');
         RETURN;
     END IF;
 
@@ -1350,8 +1352,9 @@ GRANT EXECUTE ON PROCEDURE rolebyte.role_revoke(jsonb, jsonb) TO rolebyte_public
 -- A person who lost access also leaves their place in the chart of authority,
 -- in the same act and with its own line (`chartPersonRemoved`, marked
 -- `revoked`), so the chart's editor never lists or counts someone who lifts
--- nothing. Revoking the tenant's last administrator is refused
--- (administrator_removal_refusal).
+-- nothing. The administrators' note about them is cleared in the same act, with
+-- its own line (`noteChanged`, marked `revoked`) when there was one. Revoking the
+-- tenant's last administrator is refused (administrator_removal_refusal).
 CREATE OR REPLACE PROCEDURE rolebyte.user_revoke(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1363,6 +1366,7 @@ DECLARE
     v_user_id text;
     v_refusal jsonb;
     v_left    text;
+    v_note    text;
 BEGIN
     v_actor   := NULLIF(trim(pi_data->>'actor'), '');
     v_tenant  := NULLIF(trim(pi_data->>'tenantId'), '');
@@ -1378,9 +1382,13 @@ BEGIN
         RETURN;
     END IF;
 
-    UPDATE rolebyte.user_account
-    SET status = 'revoked'
-    WHERE id = v_user_id AND tenant_id = v_tenant AND status <> 'revoked';
+    UPDATE rolebyte.user_account u
+       SET status = 'revoked', note = ''
+      FROM (SELECT id, note FROM rolebyte.user_account
+             WHERE id = v_user_id AND tenant_id = v_tenant AND status <> 'revoked'
+               FOR UPDATE) old
+     WHERE u.id = old.id
+    RETURNING old.note INTO v_note;
 
     IF NOT FOUND THEN
         po_data := util.result_error('membership:not_found', 'user does not exist');
@@ -1389,6 +1397,14 @@ BEGIN
 
     INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
     VALUES (util.generate_ulid(), v_actor, v_tenant, v_user_id, 'userRevoked', '{}'::jsonb);
+
+    -- The administrators' note about them goes with their access: it was kept to
+    -- tell members apart, and they are not one any more.
+    IF v_note <> '' THEN
+        INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+        VALUES (util.generate_ulid(), v_actor, v_tenant, v_user_id, 'noteChanged',
+                jsonb_build_object('cleared', true, 'revoked', true));
+    END IF;
 
     DELETE FROM rolebyte.chart_holder
      WHERE tenant_id = v_tenant AND user_id = v_user_id
@@ -1647,8 +1663,11 @@ GRANT EXECUTE ON PROCEDURE rolebyte.user_list(jsonb, jsonb) TO rolebyte_public;
 -- `userType` is the user type the member holds, the one an administrator sets.
 -- `chartUserType` is the one the chart position they sit in gives while the
 -- tenant has the chart, which is then the type in force; otherwise it is null.
+-- Each tenant role and user type is named as entered (`name`) and in the app's
+-- other languages (`labels`).
 -- `lastSignedInOn` is the day the register last gave them access (null: not
--- since that date was first kept).
+-- since that date was first kept). `note` is what the tenant's administrators
+-- wrote about them (empty: nothing).
 --
 -- `arrival` marks a person who has signed in and holds nothing yet: an active
 -- account (an invitation becomes active only at its first sign-in, and a
@@ -1696,16 +1715,17 @@ BEGIN
                'tenantRoles',   m.tenant_roles,
                'userType',      m.user_type,
                'chartUserType', m.chart_user_type,
-               'lastSignedInOn', to_jsonb(m.last_signed_in_on)
+               'lastSignedInOn', to_jsonb(m.last_signed_in_on),
+               'note',          m.note
            ) ORDER BY lower(m.display_name), m.id), '[]'::jsonb)
       INTO v_items
       FROM (
-          SELECT u.id, u.subject_key, u.display_name, u.status, u.last_signed_in_on,
+          SELECT u.id, u.subject_key, u.display_name, u.status, u.last_signed_in_on, u.note,
                  CASE WHEN u.subject_key LIKE 'svc:%' THEN 'service' ELSE 'person' END AS kind,
-                 (SELECT jsonb_build_object('id', t.id, 'name', t.name)
+                 (SELECT jsonb_build_object('id', t.id, 'name', t.name, 'labels', t.labels)
                     FROM rolebyte.user_type t
                    WHERE t.tenant_id = u.tenant_id AND t.id = u.user_type_id) AS user_type,
-                 (SELECT jsonb_build_object('id', t.id, 'name', t.name)
+                 (SELECT jsonb_build_object('id', t.id, 'name', t.name, 'labels', t.labels)
                     FROM rolebyte.chart_holder h
                     JOIN rolebyte.chart_position p ON p.tenant_id = h.tenant_id AND p.id = h.position_id
                     JOIN rolebyte.user_type t ON t.tenant_id = p.tenant_id AND t.id = p.user_type_id
@@ -1740,7 +1760,7 @@ BEGIN
                         AND NOT rolebyte.is_administrator_rung(rd.role_group, rd.role_level)
                  ), '[]'::jsonb) AS service_roles,
                  COALESCE((
-                     SELECT jsonb_agg(jsonb_build_object('id', r.id, 'name', r.name)
+                     SELECT jsonb_agg(jsonb_build_object('id', r.id, 'name', r.name, 'labels', r.labels)
                                       ORDER BY lower(r.name), r.id)
                        FROM rolebyte.tenant_role_assignment ta
                        JOIN rolebyte.tenant_role r ON r.id = ta.tenant_role_id AND r.tenant_id = ta.tenant_id
@@ -1761,6 +1781,87 @@ $$;
 
 REVOKE ALL ON PROCEDURE rolebyte.access_list(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.access_list(jsonb, jsonb) TO rolebyte_public;
+
+-- user_note_set — an administrator's note on a member of the tenant, kept on the
+-- member and read with the access list. Replaces the note whole; an empty one
+-- clears it.
+--
+-- The note is trimmed and a Windows line break kept as one; line breaks and tabs
+-- are kept, every other control character (C0 and C1), the line and paragraph
+-- separators, and every character that changes the direction text runs in is
+-- refused (a note is shown beside a name, and a direction override could make it
+-- read as another name). At most 1000 characters. A service is given no note. A
+-- refusal never repeats the note. A member whose access is revoked keeps none.
+--
+-- The history line says a note was set or cleared, under the administrator and
+-- about the member, and never what it says: the history cannot be rewritten, so
+-- a note's words in it could never be erased. An unchanged note writes nothing.
+CREATE OR REPLACE PROCEDURE rolebyte.user_note_set(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_actor  text := NULLIF(btrim(pi_data->>'actor'), '');
+    v_tenant text := NULLIF(btrim(pi_data->>'tenantId'), '');
+    v_user   text := NULLIF(btrim(pi_data->>'userId'), '');
+    v_note   text := pi_data->>'note';
+    v_member rolebyte.user_account%ROWTYPE;
+BEGIN
+    IF v_actor IS NULL OR v_tenant IS NULL OR v_user IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'actor, tenantId and userId are required');
+        RETURN;
+    END IF;
+    IF v_note IS NULL OR jsonb_typeof(pi_data->'note') <> 'string' THEN
+        po_data := util.result_error('membership:invalid', 'note is required; send an empty one to clear it');
+        RETURN;
+    END IF;
+
+    v_note := btrim(replace(v_note, E'\r\n', E'\n'), E' \t\n\r');
+    IF char_length(v_note) > 1000 THEN
+        po_data := util.result_error('membership:invalid', 'a note is at most 1000 characters');
+        RETURN;
+    END IF;
+    IF v_note ~ E'[\\x01-\\x08\\x0B-\\x1F\\x7F-\\x9F\\u061C\\u200E\\u200F\\u2028-\\u202E\\u2066-\\u2069]' THEN
+        po_data := util.result_error('membership:invalid', 'a note may not carry control or direction-changing characters');
+        RETURN;
+    END IF;
+
+    -- A revoked member is no longer one: their note went with their access, and
+    -- none is written on them again.
+    SELECT * INTO v_member FROM rolebyte.user_account
+     WHERE tenant_id = v_tenant AND id = v_user AND status <> 'revoked'
+       FOR UPDATE;
+    IF NOT FOUND THEN
+        po_data := util.result_error('membership:not_found', 'no such member');
+        RETURN;
+    END IF;
+    IF v_member.subject_key LIKE 'svc:%' THEN
+        po_data := util.result_error('membership:invalid', 'a service is given no note');
+        RETURN;
+    END IF;
+
+    IF v_member.note = v_note THEN
+        po_data := util.result_success(jsonb_build_object('userId', v_user, 'changed', false));
+        RETURN;
+    END IF;
+
+    UPDATE rolebyte.user_account SET note = v_note WHERE id = v_user;
+    INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+    VALUES (util.generate_ulid(), v_actor, v_tenant, v_user, 'noteChanged',
+            jsonb_build_object('cleared', v_note = ''));
+
+    po_data := util.result_success(jsonb_build_object('userId', v_user, 'changed', true));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.user_note_set(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.user_note_set(jsonb, jsonb) TO rolebyte_public;
 
 -- history — the append-only promise made queryable: a tenant's membership
 -- events, newest first, one page at a time. The billing seat-count source.
@@ -1961,7 +2062,75 @@ $$;
 
 REVOKE ALL ON FUNCTION rolebyte.tenant_role_permission_names(text) FROM PUBLIC;
 
+-- name_labels_refusal — why a write's names in other languages (`labels`) of a
+-- tenant role, a user type or a chart position cannot be taken, or NULL when
+-- they can. The map is judged as every configured list's is (languages the app
+-- speaks, each holding a name or null, a blank name refused), and then each
+-- name, trimmed, as the name itself is: 1 to 100 characters on one line. A name
+-- in another language is still a name on a screen, so it is held to the same
+-- rule as the one typed in the workspace's language.
+CREATE OR REPLACE FUNCTION rolebyte.name_labels_refusal(p_labels jsonb)
+RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_why text;
+    r     record;
+BEGIN
+    v_why := util.labels_refusal(p_labels);
+    IF v_why IS NOT NULL OR p_labels IS NULL OR jsonb_typeof(p_labels) <> 'object' THEN
+        RETURN v_why;
+    END IF;
+    FOR r IN SELECT e.key, e.value FROM jsonb_each(p_labels) e ORDER BY e.key LOOP
+        IF jsonb_typeof(r.value) = 'string'
+           AND rolebyte.is_tenant_role_name(trim(r.value #>> '{}')) IS NOT TRUE THEN
+            RETURN 'labels: the name in ' || r.key || ' is 1 to 100 characters on one line';
+        END IF;
+    END LOOP;
+    RETURN NULL;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION rolebyte.name_labels_refusal(jsonb) FROM PUBLIC;
+
+-- tenant_role_reads_alike — the first language the app speaks in which another
+-- of the tenant's roles reads the same as a role named `p_name`, with these
+-- names in other languages, would; NULL when there is none. What a reader sees
+-- is the name in their language where one was given and the name as entered
+-- otherwise, compared ignoring case, so a role named Strādnieks and another
+-- named Worker with {"lv": "Strādnieks"} read alike to a Latvian reader. The
+-- role itself (`p_role`, NULL for a new one) is never compared with itself.
+-- Only right while the caller holds the tenant's row: that is what makes a
+-- second act naming a role wait for the first, then read what it wrote.
+--
+-- Answers {"language", "name"}: the language and the other role's name as
+-- entered, which a refusal names — the administrator may know that role under
+-- another word than the one that clashed.
+CREATE OR REPLACE FUNCTION rolebyte.tenant_role_reads_alike(p_tenant text, p_role text, p_name text, p_labels jsonb)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+SET search_path = rolebyte, util, pg_temp
+AS $$
+    SELECT jsonb_build_object('language', l.lang, 'name', r.name)
+      FROM unnest(util.app_languages()) WITH ORDINALITY AS l(lang, n)
+      JOIN rolebyte.tenant_role r
+        ON r.tenant_id = p_tenant
+       AND r.id IS DISTINCT FROM p_role
+       AND lower(COALESCE(r.labels->>l.lang, r.name)) = lower(COALESCE(p_labels->>l.lang, p_name))
+     ORDER BY l.n, r.name
+     LIMIT 1;
+$$;
+
+REVOKE ALL ON FUNCTION rolebyte.tenant_role_reads_alike(text, text, text, jsonb) FROM PUBLIC;
+
 -- tenant_role_list — the tenant's roles with what each holds, ordered by name.
+-- Each carries its name as entered and its names in other languages (`labels`);
+-- the order is the name as entered, and a screen re-sorts in its reader's words.
+-- A role the tenant was opened with carries its `seed` (`guest` · `worker` ·
+-- `manager`), so a screen can tell it from one the tenant made; empty otherwise.
 CREATE OR REPLACE PROCEDURE rolebyte.tenant_role_list(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1984,7 +2153,9 @@ BEGIN
 
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
                'id',          r.id,
+               'seed',        r.seed,
                'name',        r.name,
+               'labels',      r.labels,
                'description', r.description,
                'permissions', rolebyte.tenant_role_permission_names(r.id)
            ) ORDER BY lower(r.name), r.id), '[]'::jsonb)
@@ -2004,9 +2175,12 @@ $$;
 REVOKE ALL ON PROCEDURE rolebyte.tenant_role_list(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.tenant_role_list(jsonb, jsonb) TO rolebyte_public;
 
--- tenant_role_define — the tenant makes a role: a name, an optional
+-- tenant_role_define — the tenant makes a role: a name, its names in the app's
+-- other languages (`labels`, optional, taken as given), an optional
 -- description, and no permissions yet. A name another role of the tenant
--- already carries, in any letter case, is refused. Emits `tenantRoleDefined`.
+-- already carries, in any letter case, is refused, and so is a role that would
+-- read the same as another in any language the app speaks. Emits
+-- `tenantRoleDefined`, carrying the names.
 CREATE OR REPLACE PROCEDURE rolebyte.tenant_role_define(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -2016,7 +2190,10 @@ DECLARE
     v_actor  text;
     v_tenant text;
     v_name   text;
+    v_labels jsonb;
     v_desc   text;
+    v_why    text;
+    v_clash  jsonb;
     v_row    rolebyte.tenant_role%ROWTYPE;
 BEGIN
     v_actor := NULLIF(trim(pi_data->>'actor'), '');
@@ -2052,7 +2229,19 @@ BEGIN
         RETURN;
     END IF;
 
-    IF NOT EXISTS (SELECT 1 FROM rolebyte.tenant WHERE id = v_tenant) THEN
+    v_why := rolebyte.name_labels_refusal(pi_data->'labels');
+    IF v_why IS NOT NULL THEN
+        po_data := util.result_error('membership:invalid', v_why);
+        RETURN;
+    END IF;
+    v_labels := util.labels_merge('{}'::jsonb, pi_data->'labels');
+
+    -- The tenant's row is held to the end of the act, as by every act that names
+    -- the tenant's roles, so two administrators naming roles at the same moment
+    -- take turns: the second reads the first's role and is refused if the two
+    -- would read alike.
+    PERFORM 1 FROM rolebyte.tenant WHERE id = v_tenant FOR UPDATE;
+    IF NOT FOUND THEN
         po_data := util.result_error('tenant:not_found', 'tenant does not exist');
         RETURN;
     END IF;
@@ -2062,18 +2251,27 @@ BEGIN
         po_data := util.result_error('membership:conflict', 'a role with this name already exists in the tenant');
         RETURN;
     END IF;
+    v_clash := rolebyte.tenant_role_reads_alike(v_tenant, NULL, v_name, v_labels);
+    IF v_clash IS NOT NULL THEN
+        po_data := util.result_error('membership:conflict',
+            'a role reading the same in ' || (v_clash->>'language') || ' already exists in the tenant: '
+                || (v_clash->>'name'));
+        RETURN;
+    END IF;
 
-    INSERT INTO rolebyte.tenant_role (id, tenant_id, name, description)
-    VALUES (util.generate_ulid(), v_tenant, v_name, v_desc)
+    INSERT INTO rolebyte.tenant_role (id, tenant_id, name, labels, description)
+    VALUES (util.generate_ulid(), v_tenant, v_name, v_labels, v_desc)
     RETURNING * INTO v_row;
 
     INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
     VALUES (util.generate_ulid(), v_actor, v_tenant, 'tenantRoleDefined',
-            jsonb_build_object('roleId', v_row.id, 'name', v_row.name, 'description', v_row.description));
+            jsonb_build_object('roleId', v_row.id, 'name', v_row.name, 'labels', v_row.labels,
+                               'description', v_row.description));
 
     po_data := util.result_success(jsonb_build_object(
         'id',          v_row.id,
         'name',        v_row.name,
+        'labels',      v_row.labels,
         'description', v_row.description,
         'permissions', '[]'::jsonb
     ));
@@ -2092,9 +2290,15 @@ $$;
 REVOKE ALL ON PROCEDURE rolebyte.tenant_role_define(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.tenant_role_define(jsonb, jsonb) TO rolebyte_public;
 
--- tenant_role_update — rename a role and change its description. An absent
--- description keeps the one there; an empty one clears it. Changing nothing
--- records nothing. Emits `tenantRoleRenamed` for a new name and
+-- tenant_role_update — change what a role is called and how it is described:
+-- its name (`name`), its names in the app's other languages (`labels`, merged
+-- per language: a language sent with a name sets it, one sent with null removes
+-- it, one not sent is left), its description (`description`; an empty one
+-- clears it), or any of them. Only what is sent changes, so a screen editing one
+-- language cannot erase another; a call sending none of the three is refused.
+-- Changing nothing records nothing. Emits `tenantRoleRenamed` when the name or
+-- the names in other languages change — carrying the name before and after and
+-- every name in another language the role holds after the change — and
 -- `tenantRoleDescribed` for a new description.
 CREATE OR REPLACE PROCEDURE rolebyte.tenant_role_update(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
@@ -2106,7 +2310,11 @@ DECLARE
     v_tenant  text;
     v_role    text;
     v_name    text;
+    v_labels  jsonb;
+    v_names   boolean := COALESCE(jsonb_typeof(pi_data->'labels') = 'object', false);
     v_desc    text;
+    v_why     text;
+    v_clash   jsonb;
     v_row     rolebyte.tenant_role%ROWTYPE;
     v_changed boolean := false;
 BEGIN
@@ -2118,19 +2326,42 @@ BEGIN
         RETURN;
     END IF;
 
-    IF jsonb_typeof(pi_data->'name') IS DISTINCT FROM 'string' THEN
-        po_data := util.result_error('membership:invalid', 'name is required');
-        RETURN;
+    -- Sent at all, a name is a name: anything but text, or a blank, is refused,
+    -- never read as "leave it".
+    IF pi_data ? 'name' THEN
+        IF jsonb_typeof(pi_data->'name') IS DISTINCT FROM 'string' THEN
+            po_data := util.result_error('membership:invalid', 'name must be a string');
+            RETURN;
+        END IF;
+        v_name := trim(pi_data->>'name');
+        IF rolebyte.is_tenant_role_name(v_name) IS NOT TRUE THEN
+            po_data := util.result_error('membership:invalid',
+                'a role name is 1 to 100 characters on one line');
+            RETURN;
+        END IF;
     END IF;
-    v_name := trim(pi_data->>'name');
-    IF rolebyte.is_tenant_role_name(v_name) IS NOT TRUE THEN
-        po_data := util.result_error('membership:invalid',
-            'a role name is 1 to 100 characters on one line');
+
+    v_why := rolebyte.name_labels_refusal(pi_data->'labels');
+    IF v_why IS NOT NULL THEN
+        po_data := util.result_error('membership:invalid', v_why);
         RETURN;
     END IF;
 
     IF pi_data ? 'description' AND jsonb_typeof(pi_data->'description') IS DISTINCT FROM 'string' THEN
         po_data := util.result_error('membership:invalid', 'description must be a string');
+        RETURN;
+    END IF;
+
+    IF v_name IS NULL AND NOT v_names AND NOT (pi_data ? 'description') THEN
+        po_data := util.result_error('membership:invalid', 'a name, labels, a description or more are required');
+        RETURN;
+    END IF;
+
+    -- The tenant's row first, as every act naming the tenant's roles takes it:
+    -- a second rename at the same moment waits, then reads this one's names.
+    PERFORM 1 FROM rolebyte.tenant WHERE id = v_tenant FOR UPDATE;
+    IF NOT FOUND THEN
+        po_data := util.result_error('membership:not_found', 'role does not exist');
         RETURN;
     END IF;
 
@@ -2143,6 +2374,9 @@ BEGIN
         RETURN;
     END IF;
 
+    v_name   := COALESCE(v_name, v_row.name);
+    v_labels := CASE WHEN v_names THEN util.labels_merge(v_row.labels, pi_data->'labels')
+                     ELSE v_row.labels END;
     v_desc := CASE WHEN pi_data ? 'description' THEN trim(pi_data->>'description')
                    ELSE v_row.description END;
     IF length(v_desc) > 1000 THEN
@@ -2156,16 +2390,25 @@ BEGIN
         po_data := util.result_error('membership:conflict', 'a role with this name already exists in the tenant');
         RETURN;
     END IF;
+    IF v_name <> v_row.name OR v_labels <> v_row.labels THEN
+        v_clash := rolebyte.tenant_role_reads_alike(v_tenant, v_row.id, v_name, v_labels);
+        IF v_clash IS NOT NULL THEN
+            po_data := util.result_error('membership:conflict',
+                'a role reading the same in ' || (v_clash->>'language') || ' already exists in the tenant: '
+                || (v_clash->>'name'));
+            RETURN;
+        END IF;
+    END IF;
 
-    IF v_name <> v_row.name OR v_desc <> v_row.description THEN
-        UPDATE rolebyte.tenant_role SET name = v_name, description = v_desc WHERE id = v_row.id;
+    IF v_name <> v_row.name OR v_labels <> v_row.labels OR v_desc <> v_row.description THEN
+        UPDATE rolebyte.tenant_role SET name = v_name, labels = v_labels, description = v_desc WHERE id = v_row.id;
         v_changed := true;
     END IF;
 
-    IF v_name <> v_row.name THEN
+    IF v_name <> v_row.name OR v_labels <> v_row.labels THEN
         INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
         VALUES (util.generate_ulid(), v_actor, v_tenant, 'tenantRoleRenamed',
-                jsonb_build_object('roleId', v_row.id, 'from', v_row.name, 'to', v_name));
+                jsonb_build_object('roleId', v_row.id, 'from', v_row.name, 'to', v_name, 'labels', v_labels));
     END IF;
     IF v_desc <> v_row.description THEN
         INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
@@ -2177,6 +2420,7 @@ BEGIN
     po_data := util.result_success(jsonb_build_object(
         'id',          v_row.id,
         'name',        v_name,
+        'labels',      v_labels,
         'description', v_desc,
         'changed',     v_changed
     ));
@@ -2568,7 +2812,8 @@ $$;
 REVOKE ALL ON PROCEDURE rolebyte.field_permission_roles_set(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.field_permission_roles_set(jsonb, jsonb) TO rolebyte_public;
 
--- tenant_role_delete — remove a role nobody holds. A role held by any member
+-- tenant_role_delete — remove a role nobody holds. A role the tenant was opened
+-- with (one with a seed) is never deleted, only renamed or reticked. A role held by any member
 -- whose access has not been revoked, or placed by a member service on its own
 -- objects, is refused with the counts: deleting it would take access away from
 -- people with no way back. The role's ticks and its
@@ -2605,6 +2850,14 @@ BEGIN
        FOR UPDATE;
     IF NOT FOUND THEN
         po_data := util.result_error('membership:not_found', 'role does not exist');
+        RETURN;
+    END IF;
+    -- A role the tenant was opened with stays: services pick their defaults by
+    -- it, such as the role a newcomer or a project's creator receives. It may be
+    -- renamed and its ticks changed.
+    IF v_row.seed <> '' THEN
+        po_data := util.result_error('membership:conflict',
+            'this role came with the workspace and is not deleted; rename it or change what it holds');
         RETURN;
     END IF;
 
@@ -2807,8 +3060,8 @@ GRANT EXECUTE ON PROCEDURE rolebyte.tenant_role_revoke(jsonb, jsonb) TO rolebyte
 -- ---------------------------------------------------------------------------
 
 -- tenant_role_definitions — the tenant's roles as a service that places them
--- needs them: each role's id, its labels, and the permissions it carries in this
--- tenant. Those are its ticks narrowed to what the tenant has, the same filter
+-- needs them: each role's id, its name and description, its names in the app's
+-- other languages (`labels`), and the permissions it carries in this tenant. Those are its ticks narrowed to what the tenant has, the same filter
 -- resolve applies to a person granted the role across the tenant, so a role
 -- placed on one object never carries more than the same role granted everywhere.
 -- For the same reason a tick of a permission that changes the tenant's own setup,
@@ -2842,6 +3095,7 @@ BEGIN
                'id',          r.id,
                'seed',        r.seed,
                'name',        r.name,
+               'labels',      r.labels,
                'description', r.description,
                'permissions', COALESCE((
                    SELECT jsonb_agg(p.name ORDER BY p.name COLLATE "C")
@@ -4103,3 +4357,141 @@ $$;
 
 REVOKE ALL ON PROCEDURE rolebyte.administrator_seed(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.administrator_seed(jsonb, jsonb) TO rolebyte_public;
+
+-- ---------------------------------------------------------------------------
+-- A person's own language. Kept for the person, not for any membership: one
+-- row per person keyed by their platform subject (`sub:<person id>`), the same
+-- in every tenant they belong to, read and set by that person. NULL, or no row,
+-- means they read the deployment's language. Each change is a line of the
+-- register's history that belongs to no tenant and no membership (`tenant_id`
+-- and `user_id` NULL), naming the person in its payload, so no tenant's history
+-- shows it: it is a person's choice about their own screen, nobody else's data.
+-- The row is part of the person: whatever erases a person takes it with them.
+-- ---------------------------------------------------------------------------
+
+-- person_language_get — the person's own language: {"language": "en"} or
+-- {"language": null} when they have not chosen one. Answers for a person's key
+-- only; a service account's key, or a key of any other kind, is refused.
+CREATE OR REPLACE PROCEDURE rolebyte.person_language_get(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_subject  text := NULLIF(btrim(pi_data->>'subjectKey'), '');
+    v_language text;
+BEGIN
+    IF v_subject IS NULL
+       OR (starts_with(v_subject, 'sub:') AND rolebyte.is_typed_subject_key(v_subject)) IS NOT TRUE THEN
+        po_data := util.result_error('membership:invalid', 'subjectKey must be a person''s key, sub:<person id>');
+        RETURN;
+    END IF;
+
+    SELECT s.language INTO v_language FROM rolebyte.person_setting s WHERE s.subject_key = v_subject;
+
+    po_data := util.result_success(jsonb_build_object('language', v_language));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.person_language_get(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.person_language_get(jsonb, jsonb) TO rolebyte_public;
+
+-- person_language_set — choose the person's own language, or clear it:
+-- {actor, subjectKey, language} → {"language": …}. `language` must be sent: a
+-- language the app speaks (util.app_languages, matched exactly) sets it, null
+-- clears it, so the person reads the deployment's again; anything else, and a
+-- call leaving it out, is refused rather than read as a clear. Only a person
+-- who is an active member of at least one active tenant keeps one: anybody else
+-- is refused `membership:notMember`. Every refusal writes nothing.
+--
+-- A set that moves the value writes one `personLanguageSet` line —
+-- {subjectKey, language, from}, `language` and `from` each a language or null —
+-- belonging to no tenant; a set that changes nothing writes nothing, and neither
+-- does clearing a language that was never chosen.
+--
+-- Two sets of one person at the same moment take turns: each holds the person's
+-- own lock to the end of its transaction, so the second waits for the first to
+-- commit, then reads what it wrote, and its line starts `from` there. Different
+-- people never wait for each other.
+CREATE OR REPLACE PROCEDURE rolebyte.person_language_set(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_actor    text := NULLIF(btrim(pi_data->>'actor'), '');
+    v_subject  text := NULLIF(btrim(pi_data->>'subjectKey'), '');
+    v_language text;
+    v_before   text;
+    v_why      text := 'language must be a language the app speaks ('
+                       || array_to_string(util.app_languages(), ', ') || '), or null to read the deployment''s';
+BEGIN
+    IF v_actor IS NULL OR v_subject IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'actor and subjectKey are required');
+        RETURN;
+    END IF;
+    IF (starts_with(v_subject, 'sub:') AND rolebyte.is_typed_subject_key(v_subject)) IS NOT TRUE THEN
+        po_data := util.result_error('membership:invalid', 'subjectKey must be a person''s key, sub:<person id>');
+        RETURN;
+    END IF;
+
+    -- Left out, `language` has no type at all, and is refused with every other
+    -- shape that is neither a language nor null.
+    CASE jsonb_typeof(pi_data->'language')
+        WHEN 'string' THEN
+            v_language := pi_data->>'language';
+            IF NOT (v_language = ANY (util.app_languages())) THEN
+                po_data := util.result_error('membership:invalid', v_why);
+                RETURN;
+            END IF;
+        WHEN 'null' THEN
+            v_language := NULL;
+        ELSE
+            po_data := util.result_error('membership:invalid', v_why);
+            RETURN;
+    END CASE;
+
+    IF NOT EXISTS (
+        SELECT 1
+          FROM rolebyte.user_account u
+          JOIN rolebyte.tenant t ON t.id = u.tenant_id
+         WHERE u.subject_key = v_subject
+           AND u.status = 'active'
+           AND t.status = 'active') THEN
+        po_data := util.result_error('membership:notMember',
+            'only an active member of an active tenant keeps a language of their own');
+        RETURN;
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtextextended('rolebyte.person_setting:' || v_subject, 0));
+
+    SELECT s.language INTO v_before FROM rolebyte.person_setting s WHERE s.subject_key = v_subject;
+
+    IF v_language IS DISTINCT FROM v_before THEN
+        INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+        VALUES (util.generate_ulid(), v_actor, NULL, NULL, 'personLanguageSet',
+                jsonb_build_object('subjectKey', v_subject, 'language', v_language, 'from', v_before));
+
+        INSERT INTO rolebyte.person_setting (subject_key, language, changed_at)
+        VALUES (v_subject, v_language, now())
+        ON CONFLICT (subject_key) DO UPDATE
+            SET language   = EXCLUDED.language,
+                changed_at = EXCLUDED.changed_at;
+    END IF;
+
+    po_data := util.result_success(jsonb_build_object('language', v_language));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.person_language_set(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.person_language_set(jsonb, jsonb) TO rolebyte_public;

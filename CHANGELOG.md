@@ -6,6 +6,48 @@ integrates against the procedures.
 
 ## v0.4.0
 
+### Added — e-signing: the `legacyEid` signing flow
+
+Two migrations, `envelope/V10` and `signflow/V7`, each drop and re-add one `CHECK` (`ck_slot_flow`,
+`ck_signing_job_flow`) with `legacyEid` beside every name stored before: a scan of the table under a brief lock,
+nothing rewritten. `envelope.add_slot`, `signing.save_job` and `signing.insert_signature` accept it: the eID card
+signed in the person's browser through the eParaksts provider's own plugin. **Apply before** a signing service that
+writes `legacyEid`, which the older schema refuses (`invalid flow`); nothing changes for a deployment that does not
+offer the flow.
+
+### Changed — rolebyte: assistants, each one person's own
+
+Two migrations, `rolebyte/V20` and `rolebyte/V21`. `rolebyte.assistant_person` keeps the one person an assistant (a
+machine member keyed `svc:assistant-<ULID>`) works for, and an assistant's name is unique in its tenant among those
+not removed, ignoring case. New procedures: `assistant_create` (for one active person of the tenant; the assistant
+starts in the shipped **Assistant** role, made with the tenant's first assistant), `assistant_rename`,
+`assistant_person_set`, `assistant_list` and `assistants_of_person` (the sign-in service's lookup).
+`permission_declare` accepts the seed `assistant`. **Apply with rolebyte v0.3.0 or later**, which declares that seed.
+
+### Added — rolebyte: names in other languages, a person's own language and an administrator's note
+
+- `rolebyte/V17`: tenant roles, user types and chart positions gain `labels`, their names in the app's other
+  languages. Empty for every existing one, so nothing anybody reads changes until a name is given.
+- `rolebyte/V18`: a person's own language, one row per person keyed by their platform subject and the same in every
+  tenant, read and set with `person_language_get` and `person_language_set` (none set: the deployment's language).
+- `rolebyte/V19`: an administrator's note on a member, up to 1000 characters, set with `user_note_set`; the history
+  records that a note changed, never its words.
+
+### Added — util: names in other languages for configured lists
+
+`util/V4` adds `util.app_languages`, `util.labels_merge`, `util.labels_refusal` and `util.list_number`: the helpers
+every configured list's procedures use to check its names in the app's other languages and to number its items.
+
+### Changed — identity: every sign-in is kept under the provider it came from
+
+- `identity/V4`: a credential keeps the email address its directory sent, renewed at each sign-in. It is shown,
+  never matched on; a card or a mobile identity keeps none.
+- `identity/V5`: a credential is keyed by its provider and its handle together, since a handle is unique only at the
+  provider that issued it. Every credential stored before keeps the empty provider, the deployment's one provider.
+- `identity/V6`: card sign-ins move under a provider of their own, `webeid`; where a newer sign-in service already
+  wrote the same card's credential there, the older duplicate is removed.
+- **Apply with a sign-in service that names its providers** (authbyte v0.7.0 or later).
+
 ### Changed — rolebyte: only the deployment writes the list of services, an import keeps the workspace's name and login, a workspace and one person's history can be read, and revoked people leave the chart
 
 One new migration, `rolebyte/V16`: two indexes on `rolebyte.event`, and every person whose access was revoked taken

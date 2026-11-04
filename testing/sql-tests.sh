@@ -23,9 +23,19 @@ IMG=platform-migrate:sqltest
 PGDEV=platformdb-pgdev:local
 PW=sqltestpw
 DB=platform
-# The one-shot that applies a staged, partial migration set for a fixture. Named
-# rather than anonymous so a run that dies mid-fixture still gets cleaned up.
+# The one-shots that apply a staged, partial migration set for a fixture, one per
+# fixture (this prefix and its number). Named rather than anonymous so a run that
+# dies mid-fixture still gets cleaned up.
 FIXC=platformdb-sqltest-stage
+# Flyway is a Java program, and the runner starts one per location: a few hundred
+# starts in this gate. These flags make each start cheaper (a bare start went from
+# 1.27 s to 0.75 s) and change nothing Flyway does. They are passed only here; the
+# image is untouched, so a deployment runs exactly as before.
+JVM_FAST="-XX:TieredStopAtLevel=1 -XX:+UseSerialGC -Xshare:auto"
+# How many migration fixtures run at a time. Each has a database of its own, so
+# they are independent; one per core unless SQL_TESTS_JOBS says otherwise.
+JOBS=${SQL_TESTS_JOBS:-$(nproc 2>/dev/null || echo 2)}
+case "$JOBS" in ''|*[!0-9]*|0) echo "FATAL: SQL_TESTS_JOBS must be a whole number of 1 or more (got '$JOBS')" >&2; exit 1 ;; esac
 
 # Every location and every role any deployment shape declares, read from
 # testing/deployments.conf. Dependency order: util first, grants last, the rest
@@ -40,7 +50,7 @@ HUMAN_WRITE=$(union 5)
 
 cleanup() {
   docker rm -f "$PG" >/dev/null 2>&1 || true
-  docker rm -f "$FIXC" >/dev/null 2>&1 || true
+  for c in $(docker ps -aq --filter "name=^${FIXC}-" 2>/dev/null); do docker rm -f "$c" >/dev/null 2>&1 || true; done
   docker network rm "$NET" >/dev/null 2>&1 || true
   rm -rf testing/.fixture-stage
 }
@@ -80,7 +90,7 @@ echo "   $(echo $ROLES | wc -w) service roles + group roles + plpgsql_check read
 echo "== apply ALL locations via the migration image"
 docker run --rm --network "$NET" \
   -e PGHOST="$PG" -e PGDATABASE="$DB" -e PGUSER=platform -e PGPASSWORD="$PW" \
-  -e LOCATIONS="$ALL_LOCATIONS" "$IMG" | tail -1
+  -e LOCATIONS="$ALL_LOCATIONS" -e JAVA_ARGS="$JVM_FAST" "$IMG" | tail -1
 
 echo "== SQL unit tests"
 docker cp migrations/testing "$PG":/sqltests
@@ -133,56 +143,90 @@ if [ -z "$SEEDS" ]; then
   echo "   none declared under $FIXTURES/ — no migration in this tree carries a data statement"
 else
   rm -rf "$STAGE"
+  mkdir -p "$STAGE"
   docker cp "$FIXTURES" "$PG":/fixtures >/dev/null
+
+  # Plan every fixture first: its location and version, the locations it is
+  # applied after, and the ones it is applied with. Both lists are read from the
+  # first deployment shape that declares the location, so the order is the one a
+  # deployment really uses and no second list has to be kept in step.
+  PLAN=()
+  n=0
   for seed in $SEEDS; do
+    n=$((n+1))
     loc=$(basename "$(dirname "$seed")")
     ver=$(basename "$seed" .seed.sql); ver=${ver#V}
     assert="$FIXTURES/$loc/V${ver}.assert.sql"
     [ -f "$assert" ] || { echo "FATAL: $seed has no V${ver}.assert.sql beside it — a seed that asserts nothing is not a gate" >&2; exit 1; }
     mig=$(ls "migrations/$loc/V${ver}__"*.sql 2>/dev/null | head -1 || true)
     [ -n "$mig" ] || { echo "FATAL: fixture $seed names V$ver of location '$loc', which does not exist" >&2; exit 1; }
-
-    # Which locations this one is applied after — read from the first deployment
-    # shape that declares it, so the order is the one a deployment really uses
-    # and no second list has to be kept in step.
     row=$(printf '%s\n' "$SHAPES" | awk -F'|' -v l="$loc" '{n=split($2,a," "); for(i=1;i<=n;i++) if(a[i]==l){print; exit}}' || true)
     [ -n "$row" ] || { echo "FATAL: location '$loc' is in no deployment shape — nothing declares what is applied before it" >&2; exit 1; }
     locations=$(printf '%s' "$row" | cut -d'|' -f2)
     deps=$(printf '%s' "$locations" | awk -v l="$loc" '{for(i=1;i<=NF;i++){ if($i==l) exit; printf "%s ", $i }}')
-    db="fixture_${loc}_v${ver}"
+    rest=$(printf '%s' "$locations" | awk -v l="$loc" '{on=0; for(i=1;i<=NF;i++){ if($i==l) on=1; if(on) printf "%s ", $i }}')
+    PLAN+=("$n|$loc|$ver|$deps|$rest")
+  done
 
-    mkdir -p "$STAGE/$loc"
-    staged=0
-    for f in "migrations/$loc/V"*.sql; do
-      n=$(basename "$f"); n=${n#V}; n=${n%%__*}
-      if [ "$n" -lt "$ver" ]; then cp "$f" "$STAGE/$loc/"; staged=$((staged+1)); fi
-    done
-    [ "$staged" -gt 0 ] || { echo "FATAL: V$ver is the first migration of '$loc' — there is no earlier state for a database to be in" >&2; exit 1; }
+  # 1. everything a location is applied after, from the image itself. Most
+  #    fixtures share that starting point, so each distinct one is migrated once,
+  #    into a template, and every fixture's database begins as a copy of it. A
+  #    template holds only locations BEFORE the fixture's own, and every
+  #    database-level setting the migrations make (its connect grants, its default
+  #    search_path) comes from the last location, which is never among them, so
+  #    the copy is the database the runner would have made.
+  BASES=()
+  for line in "${PLAN[@]}"; do
+    IFS='|' read -r i loc ver deps rest <<<"$line"
+    [ -n "$deps" ] || continue
+    known=0
+    for b in "${BASES[@]}"; do [ "${b#*|}" = "$deps" ] && known=1; done
+    [ "$known" = 1 ] && continue
+    base="fixture_base_$(( ${#BASES[@]} + 1 ))"
+    docker exec "$PG" sh -c "psql -X -v ON_ERROR_STOP=1 -U platform -d $DB -qc 'CREATE DATABASE $base OWNER platform'" >/dev/null
+    docker run --rm --network "$NET" -e PGHOST="$PG" -e PGDATABASE="$base" -e PGUSER=platform \
+      -e PGPASSWORD="$PW" -e LOCATIONS="$deps" -e JAVA_ARGS="$JVM_FAST" "$IMG" >/dev/null \
+      || { echo "FATAL: applying '$deps', the starting point of fixtures, failed" >&2; exit 1; }
+    BASES+=("$base|$deps")
+  done
+  # One CREATE DATABASE at a time: a copy needs its template to have no other
+  # session, and two copies of one template at once can trip on each other.
+  for line in "${PLAN[@]}"; do
+    IFS='|' read -r i loc ver deps rest <<<"$line"
+    from=""
+    for b in "${BASES[@]}"; do [ "${b#*|}" = "$deps" ] && from=" TEMPLATE ${b%%|*}"; done
+    docker exec "$PG" sh -c "psql -X -v ON_ERROR_STOP=1 -U platform -d $DB -qc 'CREATE DATABASE fixture_${loc}_v${ver}${from} OWNER platform'" >/dev/null
+  done
 
-    docker exec "$PG" sh -c "psql -X -v ON_ERROR_STOP=1 -U platform -d $DB -qc 'CREATE DATABASE $db OWNER platform'" >/dev/null
-
-    # 1. everything this location is applied after, from the image itself
-    if [ -n "$deps" ]; then
-      docker run --rm --network "$NET" -e PGHOST="$PG" -e PGDATABASE="$db" -e PGUSER=platform \
-        -e PGPASSWORD="$PW" -e LOCATIONS="$deps" "$IMG" >/dev/null \
-        || { echo "FATAL: fixture $loc/V$ver — applying '$deps' failed" >&2; exit 1; }
-    fi
+  # One fixture, from its copied starting point to its assertions. Runs in a
+  # subshell of its own; its last act marks it passed, so a fixture that stopped
+  # anywhere before reads as failed.
+  fixture() {
+    local i=$1 loc=$2 ver=$3 rest=$4
+    local db="fixture_${loc}_v${ver}" c="${FIXC}-$1" dir="$STAGE/$1" staged=0 f n out rows
 
     # 2. the location as it stood one version earlier. The staged copy is handed
     #    to the same runner through MIGRATIONS_DIR, so Flyway records exactly the
     #    history a database that stopped below V$ver would carry, and step 4
     #    continues it instead of re-applying anything.
-    docker rm -f "$FIXC" >/dev/null 2>&1 || true
+    mkdir -p "$dir/$loc"
+    for f in "migrations/$loc/V"*.sql; do
+      n=$(basename "$f"); n=${n#V}; n=${n%%__*}
+      if [ "$n" -lt "$ver" ]; then cp "$f" "$dir/$loc/"; staged=$((staged+1)); fi
+    done
+    [ "$staged" -gt 0 ] || { echo "FATAL: V$ver is the first migration of '$loc' — there is no earlier state for a database to be in" >&2; exit 1; }
+    docker rm -f "$c" >/dev/null 2>&1 || true
     #    MSYS_NO_PATHCONV: this is the one container path that cannot hide
     #    inside an sh -c body or a colon form, and Git Bash rewrites a bare
     #    /staged into a Windows path before docker ever sees it. The variable
     #    means nothing on Linux, so the line runs identically in both shells.
-    MSYS_NO_PATHCONV=1 docker create --name "$FIXC" --network "$NET" -e PGHOST="$PG" -e PGDATABASE="$db" \
-      -e PGUSER=platform -e PGPASSWORD="$PW" -e LOCATIONS="$loc" -e MIGRATIONS_DIR=/staged "$IMG" >/dev/null
-    docker cp "$STAGE" "$FIXC":/staged >/dev/null
-    docker start -a "$FIXC" >/dev/null 2>&1 \
-      || { echo "FATAL: fixture $loc/V$ver — applying the $staged migration(s) below V$ver failed:" >&2; docker logs "$FIXC" 2>&1 | tail -20 >&2; exit 1; }
-    docker rm -f "$FIXC" >/dev/null
+    MSYS_NO_PATHCONV=1 docker create --name "$c" --network "$NET" -e PGHOST="$PG" -e PGDATABASE="$db" \
+      -e PGUSER=platform -e PGPASSWORD="$PW" -e LOCATIONS="$loc" -e MIGRATIONS_DIR=/staged \
+      -e JAVA_ARGS="$JVM_FAST" "$IMG" >/dev/null
+    docker cp "$dir" "$c":/staged >/dev/null
+    docker start -a "$c" >/dev/null 2>&1 \
+      || { echo "FATAL: fixture $loc/V$ver — applying the $staged migration(s) below V$ver failed:" >&2; docker logs "$c" 2>&1 | tail -20 >&2; exit 1; }
+    docker rm -f "$c" >/dev/null
 
     # 3. the rows. Proven by the count psql reports, never by the absence of an
     #    error: a seed that silently wrote nothing makes every assertion below
@@ -192,9 +236,11 @@ else
     rows=$(printf '%s\n' "$out" | awk '/^INSERT 0 [0-9]+$/ { s += $3 } END { print s+0 }')
     [ "$rows" -gt 0 ] || { echo "FATAL: fixture $loc/V$ver — the seed wrote 0 rows, so nothing that follows observes anything" >&2; exit 1; }
 
-    # 4. the real set, V$ver included, onto a database with work in it
+    # 4. the real set from this location on, V$ver included, onto a database with
+    #    work in it. The locations before it are at their head already (step 1),
+    #    so running them again would change nothing.
     docker run --rm --network "$NET" -e PGHOST="$PG" -e PGDATABASE="$db" -e PGUSER=platform \
-      -e PGPASSWORD="$PW" -e LOCATIONS="$locations" "$IMG" >/dev/null \
+      -e PGPASSWORD="$PW" -e LOCATIONS="$rest" -e JAVA_ARGS="$JVM_FAST" "$IMG" >/dev/null \
       || { echo "FATAL: fixture $loc/V$ver — the migration set failed against a database that already had rows" >&2; exit 1; }
 
     # 5. what the migration claims. The script must reach its own PASS notice —
@@ -204,8 +250,34 @@ else
     printf '%s\n' "$out" | grep -q 'PASS' \
       || { echo "FATAL: fixture $loc/V$ver — the assertions never reached their PASS notice" >&2; exit 1; }
     echo "   OK: $loc/V$ver — $staged migration(s) below it, $rows seeded row(s), then V$ver asserted"
-    rm -rf "$STAGE"
+    touch "$STAGE/$i.passed"
+  }
+
+  # Side by side, at most $JOBS at a time; each writes its own log, read back in
+  # plan order below, so the report reads the same however the runs interleave.
+  echo "   ${#PLAN[@]} fixture(s), $JOBS at a time"
+  running=0
+  for line in "${PLAN[@]}"; do
+    IFS='|' read -r i loc ver deps rest <<<"$line"
+    if [ "$running" -ge "$JOBS" ]; then wait -n || true; running=$((running-1)); fi
+    ( fixture "$i" "$loc" "$ver" "$rest" ) >"$STAGE/$i.log" 2>&1 &
+    running=$((running+1))
   done
+  wait || true
+
+  failed=0
+  for line in "${PLAN[@]}"; do
+    IFS='|' read -r i loc ver deps rest <<<"$line"
+    if [ -f "$STAGE/$i.passed" ]; then
+      grep '^   OK: ' "$STAGE/$i.log"
+    else
+      failed=1
+      echo "FATAL: fixture $loc/V$ver did not pass:" >&2
+      cat "$STAGE/$i.log" >&2
+    fi
+  done
+  [ "$failed" = 0 ] || exit 1
+  rm -rf "$STAGE"
 fi
 
 echo "== plpgsql_check static analysis (error-level findings fail)"

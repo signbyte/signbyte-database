@@ -57,7 +57,8 @@ END;
 $$;
 REVOKE ALL ON FUNCTION rolebyte.chart_permission_ids(jsonb) FROM PUBLIC;
 
--- chart_position_json — one position as it is read: its place in the tree, the
+-- chart_position_json — one position as it is read: its place in the tree, its
+-- name as entered and its names in the app's other languages (`labels`), the
 -- user type it names, the boxes it carries and the people in it.
 CREATE OR REPLACE FUNCTION rolebyte.chart_position_json(p_id text)
 RETURNS jsonb
@@ -70,6 +71,7 @@ BEGIN
                 'id', p.id,
                 'parentId', COALESCE(p.parent_id, ''),
                 'name', p.name,
+                'labels', p.labels,
                 'userTypeId', COALESCE(p.user_type_id, ''),
                 'permissions', COALESCE((
                     SELECT jsonb_agg(sp.service_key || '/' || sp.feature_key || ':' || sp.act
@@ -191,7 +193,9 @@ REVOKE ALL ON PROCEDURE rolebyte.chart_document(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.chart_document(jsonb, jsonb) TO rolebyte_public;
 
 -- chart_position_add — a position under another, or the top when the tenant has
--- none yet. Input {actor, tenantId, name, parentId?}.
+-- none yet. Input {actor, tenantId, name, labels?, parentId?}; `labels`, its
+-- names in the app's other languages, are taken as given. Two positions may
+-- carry the same name, as two seats of one kind.
 CREATE OR REPLACE PROCEDURE rolebyte.chart_position_add(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -202,6 +206,8 @@ DECLARE
     v_tenant text := NULLIF(btrim(pi_data->>'tenantId'), '');
     v_name   text := btrim(COALESCE(pi_data->>'name', ''));
     v_parent text := NULLIF(btrim(COALESCE(pi_data->>'parentId', '')), '');
+    v_labels jsonb;
+    v_why    text;
     v_id     text;
 BEGIN
     IF v_actor IS NULL OR v_tenant IS NULL THEN
@@ -212,6 +218,12 @@ BEGIN
         po_data := util.result_error('membership:invalid', 'a position needs a name of 1 to 100 characters on one line');
         RETURN;
     END IF;
+    v_why := rolebyte.name_labels_refusal(pi_data->'labels');
+    IF v_why IS NOT NULL THEN
+        po_data := util.result_error('membership:invalid', v_why);
+        RETURN;
+    END IF;
+    v_labels := util.labels_merge('{}'::jsonb, pi_data->'labels');
     PERFORM 1 FROM rolebyte.tenant WHERE id = v_tenant FOR UPDATE;
     IF NOT FOUND THEN
         po_data := util.result_error('tenant:not_found', 'tenant does not exist');
@@ -233,10 +245,12 @@ BEGIN
     END IF;
 
     v_id := util.generate_ulid();
-    INSERT INTO rolebyte.chart_position (id, tenant_id, parent_id, name) VALUES (v_id, v_tenant, v_parent, v_name);
+    INSERT INTO rolebyte.chart_position (id, tenant_id, parent_id, name, labels)
+    VALUES (v_id, v_tenant, v_parent, v_name, v_labels);
     INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
     VALUES (util.generate_ulid(), v_actor, v_tenant, 'chartPositionAdded',
-            jsonb_build_object('positionId', v_id, 'parentId', COALESCE(v_parent, ''), 'name', v_name));
+            jsonb_build_object('positionId', v_id, 'parentId', COALESCE(v_parent, ''), 'name', v_name,
+                               'labels', v_labels));
 
     po_data := util.result_success(rolebyte.chart_position_json(v_id));
 EXCEPTION
@@ -249,7 +263,14 @@ $$;
 REVOKE ALL ON PROCEDURE rolebyte.chart_position_add(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.chart_position_add(jsonb, jsonb) TO rolebyte_public;
 
--- chart_position_rename. Input {actor, tenantId, positionId, name}.
+-- chart_position_rename — change what a position is called: its name (`name`),
+-- its names in the app's other languages (`labels`, merged per language: a
+-- language sent with a name sets it, one sent with null removes it, one not
+-- sent is left), or both. Only what is sent changes; a call sending neither is
+-- refused. Input {actor, tenantId, positionId, name?, labels?}. Emits
+-- `chartPositionRenamed` when the name or the names in other languages change,
+-- carrying the name after and before and every name in another language the
+-- position holds after the change; changing nothing records nothing.
 CREATE OR REPLACE PROCEDURE rolebyte.chart_position_rename(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -259,32 +280,53 @@ DECLARE
     v_actor  text := NULLIF(btrim(pi_data->>'actor'), '');
     v_tenant text := NULLIF(btrim(pi_data->>'tenantId'), '');
     v_id     text := NULLIF(btrim(pi_data->>'positionId'), '');
-    v_name   text := btrim(COALESCE(pi_data->>'name', ''));
-    v_before text;
+    v_names  boolean := COALESCE(jsonb_typeof(pi_data->'labels') = 'object', false);
+    v_name   text;
+    v_labels jsonb;
+    v_why    text;
+    v_before rolebyte.chart_position%ROWTYPE;
 BEGIN
     IF v_actor IS NULL OR v_tenant IS NULL OR v_id IS NULL THEN
         po_data := util.result_error('membership:invalid', 'actor, tenantId and positionId are required');
         RETURN;
     END IF;
-    IF NOT rolebyte.is_tenant_role_name(v_name) THEN
-        po_data := util.result_error('membership:invalid', 'a position needs a name of 1 to 100 characters on one line');
+    -- Sent at all, a name is a name: a blank one is refused, never read as
+    -- "leave it".
+    IF pi_data ? 'name' THEN
+        v_name := btrim(COALESCE(pi_data->>'name', ''));
+        IF NOT rolebyte.is_tenant_role_name(v_name) THEN
+            po_data := util.result_error('membership:invalid', 'a position needs a name of 1 to 100 characters on one line');
+            RETURN;
+        END IF;
+    END IF;
+    v_why := rolebyte.name_labels_refusal(pi_data->'labels');
+    IF v_why IS NOT NULL THEN
+        po_data := util.result_error('membership:invalid', v_why);
+        RETURN;
+    END IF;
+    IF v_name IS NULL AND NOT v_names THEN
+        po_data := util.result_error('membership:invalid', 'a name, labels or both are required');
         RETURN;
     END IF;
     IF NOT rolebyte.chart_entitled(v_tenant) THEN
         po_data := util.result_error('membership:conflict', 'the workspace does not include the chart of authority');
         RETURN;
     END IF;
-    SELECT name INTO v_before FROM rolebyte.chart_position WHERE tenant_id = v_tenant AND id = v_id FOR UPDATE;
+    SELECT * INTO v_before FROM rolebyte.chart_position WHERE tenant_id = v_tenant AND id = v_id FOR UPDATE;
     IF NOT FOUND THEN
         po_data := util.result_error('membership:not_found', 'no such position');
         RETURN;
     END IF;
 
-    IF v_name <> v_before THEN
-        UPDATE rolebyte.chart_position SET name = v_name WHERE id = v_id;
+    v_name   := COALESCE(v_name, v_before.name);
+    v_labels := CASE WHEN v_names THEN util.labels_merge(v_before.labels, pi_data->'labels')
+                     ELSE v_before.labels END;
+    IF v_name <> v_before.name OR v_labels <> v_before.labels THEN
+        UPDATE rolebyte.chart_position SET name = v_name, labels = v_labels WHERE id = v_id;
         INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
         VALUES (util.generate_ulid(), v_actor, v_tenant, 'chartPositionRenamed',
-                jsonb_build_object('positionId', v_id, 'name', v_name, 'from', v_before));
+                jsonb_build_object('positionId', v_id, 'name', v_name, 'from', v_before.name,
+                                   'labels', v_labels));
     END IF;
 
     po_data := util.result_success(rolebyte.chart_position_json(v_id));

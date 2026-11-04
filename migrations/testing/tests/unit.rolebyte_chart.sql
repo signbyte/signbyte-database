@@ -511,8 +511,8 @@ BEGIN
     END IF;
     -- The administration read says both: his own, and the position's in force.
     v := pg_temp.access_row(v_ta, v_karlis);
-    IF v->'userType' IS DISTINCT FROM jsonb_build_object('id', v_def, 'name', 'Member')
-       OR v->'chartUserType' IS DISTINCT FROM jsonb_build_object('id', v_pm, 'name', 'Project manager')
+    IF v->'userType' IS DISTINCT FROM jsonb_build_object('id', v_def, 'name', 'Member', 'labels', jsonb_build_object('lv', 'Dalībnieks'))
+       OR v->'chartUserType' IS DISTINCT FROM jsonb_build_object('id', v_pm, 'name', 'Project manager', 'labels', '{}'::jsonb)
        OR (v->>'arrival')::boolean THEN
         RAISE EXCEPTION 'Kārlis reads Member as his own, Project manager from the chart, and no arrival: %', v;
     END IF;

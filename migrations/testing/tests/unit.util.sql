@@ -132,6 +132,65 @@ begin
     raise exception 'two scopes share a token';
   end if;
 
+  ------------------------------------------------------------------
+  -- The words a company configures: the app's languages, the check and
+  -- the merge of a name per language, and an item's number.
+  ------------------------------------------------------------------
+  if util.app_languages() is distinct from array['en', 'lv']::text[] then
+    raise exception 'the app speaks English and Latvian: %', util.app_languages();
+  end if;
+
+  -- Absent, JSON null and a well-formed map pass; removal is null.
+  if util.labels_refusal(null) is not null or util.labels_refusal('null'::jsonb) is not null
+     or util.labels_refusal('{}'::jsonb) is not null
+     or util.labels_refusal('{"en": "Welding", "lv": null}'::jsonb) is not null then
+    raise exception 'absent names, no names and a well-formed map pass';
+  end if;
+  if coalesce(util.labels_refusal('"Welding"'::jsonb), '') not like '%object%' then
+    raise exception 'names that are not an object are refused';
+  end if;
+  if util.labels_refusal('{"de": "Schweißen"}'::jsonb) is distinct from
+       'labels: de is not a language the app speaks (en, lv)' then
+    raise exception 'a language the app does not speak is refused, naming those it does: %',
+      util.labels_refusal('{"de": "Schweißen"}'::jsonb);
+  end if;
+  if coalesce(util.labels_refusal('{"en": 7}'::jsonb), '') not like '%must be text%' then
+    raise exception 'a name that is not text is refused';
+  end if;
+  if coalesce(util.labels_refusal('{"en": "   "}'::jsonb), '') not like '%empty%' then
+    raise exception 'a name that is empty once trimmed is refused';
+  end if;
+
+  -- The merge: set trimmed, null removes, unnamed languages stay.
+  if util.labels_merge('{"en": "Welding", "lv": "Metināšana"}'::jsonb, '{"en": null}'::jsonb)
+       is distinct from '{"lv": "Metināšana"}'::jsonb then
+    raise exception 'null removes that language and leaves the rest';
+  end if;
+  if util.labels_merge('{"lv": "Metināšana"}'::jsonb, '{"en": "  Welding "}'::jsonb)
+       is distinct from '{"en": "Welding", "lv": "Metināšana"}'::jsonb then
+    raise exception 'a new name is added trimmed beside the others';
+  end if;
+  if util.labels_merge('{"en": "Welding"}'::jsonb, null) is distinct from '{"en": "Welding"}'::jsonb
+     or util.labels_merge('{"en": "Welding"}'::jsonb, 'null'::jsonb) is distinct from '{"en": "Welding"}'::jsonb
+     or util.labels_merge(null, '{"lv": null}'::jsonb) is distinct from '{}'::jsonb then
+    raise exception 'no change leaves the names, and removing from nothing is nothing';
+  end if;
+
+  -- An item's number: a whole number from 1, as a number or as digits.
+  if util.list_number('3'::jsonb) is distinct from 3 or util.list_number('"12"'::jsonb) is distinct from 12
+     or util.list_number('999999999'::jsonb) is distinct from 999999999 then
+    raise exception 'a number and a string of digits are read';
+  end if;
+  for r in select x from unnest(array['0', '-1', '1.5', '3.0', '"03"', '"twelve"', '""', 'null', 'true',
+                                      '[1]', '1000000000', '"1e3"']) x loop
+    if util.list_number(r.x::jsonb) is not null then
+      raise exception 'not a number of any item: %', r.x;
+    end if;
+  end loop;
+  if util.list_number(null) is not null then
+    raise exception 'nothing is no number';
+  end if;
+
   raise notice 'unit.util.sql: ALL ASSERTIONS PASSED';
 end $$;
 

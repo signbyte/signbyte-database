@@ -37,12 +37,37 @@
 -- be is refused rather than stored under a guess. A codeless login is one that
 -- sends no code at all, not one that sends a bad one.
 --
+-- A credential is keyed by `provider` and `idp_sub` together: a handle is unique
+-- only at the provider that issued it, so the same handle from two providers is
+-- two credentials, and, without a code, two people. `provider` is the identifier
+-- of the provider the login came through; the empty provider (also what a login
+-- that names none sends) is the deployment's first one, which holds every
+-- credential stored before providers were told apart. At most 1024 characters.
+--
+-- The card's sign-ins are kept under `webeid`, whatever provider the caller
+-- names: a card sign-in's handle is the holder's code, and kept under any
+-- upstream's provider a codeless sign-in there whose handle is that code would
+-- land on the card holder. So a sign-in by the card's method is stored under
+-- `webeid`, and one under `webeid` must carry its code; one that does not is
+-- refused and nothing is written.
+--
 -- Returns {"internal_sub": "<person id>", "created": <bool>}. `created` is true
 -- only when THIS call inserted the person (the person's first-ever login, by any
 -- method) — detected via the `xmax = 0` upsert idiom on the code path — so the
 -- service records the correct GDPR-audit event (identity created vs updated).
 -- Adding a new method to an existing person is an update, not a create. The
--- profile (the name fields) is refreshed from every login, on both paths.
+-- profile (the name fields) is refreshed from every login, on both paths: a name
+-- field the login carries replaces the stored one, and one it does not carry
+-- leaves the stored one as it is.
+--
+-- `email` is the address a directory sent with a codeless login. It is kept on the
+-- credential and renewed at every login — empty when this login sent none — and
+-- only something shaped like an address is kept: one `@` with text either side, no
+-- space or control character, no invisible character that changes how it reads
+-- where it is shown (a direction mark or override, a zero-width character, a line
+-- or paragraph separator), at most 320 characters. Anything else is kept as
+-- empty and the login goes on; a login is never refused over what its directory
+-- says about an address. A login that carries a code keeps none.
 CREATE OR REPLACE PROCEDURE identity.upsert(pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -50,6 +75,7 @@ SET search_path = identity, util, pg_temp
 AS $$
 DECLARE
     v_idp_sub      text := pi_data->>'idp_sub';
+    v_provider     text := COALESCE(pi_data->>'provider', '');
     -- the national id, where the login carries one; accept either field name
     -- (the service sends `serial_number`), prefer an explicit `national_id`. An
     -- empty string is the absence of a code, the same as a missing field.
@@ -58,12 +84,31 @@ DECLARE
     v_name         text := COALESCE(pi_data->>'name', '');
     v_given_name   text := COALESCE(pi_data->>'given_name', '');
     v_family_name  text := COALESCE(pi_data->>'family_name', '');
+    v_email        text := btrim(COALESCE(pi_data->>'email', ''));
     v_person_sub   text;
     v_created      boolean;
 BEGIN
     IF v_idp_sub IS NULL OR v_idp_sub = '' THEN
         po_data := util.result_error('identity:invalid', 'idp_sub is required');
         RETURN;
+    END IF;
+    IF char_length(v_provider) > 1024 THEN
+        po_data := util.result_error('identity:invalid', 'provider is longer than 1024 characters');
+        RETURN;
+    END IF;
+    IF v_login_method = 'webEid' THEN
+        v_provider := 'webeid';
+    END IF;
+    IF v_provider = 'webeid' AND v_national_id IS NULL THEN
+        po_data := util.result_error('identity:invalid', 'a sign-in kept under the card''s provider carries its identity code');
+        RETURN;
+    END IF;
+
+    IF v_national_id IS NOT NULL
+       OR char_length(v_email) > 320
+       OR v_email !~ '^[^@[:space:][:cntrl:]]+@[^@[:space:][:cntrl:]]+$'
+       OR v_email ~ E'[\\x7F-\\x9F\\u00AD\\u061C\\u180E\\u200B-\\u200F\\u2028-\\u202E\\u2060-\\u206F\\uFEFF]' THEN
+        v_email := '';
     END IF;
 
     IF v_national_id IS NOT NULL THEN
@@ -91,13 +136,13 @@ BEGIN
         INSERT INTO identity.person (national_id, name, given_name, family_name)
         VALUES (v_national_id, v_name, v_given_name, v_family_name)
         ON CONFLICT (national_id) DO UPDATE SET
-            name        = EXCLUDED.name,
-            given_name  = EXCLUDED.given_name,
-            family_name = EXCLUDED.family_name,
+            name        = COALESCE(NULLIF(EXCLUDED.name, ''), identity.person.name),
+            given_name  = COALESCE(NULLIF(EXCLUDED.given_name, ''), identity.person.given_name),
+            family_name = COALESCE(NULLIF(EXCLUDED.family_name, ''), identity.person.family_name),
             updated_at  = now()
         RETURNING person_sub, (xmax = 0) INTO v_person_sub, v_created;
     ELSE
-        -- 1b) No code: resolve by the credential handle.
+        -- 1b) No code: resolve by the credential, the provider with the handle.
         --
         -- Two first logins of the same new handle at the same moment would each
         -- find no credential and each create a person; the second's credential
@@ -110,16 +155,16 @@ BEGIN
 
         SELECT c.person_sub INTO v_person_sub
           FROM identity.credential c
-         WHERE c.idp_sub = v_idp_sub;
+         WHERE c.provider = v_provider AND c.idp_sub = v_idp_sub;
 
         IF v_person_sub IS NOT NULL THEN
             -- A known handle: the same person, profile refreshed exactly as on the
             -- code path. A code the row already holds is left as it is — a login
             -- that carries no code never blanks one.
             UPDATE identity.person
-               SET name        = v_name,
-                   given_name  = v_given_name,
-                   family_name = v_family_name,
+               SET name        = COALESCE(NULLIF(v_name, ''), name),
+                   given_name  = COALESCE(NULLIF(v_given_name, ''), given_name),
+                   family_name = COALESCE(NULLIF(v_family_name, ''), family_name),
                    updated_at  = now()
              WHERE person_sub = v_person_sub;
             v_created := false;
@@ -132,12 +177,13 @@ BEGIN
         END IF;
     END IF;
 
-    -- 2) Link the auth-method credential (idp_sub) to that person.
-    INSERT INTO identity.credential (idp_sub, person_sub, login_method)
-    VALUES (v_idp_sub, v_person_sub, v_login_method)
-    ON CONFLICT (idp_sub) DO UPDATE SET
+    -- 2) Link the auth-method credential (provider, idp_sub) to that person.
+    INSERT INTO identity.credential (provider, idp_sub, person_sub, login_method, email)
+    VALUES (v_provider, v_idp_sub, v_person_sub, v_login_method, v_email)
+    ON CONFLICT (provider, idp_sub) DO UPDATE SET
         person_sub   = EXCLUDED.person_sub,
         login_method = EXCLUDED.login_method,
+        email        = EXCLUDED.email,
         updated_at   = now();
 
     po_data := util.result_success(jsonb_build_object('internal_sub', v_person_sub, 'created', v_created));
@@ -151,7 +197,8 @@ END
 $$;
 
 -- identity.get — read a person by internal `sub` (person id) or by any of their
--- IdP `sub`s / credential handles. Returns the person profile
+-- IdP `sub`s / credential handles, at the provider named by `provider` (none is
+-- the deployment's first). Returns the person profile
 -- (and, when looked up by idp_sub, the matched credential's handle + method), or
 -- identity:not_found.
 CREATE OR REPLACE PROCEDURE identity.get(pi_data jsonb, INOUT po_data jsonb)
@@ -174,7 +221,8 @@ BEGIN
     IF v_internal_sub IS NOT NULL AND v_internal_sub <> '' THEN
         SELECT * INTO v_person FROM identity.person WHERE person_sub = v_internal_sub;
     ELSE
-        SELECT * INTO v_cred FROM identity.credential WHERE idp_sub = v_idp_sub;
+        SELECT * INTO v_cred FROM identity.credential
+         WHERE provider = COALESCE(pi_data->>'provider', '') AND idp_sub = v_idp_sub;
         IF FOUND THEN
             SELECT * INTO v_person FROM identity.person WHERE person_sub = v_cred.person_sub;
         END IF;
@@ -272,11 +320,72 @@ EXCEPTION
 END
 $$;
 
+-- identity.sign_in_lines — what names each of a list of people, for a screen that
+-- tells two people of one name apart, without handing it anybody's code.
+--
+-- For each person the store knows, one line: `signsIn` (whether any credential
+-- can sign in as them), `email` where a credential holds one (the most recently
+-- renewed), and `country` and `length` where the person holds a code — the country
+-- the code was issued in and how many characters the code has as a person is shown
+-- it, so a screen can draw it hidden at its true width. The code itself is never
+-- in a line; showing it is a separate, recorded act. A person the store does not
+-- know is left out. At most 500 people per read; every entry must be a person id
+-- of the platform's shape, and a refusal never echoes what was sent.
+--
+-- Returns {"lines": [{"sub", "signsIn", "email"?, "country"?, "length"?}]}.
+CREATE OR REPLACE PROCEDURE identity.sign_in_lines(pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = identity, util, pg_temp
+AS $$
+DECLARE
+    v_subs  jsonb := pi_data->'subs';
+    v_lines jsonb;
+BEGIN
+    IF v_subs IS NULL OR jsonb_typeof(v_subs) <> 'array' THEN
+        po_data := util.result_error('identity:invalid', 'subs must be a list of person ids');
+        RETURN;
+    END IF;
+    IF jsonb_array_length(v_subs) > 500 THEN
+        po_data := util.result_error('identity:invalid', 'at most 500 person ids per read');
+        RETURN;
+    END IF;
+    IF EXISTS (SELECT 1 FROM jsonb_array_elements(v_subs) s
+                WHERE jsonb_typeof(s) <> 'string' OR s #>> '{}' !~ '^[0-9A-HJKMNP-TV-Z]{26}$') THEN
+        po_data := util.result_error('identity:invalid', 'every entry must be a person id');
+        RETURN;
+    END IF;
+
+    SELECT COALESCE(jsonb_agg(
+               jsonb_strip_nulls(jsonb_build_object(
+                   'sub',     p.person_sub,
+                   'signsIn', EXISTS (SELECT 1 FROM identity.credential c WHERE c.person_sub = p.person_sub),
+                   'email',   (SELECT c.email FROM identity.credential c
+                                WHERE c.person_sub = p.person_sub AND c.email <> ''
+                                ORDER BY c.updated_at DESC, c.idp_sub LIMIT 1),
+                   'country', CASE WHEN p.national_id IS NOT NULL THEN substring(p.national_id FROM 4 FOR 2) END,
+                   'length',  CASE WHEN p.national_id IS NOT NULL THEN char_length(util.identity_display(p.national_id)) END))
+               ORDER BY p.person_sub), '[]'::jsonb)
+      INTO v_lines
+      FROM identity.person p
+     WHERE p.person_sub IN (SELECT s #>> '{}' FROM jsonb_array_elements(v_subs) s);
+
+    po_data := util.result_success(jsonb_build_object('lines', v_lines));
+EXCEPTION
+    WHEN SQLSTATE 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('identity:lines_failed', SQLERRM) USING ERRCODE = 'P0001';
+END
+$$;
+
 
 -- EXECUTE-only: revoke from PUBLIC, grant only to the service role.
-REVOKE ALL ON PROCEDURE identity.upsert(jsonb, jsonb)   FROM PUBLIC;
-REVOKE ALL ON PROCEDURE identity.get(jsonb, jsonb)      FROM PUBLIC;
-REVOKE ALL ON PROCEDURE identity.register(jsonb, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON PROCEDURE identity.upsert(jsonb, jsonb)   TO authbyte_public;
-GRANT EXECUTE ON PROCEDURE identity.get(jsonb, jsonb)      TO authbyte_public;
-GRANT EXECUTE ON PROCEDURE identity.register(jsonb, jsonb) TO authbyte_public;
+REVOKE ALL ON PROCEDURE identity.upsert(jsonb, jsonb)         FROM PUBLIC;
+REVOKE ALL ON PROCEDURE identity.get(jsonb, jsonb)            FROM PUBLIC;
+REVOKE ALL ON PROCEDURE identity.register(jsonb, jsonb)       FROM PUBLIC;
+REVOKE ALL ON PROCEDURE identity.sign_in_lines(jsonb, jsonb)  FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE identity.upsert(jsonb, jsonb)        TO authbyte_public;
+GRANT EXECUTE ON PROCEDURE identity.get(jsonb, jsonb)           TO authbyte_public;
+GRANT EXECUTE ON PROCEDURE identity.register(jsonb, jsonb)      TO authbyte_public;
+GRANT EXECUTE ON PROCEDURE identity.sign_in_lines(jsonb, jsonb) TO authbyte_public;
