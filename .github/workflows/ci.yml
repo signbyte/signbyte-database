@@ -90,9 +90,13 @@ jobs:
           exit 0
         fi
         rc=0
+        # A versioned migration is migrations/<location>/V<n>__<what>.sql, the only
+        # shape the runner applies. A test fixture named for the version it tests
+        # (migrations/testing/fixtures/<location>/V<n>.seed.sql) is never applied, and
+        # changes when a later version changes what it can assert.
         for base in $bases; do
           changed=$(git diff --diff-filter=MD --name-only "$base" "${{ github.sha }}" -- migrations/ \
-                    | grep -E '/V[0-9][^/]*\.sql$' || true)
+                    | grep -E '^migrations/[^/]+/V[0-9]+__[^/]*\.sql$' || true)
           if [ -n "$changed" ]; then
             echo "::error::Modifying or deleting an already-applied versioned migration is not allowed — add a NEW V*.sql instead. Offending file(s) since ${base}:"
             echo "$changed"
@@ -138,14 +142,13 @@ jobs:
     # Report-only: the base is the upstream Flyway image we do not rebuild, so a
     # base finding surfaces here without blocking. Promote to a blocking gate
     # (exit-code 1) once a hardened base is chosen.
+    # The scanner runs from its own image, pinned by version and digest: the setup action's install script
+    # downloads the binary from a host that does not resolve, so a runner with no cached binary cannot install it.
     - name: Trivy scan (report-only)
-      uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-      with:
-        # The scanner itself, pinned: the action's own default lags its releases.
-        version: v0.74.0
-        image-ref: ${{ env.IMAGE }}:${{ github.sha }}
-        severity: HIGH,CRITICAL
-        exit-code: '0'
+      run: |
+        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+          aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c \
+          image --severity HIGH,CRITICAL --exit-code 0 --no-progress "${{ env.IMAGE }}:${{ github.sha }}"
 
     - name: Login to ghcr.io
       uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0

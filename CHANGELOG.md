@@ -4,6 +4,143 @@ Notable changes to the signbyte database — the schema set and the migration im
 newest first, per release. Written for whoever applies the image to a database or
 integrates against the procedures.
 
+## v0.4.0
+
+### Added — e-signing: the `legacyEid` signing flow
+
+Two migrations, `envelope/V10` and `signflow/V7`, each drop and re-add one `CHECK` (`ck_slot_flow`,
+`ck_signing_job_flow`) with `legacyEid` beside every name stored before: a scan of the table under a brief lock,
+nothing rewritten. `envelope.add_slot`, `signing.save_job` and `signing.insert_signature` accept it: the eID card
+signed in the person's browser through the eParaksts provider's own plugin. **Apply before** a signing service that
+writes `legacyEid`, which the older schema refuses (`invalid flow`); nothing changes for a deployment that does not
+offer the flow.
+
+### Changed — rolebyte: assistants, each one person's own
+
+Two migrations, `rolebyte/V20` and `rolebyte/V21`. `rolebyte.assistant_person` keeps the one person an assistant (a
+machine member keyed `svc:assistant-<ULID>`) works for, and an assistant's name is unique in its tenant among those
+not removed, ignoring case. New procedures: `assistant_create` (for one active person of the tenant; the assistant
+starts in the shipped **Assistant** role, made with the tenant's first assistant), `assistant_rename`,
+`assistant_person_set`, `assistant_list` and `assistants_of_person` (the sign-in service's lookup).
+`permission_declare` accepts the seed `assistant`. **Apply with rolebyte v0.3.0 or later**, which declares that seed.
+
+### Added — rolebyte: names in other languages, a person's own language and an administrator's note
+
+- `rolebyte/V17`: tenant roles, user types and chart positions gain `labels`, their names in the app's other
+  languages. Empty for every existing one, so nothing anybody reads changes until a name is given.
+- `rolebyte/V18`: a person's own language, one row per person keyed by their platform subject and the same in every
+  tenant, read and set with `person_language_get` and `person_language_set` (none set: the deployment's language).
+- `rolebyte/V19`: an administrator's note on a member, up to 1000 characters, set with `user_note_set`; the history
+  records that a note changed, never its words.
+
+### Added — util: names in other languages for configured lists
+
+`util/V4` adds `util.app_languages`, `util.labels_merge`, `util.labels_refusal` and `util.list_number`: the helpers
+every configured list's procedures use to check its names in the app's other languages and to number its items.
+
+### Changed — identity: every sign-in is kept under the provider it came from
+
+- `identity/V4`: a credential keeps the email address its directory sent, renewed at each sign-in. It is shown,
+  never matched on; a card or a mobile identity keeps none.
+- `identity/V5`: a credential is keyed by its provider and its handle together, since a handle is unique only at the
+  provider that issued it. Every credential stored before keeps the empty provider, the deployment's one provider.
+- `identity/V6`: card sign-ins move under a provider of their own, `webeid`; where a newer sign-in service already
+  wrote the same card's credential there, the older duplicate is removed.
+- **Apply with a sign-in service that names its providers** (authbyte v0.7.0 or later).
+
+### Changed — rolebyte: only the deployment writes the list of services, an import keeps the workspace's name and login, a workspace and one person's history can be read, and revoked people leave the chart
+
+One new migration, `rolebyte/V16`: two indexes on `rolebyte.event`, and every person whose access was revoked taken
+out of their chart position with one `chartPersonRemoved` line each (touches only those rows). **Apply with the
+rolebyte service of the same date**, whose one-time bootstrap door calls the new `own_rung_register`.
+
+- **Operators: register services, roles and permissions as the location's owner.** `service_register`,
+  `role_define` and `permission_declare` are no longer executable by `rolebyte_public`; the list every tenant of a
+  deployment shares is written only by the deployment (`permissions_register` or the three procedures, as owner).
+- New `rolebyte.tenant_get` (a workspace's name and the entitlements in force) and `rolebyte.own_rung_register`
+  (the register's own administrator rung, naming nothing else), both granted to `rolebyte_public`.
+- `config_section` no longer carries the workspace's name or corporate login; `config_apply` compares a document
+  with the list and never writes it — entries `unchanged` or `skipped`, a file's name and login answered as a
+  `workspace` list of `skipped` items.
+- `history` takes `actor` (a typed key, or `operator` for whoever runs the deployment); `user_revoke` also takes
+  the person out of the chart.
+
+### Changed — rolebyte records the day each member last signed in, its people read names each member's user type, and its history reads a page at a time
+
+One new migration, `rolebyte/V15`, adds a nullable date column to `rolebyte.user_account` (no rewrite, a brief
+lock); three procedures change behaviour. **Apply with the rolebyte service of the same date.**
+
+- `rolebyte.resolve` reads a new optional input, `issuing` (a JSON boolean). With `issuing: true` it writes the day
+  (UTC) on each membership it answers, at most once a day per membership, skipping a row another session holds
+  locked; without it nothing is written. Its answer is unchanged and it writes no event.
+- `rolebyte.access_list` gives each member `userType` (`{id, name}`), `chartUserType` (the chart position's type while
+  the tenant has the chart, else `null`) and `lastSignedInOn` (`"YYYY-MM-DD"` or `null`). `arrival` now also needs
+  the user type in force to hold nothing and no chart position carrying a box.
+- `rolebyte.history` answers newest first, a page at a time, with `more`: `limit` (100 by default, at most 500),
+  `before` (an event id of the same tenant) and `kindPrefix` beside `service`, `from` and `to`. A bad `limit` or
+  `before` is `membership:invalid`. It used to answer up to 1,000 events oldest first.
+
+### Changed — rolebyte's configuration section answers the whole contract, and records every import and export
+
+No migration and no table changes; the repeatable procedures change, and two of them answer a different shape.
+**Apply with the rolebyte service of the same date**, and switch any deployment script that registers the
+services' permissions through `config_apply` in the same change.
+
+- `rolebyte.config_get` answers `{section, version}` instead of the section itself. The section carries
+  `"schema": "rolebyte-config/1"` and, on each permission a new tenant's roles start with, its `seeds`, so a section
+  read back and applied changes nothing. The version is `util.config_token('rolebyte-config/1', tenant, section)`.
+- `rolebyte.config_version` (new, granted to the register's role) answers the version alone. The vocabulary is
+  every tenant's, so a vocabulary change moves every tenant's version.
+- `rolebyte.config_apply` requires the schema, reads `dryRun`, `expectedVersion`, `partHash` and `documentHash`,
+  needs `expectedVersion` for a writing apply (`config_version_required`) and compares it under one lock for the
+  whole deployment (`config_version_moved`). A preview and an apply are one pass, undone for a preview or when an
+  item is refused, and **a refused item is a line of the report, not an error**; a changed class or plane is
+  `config_key_conflict` (was `conflict`). An apply that was not refused writes one `configApplied` line in the
+  tenant's history with the counts, the part's hash and the document's.
+- `rolebyte.config_exported` (new, granted to the register's role) writes one `configExported` line naming who took
+  the section out and the part's hash.
+- `rolebyte.permissions_register` (new, granted to nobody) is how a deployment registers the permissions each
+  service prints, as the location's owner: no tenant, no version, no history line, and one refused entry writes
+  nothing.
+- `rolebyte.permission_declare` also answers `changes`, the members a declaration changed.
+
+### Added — one helper for a configuration's version
+
+Migration `util/V3` adds `util.config_token(schema, scope, section)`, a pure function that computes the version token
+of a section of configuration (`sha256:` and the hex SHA-256 of the schema name, the scope and the section's text). It
+creates no table, writes no row and is granted to no service role. Every deployment records one more applied
+migration in `flyway_schema_history_util`; nothing else changes.
+
+### Added — an organisation chart, and a user type for every member
+
+Migration `V14` adds three tables to `rolebyte` — `chart_position` (a tree of positions, one top per tenant),
+`chart_holder` (a member in a position, at most one each) and `chart_position_permission` — accepts a third plane,
+`chart`, on `rolebyte.service_permission`, and adds `rolebyte.tenant.default_user_type_id`. **It rewrites every
+`rolebyte.user_account` row once:** each tenant gains a user type named *Member*, holding nothing (an existing type of
+that name, in any letter case, is adopted instead), every member without a type receives it with the source
+`workspaceDefault`, and `user_type_id` and `user_type_source` then become NOT NULL, with one event written per member
+given the type. Run it in a quiet window on a large register.
+
+A permission declared on the `chart` plane is carried by a position, never by a role or a user type
+(`rolebyte.tenant_role_permissions_set` refuses one with `membership:invalid`), must be ordinary in class and seeds no
+role. Ten new procedures, granted to the register's own role, edit and read the chart: `chart_get`, `chart_document`
+(for each member in a position, the subject keys of everyone in a position below theirs), `chart_position_add`,
+`_rename`, `_move`, `_remove`, `_permissions_set`, `_user_type_set`, `chart_person_place` and `chart_person_remove`.
+The chart is in force for a tenant only while it is entitled to the service key `authority`: until then a write is
+refused with `membership:conflict`, `chart_document` answers an empty chart, and **a deployment that never entitles it
+behaves exactly as before, apart from the user type below.** While it is in force, `rolebyte.resolve` adds a
+position's chart permissions to its members' scopes, and a member in a position that names a user type receives that
+type's permissions in place of their own. An administrator's scopes never include a chart permission.
+
+### Changed — every member holds a user type
+
+`rolebyte.tenant_open`, `user_invite`, `directory_admit` and the administrator seed give every arriving member the
+tenant's default user type (the corporate-login default still wins for people arriving through the tenant's
+directory). `rolebyte.user_type_assign` refuses an empty type with `membership:invalid`: a type is changed, never taken
+away. `rolebyte.user_type_delete` refuses the default and a type a chart position names with `membership:conflict`,
+and `user_type_list` marks the default with `workspaceDefault`. A caller that took a member's type away by sending an
+empty one must stop doing so before applying this image.
+
 ## v0.3.0
 
 ### Added — a family of permissions, one per field

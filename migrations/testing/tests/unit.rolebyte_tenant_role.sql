@@ -429,6 +429,24 @@ BEGIN
        OR (SELECT r->'permissions' FROM jsonb_array_elements(v->'roles') r WHERE r->>'id' = v_other) IS DISTINCT FROM '[]'::jsonb THEN
         RAISE EXCEPTION 'tenant A lists its two remaining roles by name: %', v;
     END IF;
+    -- The roles the tenant was opened with carry their seed, so a screen can tell them from the ones it made.
+    IF (SELECT count(*) FROM jsonb_array_elements(v->'roles') r
+         WHERE r->>'seed' IN ('guest', 'worker', 'manager')) IS DISTINCT FROM
+       (SELECT count(*) FROM rolebyte.tenant_role WHERE tenant_id = v_ta AND seed <> '')
+       OR (SELECT count(*) FROM rolebyte.tenant_role WHERE tenant_id = v_ta AND seed <> '') < 3
+       OR (SELECT r->>'seed' FROM jsonb_array_elements(v->'roles') r WHERE r->>'id' = v_other) IS DISTINCT FROM '' THEN
+        RAISE EXCEPTION 'the list says which roles the tenant was opened with, and a made one has no seed: %', v;
+    END IF;
+    -- A role the tenant was opened with is never deleted, though nobody holds it; it survives, ticks and all.
+    v_msg := pg_temp.refused('tenant_role_delete', jsonb_build_object('actor', 'adm-a', 'tenantId', v_ta,
+        'roleId', (SELECT id FROM rolebyte.tenant_role WHERE tenant_id = v_ta AND seed = 'guest')),
+        'membership:conflict', 'deleting the role the tenant was opened with as its Guest');
+    IF v_msg NOT LIKE '%came with the workspace%'
+       OR NOT EXISTS (SELECT 1 FROM rolebyte.tenant_role WHERE tenant_id = v_ta AND seed = 'guest')
+       OR EXISTS (SELECT 1 FROM rolebyte.event WHERE tenant_id = v_ta AND kind = 'tenantRoleDeleted'
+                   AND payload->>'roleId' = (SELECT id FROM rolebyte.tenant_role WHERE tenant_id = v_ta AND seed = 'guest')) THEN
+        RAISE EXCEPTION 'a shipped role is refused with its reason, stays, and leaves no delete line: %', v_msg;
+    END IF;
     PERFORM pg_temp.refused('tenant_role_list', '{}'::jsonb, 'membership:invalid', 'a list with no tenant');
     PERFORM pg_temp.refused('tenant_role_list', jsonb_build_object('tenantId', util.generate_ulid()),
         'tenant:not_found', 'a list of an unknown tenant');

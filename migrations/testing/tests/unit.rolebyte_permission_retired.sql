@@ -104,17 +104,17 @@ BEGIN
         'permissions', '["rtsvc/task:view", "rtsvc/task:edit"]'::jsonb), 'tick two boxes');
     PERFORM pg_temp.ok('tenant_role_grant', jsonb_build_object('actor', v_s[1], 'tenantId', v_tenant, 'userId', v_toms, 'roleId', v_worker), 'grant Darbinieks');
 
-    -- 1. The service retires task:edit through its configuration document; the
-    --    second apply of the same document changes nothing and records nothing.
+    -- 1. The service retires task:edit in the list it prints, which the deployment
+    --    registers; registering the same list again changes nothing and records nothing.
     v_doc := '{"services":[{"key":"rtsvc","displayName":"Work","roles":[],"permissions":[
         {"feature":"task","act":"view","class":"ordinary","plane":"object"},
         {"feature":"task","act":"edit","class":"ordinary","plane":"object","retired":true},
         {"feature":"project","act":"create","class":"ordinary","plane":"tenant"}]}]}';
-    v := pg_temp.ok('config_apply', jsonb_build_object('tenantId', v_tenant, 'actor', 'retired-test', 'section', v_doc), 'retire by document');
-    IF (SELECT e->>'status' FROM jsonb_array_elements(v->'permissions') e WHERE e->>'permission' = 'rtsvc/task:edit')
+    v := pg_temp.ok('permissions_register', jsonb_build_object('actor', 'retired-test', 'section', v_doc), 'retire by registration');
+    IF (SELECT e->>'status' FROM jsonb_array_elements(v->'permissions') e WHERE e->>'key' = 'rtsvc/task:edit')
        IS DISTINCT FROM 'changed'
        OR EXISTS (SELECT 1 FROM jsonb_array_elements(v->'permissions') e
-                   WHERE e->>'permission' <> 'rtsvc/task:edit' AND e->>'status' <> 'unchanged') THEN
+                   WHERE e->>'key' <> 'rtsvc/task:edit' AND e->>'status' <> 'unchanged') THEN
         RAISE EXCEPTION 'retiring one permission should change exactly it: %', v;
     END IF;
     IF (SELECT retired_at FROM rolebyte.service_permission
@@ -125,21 +125,22 @@ BEGIN
                     AND payload->>'permission' = 'rtsvc/task:edit' AND actor = 'retired-test') THEN
         RAISE EXCEPTION 'retiring must land in the event stream, attributed';
     END IF;
-    v := pg_temp.ok('config_apply', jsonb_build_object('tenantId', v_tenant, 'actor', 'retired-test', 'section', v_doc), 'apply again');
+    v := pg_temp.ok('permissions_register', jsonb_build_object('actor', 'retired-test', 'section', v_doc), 'register again');
     IF EXISTS (SELECT 1 FROM jsonb_array_elements(v->'permissions') e WHERE e->>'status' <> 'unchanged') THEN
-        RAISE EXCEPTION 'the second apply of the same document should change nothing: %', v;
+        RAISE EXCEPTION 'the second registration of the same list should change nothing: %', v;
     END IF;
     IF (SELECT count(*) FROM rolebyte.event WHERE kind = 'permissionRetired' AND payload->>'permission' = 'rtsvc/task:edit') <> 1 THEN
-        RAISE EXCEPTION 'the second apply must record nothing';
+        RAISE EXCEPTION 'the second registration must record nothing';
     END IF;
 
     --    The export says so, and reads back as unchanged.
     v := pg_temp.ok('config_get', jsonb_build_object('tenantId', v_tenant), 'export');
-    IF (SELECT p->'retired' FROM jsonb_array_elements(v->'services') s, jsonb_array_elements(s->'permissions') p
+    IF (SELECT p->'retired' FROM jsonb_array_elements(v->'section'->'services') s, jsonb_array_elements(s->'permissions') p
          WHERE s->>'key' = 'rtsvc' AND p->>'feature' = 'task' AND p->>'act' = 'edit') IS DISTINCT FROM 'true'::jsonb THEN
         RAISE EXCEPTION 'the export should carry the retired mark: %', v;
     END IF;
-    v := pg_temp.ok('config_apply', jsonb_build_object('tenantId', v_tenant, 'actor', 'retired-test', 'section', v), 'round trip');
+    v := pg_temp.ok('config_apply', jsonb_build_object('tenantId', v_tenant, 'actor', 'retired-test',
+        'section', v->'section', 'expectedVersion', v->'version'), 'round trip');
     IF EXISTS (SELECT 1 FROM jsonb_array_elements(v->'permissions') e WHERE e->>'status' <> 'unchanged') THEN
         RAISE EXCEPTION 'the export applied back should change nothing: %', v;
     END IF;

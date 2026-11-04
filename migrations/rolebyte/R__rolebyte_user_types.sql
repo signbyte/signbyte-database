@@ -7,9 +7,10 @@
 -- declared beside their permissions (`seeds`), so the register names no
 -- service's permission here, and a deployment whose services declare none
 -- opens its tenants with no roles at all, as before. Named in the deployment's
--- language — English unless the call says Latvian — and changed or deleted by
--- the tenant like any other role afterwards. A helper for tenant_open; no
--- service may call it.
+-- language — English unless the call says Latvian — with the shipped name in
+-- the app's other language beside it (`labels`), and changed or deleted by the
+-- tenant like any other role afterwards. A helper for tenant_open; no service
+-- may call it.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION rolebyte.seed_roles(p_actor text, p_tenant text, p_language text)
 RETURNS jsonb
@@ -17,50 +18,72 @@ LANGUAGE plpgsql
 SET search_path = rolebyte, util, pg_temp
 AS $$
 DECLARE
-    v_seed  record;
-    v_id    text;
-    v_made  jsonb := '[]'::jsonb;
+    v_seed   record;
+    v_id     text;
+    v_labels jsonb;
+    v_made   jsonb := '[]'::jsonb;
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM rolebyte.service_permission
                     WHERE seeds <> '{}'::text[] AND retired_at IS NULL) THEN
         RETURN v_made;
     END IF;
 
+    -- Held as every act naming the tenant's roles holds it, so what is read
+    -- below is not overtaken by a role an administrator names meanwhile.
+    PERFORM 1 FROM rolebyte.tenant WHERE id = p_tenant FOR UPDATE;
+
     FOR v_seed IN
-        SELECT s.seed, s.name, s.description
-          FROM (VALUES
+        WITH shipped(seed, lang, name, description) AS (VALUES
             ('guest', 'en', 'Guest', 'Holds nothing. What a person has until somebody places them.'),
             ('worker', 'en', 'Worker', 'Adds tasks, moves the ones assigned to them, and sees only their own hours; in the Asset register only the equipment handed to them, in Workforce only their own record.'),
             ('manager', 'en', 'Manager', 'Everything where they are placed, including who is on it.'),
             ('guest', 'lv', 'Viesis', 'Nedod neko; tas ir cilvēkam, līdz kāds viņu kaut kur pievieno.'),
             ('worker', 'lv', 'Darbinieks', 'Pievieno uzdevumus, virza sev piešķirtos un redz tikai savas stundas; Iekārtu reģistrā tikai sev nodotās iekārtas, Darbaspēkā tikai savu ierakstu.'),
             ('manager', 'lv', 'Vadītājs', 'Visu tur, kur ir pievienots, arī to, kas tur ir.')
-          ) AS s(seed, lang, name, description)
+        )
+        SELECT s.seed, s.name, s.description,
+               COALESCE((SELECT jsonb_object_agg(o.lang, o.name)
+                           FROM shipped o
+                          WHERE o.seed = s.seed AND o.lang <> s.lang
+                            AND o.lang = ANY (util.app_languages())), '{}'::jsonb) AS labels
+          FROM shipped s
          WHERE s.lang = CASE WHEN p_language = 'lv' THEN 'lv' ELSE 'en' END
          ORDER BY CASE s.seed WHEN 'guest' THEN 1 WHEN 'worker' THEN 2 ELSE 3 END
     LOOP
-        -- A tenant keeps what it has: a shipped role it already holds, or a name
-        -- it already uses for a role of its own, is left alone.
+        -- A tenant keeps what it has: a shipped role it already holds, or a name it
+        -- already uses for a role of its own — as a role's name, or as what one of
+        -- its roles reads in any language the app speaks — is left alone.
         IF EXISTS (SELECT 1 FROM rolebyte.tenant_role r
                     WHERE r.tenant_id = p_tenant
-                      AND (r.seed = v_seed.seed OR lower(r.name) = lower(v_seed.name))) THEN
+                      AND (r.seed = v_seed.seed OR lower(r.name) = lower(v_seed.name)))
+           OR rolebyte.tenant_role_reads_alike(p_tenant, NULL, v_seed.name, '{}'::jsonb) IS NOT NULL THEN
             CONTINUE;
         END IF;
 
+        -- The shipped name in the other language goes beside it, unless one of the
+        -- tenant's own roles already reads so in that language: then the shipped
+        -- role reads its name as entered there too, and the tenant's own role
+        -- keeps the word.
+        v_labels := v_seed.labels;
+        IF rolebyte.tenant_role_reads_alike(p_tenant, NULL, v_seed.name, v_labels) IS NOT NULL THEN
+            v_labels := '{}'::jsonb;
+        END IF;
+
         v_id := util.generate_ulid();
-        INSERT INTO rolebyte.tenant_role (id, tenant_id, name, description, seed)
-        VALUES (v_id, p_tenant, v_seed.name, v_seed.description, v_seed.seed);
+        INSERT INTO rolebyte.tenant_role (id, tenant_id, name, labels, description, seed)
+        VALUES (v_id, p_tenant, v_seed.name, v_labels, v_seed.description, v_seed.seed);
 
         INSERT INTO rolebyte.tenant_role_permission (tenant_role_id, permission_id)
         SELECT v_id, sp.id
           FROM rolebyte.service_permission sp
          WHERE v_seed.seed = ANY (sp.seeds) AND sp.retired_at IS NULL;
 
-        -- The event carries what the role was given, so the history alone
-        -- rebuilds it, exactly as a defined role and its reconfigurations do.
+        -- The event carries what the role was given, its names included, so the
+        -- history alone rebuilds it, exactly as a defined role and its
+        -- reconfigurations do.
         INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
         VALUES (util.generate_ulid(), p_actor, p_tenant, 'tenantRoleSeeded',
-                jsonb_build_object('roleId', v_id, 'seed', v_seed.seed, 'name', v_seed.name,
+                jsonb_build_object('roleId', v_id, 'seed', v_seed.seed, 'name', v_seed.name, 'labels', v_labels,
                                    'permissions', COALESCE((
                                        SELECT jsonb_agg(sp.service_key || '/' || sp.feature_key || ':' || sp.act
                                                         ORDER BY sp.service_key, sp.feature_key, sp.act)
@@ -68,7 +91,7 @@ BEGIN
                                          JOIN rolebyte.service_permission sp ON sp.id = t.permission_id
                                         WHERE t.tenant_role_id = v_id), '[]'::jsonb)));
 
-        v_made := v_made || jsonb_build_object('id', v_id, 'seed', v_seed.seed, 'name', v_seed.name);
+        v_made := v_made || jsonb_build_object('id', v_id, 'seed', v_seed.seed, 'name', v_seed.name, 'labels', v_labels);
     END LOOP;
 
     RETURN v_made;
@@ -107,7 +130,8 @@ BEGIN
     END IF;
 
     v_made := rolebyte.seed_roles(v_actor, v_tenant, NULLIF(btrim(pi_data->>'language'), ''));
-    SELECT COALESCE(jsonb_agg(jsonb_build_object('id', r.id, 'seed', r.seed, 'name', r.name) ORDER BY r.seed), '[]'::jsonb)
+    SELECT COALESCE(jsonb_agg(jsonb_build_object('id', r.id, 'seed', r.seed, 'name', r.name, 'labels', r.labels)
+                              ORDER BY r.seed), '[]'::jsonb)
       INTO v_left
       FROM rolebyte.tenant_role r
      WHERE r.tenant_id = v_tenant AND r.seed <> ''
@@ -131,6 +155,118 @@ REVOKE ALL ON PROCEDURE rolebyte.tenant_seed_roles(jsonb, jsonb) FROM PUBLIC;
 -- User types: a named set of the tenant's tenant-wide permissions, given to a
 -- person across the tenant. Every act is the tenant administrator's.
 -- ---------------------------------------------------------------------------
+
+-- user_type_reads_alike — the first language the app speaks in which another of
+-- the tenant's user types reads the same as a type named `p_name`, with these
+-- names in other languages, would; NULL when there is none. As for roles: what a
+-- reader sees is the name in their language where one was given and the name as
+-- entered otherwise, compared ignoring case; the type itself (`p_type`, NULL for
+-- a new one) is never compared with itself. Only right while the caller holds
+-- the tenant's row, which every act naming the tenant's user types takes first.
+--
+-- Answers {"language", "name"}: the language and the other type's name as
+-- entered, which a refusal names.
+CREATE OR REPLACE FUNCTION rolebyte.user_type_reads_alike(p_tenant text, p_type text, p_name text, p_labels jsonb)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+SET search_path = rolebyte, util, pg_temp
+AS $$
+    SELECT jsonb_build_object('language', l.lang, 'name', t.name)
+      FROM unnest(util.app_languages()) WITH ORDINALITY AS l(lang, n)
+      JOIN rolebyte.user_type t
+        ON t.tenant_id = p_tenant
+       AND t.id IS DISTINCT FROM p_type
+       AND lower(COALESCE(t.labels->>l.lang, t.name)) = lower(COALESCE(p_labels->>l.lang, p_name))
+     ORDER BY l.n, t.name
+     LIMIT 1;
+$$;
+REVOKE ALL ON FUNCTION rolebyte.user_type_reads_alike(text, text, text, jsonb) FROM PUBLIC;
+
+-- ensure_default_user_type — the tenant's default user type, made when it has
+-- none: named Member (Dalībnieks in Latvian) in the language asked, with the
+-- other beside it (`labels`), holding nothing. Every member holds a user type,
+-- so every arrival receives this one unless a lane names another. A tenant that
+-- already has a type of that name — as its name, or as what it reads in any
+-- language the app speaks — adopts it as its default rather than making a
+-- second, and the name in the other language is left off when another of the
+-- tenant's types already reads so in that language: an arrival is never
+-- refused for it, and no two types are made to read alike. Answers the
+-- default's id. A helper for the procedures that admit a member; no service may
+-- call it.
+CREATE OR REPLACE FUNCTION rolebyte.ensure_default_user_type(p_actor text, p_tenant text, p_language text)
+RETURNS text
+LANGUAGE plpgsql
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_id     text;
+    v_name   text := CASE WHEN p_language = 'lv' THEN 'Dalībnieks' ELSE 'Member' END;
+    v_other  jsonb := CASE WHEN p_language = 'lv' THEN jsonb_build_object('en', 'Member')
+                           ELSE jsonb_build_object('lv', 'Dalībnieks') END;
+    v_labels jsonb;
+    v_desc   text  := CASE WHEN p_language = 'lv'
+                        THEN 'Nedod neko. Tas ir katrs dalībnieks, līdz kāds viņam piešķir citu.'
+                        ELSE 'Holds nothing. What every member is until somebody gives them another.' END;
+BEGIN
+    SELECT default_user_type_id INTO v_id FROM rolebyte.tenant WHERE id = p_tenant FOR UPDATE;
+    IF v_id IS NOT NULL THEN
+        RETURN v_id;
+    END IF;
+
+    SELECT t.id INTO v_id
+      FROM rolebyte.user_type t
+     WHERE t.tenant_id = p_tenant
+       AND (lower(t.name) = lower(v_name)
+            OR EXISTS (SELECT 1 FROM unnest(util.app_languages()) AS l(lang)
+                        WHERE lower(COALESCE(t.labels->>l.lang, t.name)) = lower(v_name)))
+     ORDER BY lower(t.name) = lower(v_name) DESC, t.created_at, t.id
+     LIMIT 1;
+    IF v_id IS NULL THEN
+        SELECT COALESCE(jsonb_object_agg(e.key, e.value), '{}'::jsonb) INTO v_labels
+          FROM jsonb_each(v_other) e
+         WHERE e.key = ANY (util.app_languages());
+        IF rolebyte.user_type_reads_alike(p_tenant, NULL, v_name, v_labels) IS NOT NULL THEN
+            v_labels := '{}'::jsonb;
+        END IF;
+        v_id := util.generate_ulid();
+        INSERT INTO rolebyte.user_type (id, tenant_id, name, labels, description)
+        VALUES (v_id, p_tenant, v_name, v_labels, v_desc);
+        INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
+        VALUES (util.generate_ulid(), p_actor, p_tenant, 'userTypeDefined',
+                jsonb_build_object('userTypeId', v_id) || rolebyte.user_type_state(v_id));
+    END IF;
+    UPDATE rolebyte.tenant SET default_user_type_id = v_id WHERE id = p_tenant;
+    INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
+    VALUES (util.generate_ulid(), p_actor, p_tenant, 'defaultUserTypeSet',
+            jsonb_build_object('userTypeId', v_id, 'from', ''));
+
+    RETURN v_id;
+END;
+$$;
+REVOKE ALL ON FUNCTION rolebyte.ensure_default_user_type(text, text, text) FROM PUBLIC;
+
+-- effective_user_type — the user type that applies to a member now: the type of
+-- the position they sit in when that position names one and the tenant is
+-- entitled to the chart, and their own otherwise. A lapse of the entitlement,
+-- or leaving the position, returns them to the type an administrator (or their
+-- arrival) gave them; nothing is overwritten.
+CREATE OR REPLACE FUNCTION rolebyte.effective_user_type(p_tenant text, p_user text)
+RETURNS text
+LANGUAGE sql
+STABLE
+SET search_path = rolebyte, pg_temp
+AS $$
+    SELECT COALESCE(
+        (SELECT p.user_type_id
+           FROM rolebyte.chart_holder h
+           JOIN rolebyte.chart_position p ON p.tenant_id = h.tenant_id AND p.id = h.position_id
+          WHERE h.tenant_id = p_tenant AND h.user_id = p_user
+            AND p.user_type_id IS NOT NULL
+            AND rolebyte.chart_entitled(p_tenant)),
+        (SELECT u.user_type_id FROM rolebyte.user_account u WHERE u.tenant_id = p_tenant AND u.id = p_user));
+$$;
+REVOKE ALL ON FUNCTION rolebyte.effective_user_type(text, text) FROM PUBLIC;
 
 -- user_type_permissions — the permission ids a list of names resolves to, or
 -- NULL when one of them is not an ordinary tenant-wide permission this register
@@ -168,7 +304,8 @@ END;
 $$;
 REVOKE ALL ON FUNCTION rolebyte.user_type_permissions(jsonb) FROM PUBLIC;
 
--- user_type_json — one user type as it is read.
+-- user_type_json — one user type as it is read: its name as entered and its
+-- names in the app's other languages (`labels`), what it holds, and who holds it.
 CREATE OR REPLACE FUNCTION rolebyte.user_type_json(p_id text)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -177,7 +314,7 @@ SET search_path = rolebyte, pg_temp
 AS $$
 BEGIN
     RETURN (SELECT jsonb_build_object(
-                'id', t.id, 'name', t.name, 'description', t.description,
+                'id', t.id, 'name', t.name, 'labels', t.labels, 'description', t.description,
                 'permissions', COALESCE((
                     SELECT jsonb_agg(sp.service_key || '/' || sp.feature_key || ':' || sp.act
                                      ORDER BY sp.service_key || '/' || sp.feature_key || ':' || sp.act COLLATE "C")
@@ -186,15 +323,17 @@ BEGIN
                      WHERE up.user_type_id = t.id), '[]'::jsonb),
                 'members', (SELECT count(*) FROM rolebyte.user_account u WHERE u.user_type_id = t.id),
                 'corporateLoginDefault', EXISTS (SELECT 1 FROM rolebyte.tenant n
-                                                  WHERE n.id = t.tenant_id AND n.corporate_login_user_type_id = t.id))
+                                                  WHERE n.id = t.tenant_id AND n.corporate_login_user_type_id = t.id),
+                'workspaceDefault', EXISTS (SELECT 1 FROM rolebyte.tenant n
+                                             WHERE n.id = t.tenant_id AND n.default_user_type_id = t.id))
               FROM rolebyte.user_type t WHERE t.id = p_id);
 END;
 $$;
 REVOKE ALL ON FUNCTION rolebyte.user_type_json(text) FROM PUBLIC;
 
--- user_type_state — what a user type is after an act (its name, description and
--- whole set of permissions), carried by the act's event so the history alone
--- rebuilds it.
+-- user_type_state — what a user type is after an act (its name, its names in
+-- other languages, its description and whole set of permissions), carried by the
+-- act's event so the history alone rebuilds it.
 CREATE OR REPLACE FUNCTION rolebyte.user_type_state(p_id text)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -202,13 +341,16 @@ STABLE
 SET search_path = rolebyte, pg_temp
 AS $$
 BEGIN
-    RETURN rolebyte.user_type_json(p_id) - 'id' - 'members' - 'corporateLoginDefault';
+    RETURN rolebyte.user_type_json(p_id) - 'id' - 'members' - 'corporateLoginDefault' - 'workspaceDefault';
 END;
 $$;
 REVOKE ALL ON FUNCTION rolebyte.user_type_state(text) FROM PUBLIC;
 
--- user_type_define — a new user type. Input {actor, tenantId, name,
--- description, permissions: ["<service>/<feature>:<act>", …]}.
+-- user_type_define — a new user type. Input {actor, tenantId, name, labels?,
+-- description, permissions: ["<service>/<feature>:<act>", …]}; `labels`, its
+-- names in the app's other languages, are taken as given. A name another type of
+-- the tenant carries, in any letter case, is refused, and so is a type that
+-- would read the same as another in any language the app speaks.
 CREATE OR REPLACE PROCEDURE rolebyte.user_type_define(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -219,6 +361,9 @@ DECLARE
     v_tenant text := NULLIF(btrim(pi_data->>'tenantId'), '');
     v_name   text := btrim(COALESCE(pi_data->>'name', ''));
     v_desc   text := btrim(COALESCE(pi_data->>'description', ''));
+    v_labels jsonb;
+    v_why    text;
+    v_clash  jsonb;
     v_perms  text[];
     v_id     text;
 BEGIN
@@ -230,13 +375,23 @@ BEGIN
         po_data := util.result_error('membership:invalid', 'a user type needs a name of 1 to 100 characters on one line');
         RETURN;
     END IF;
+    v_why := rolebyte.name_labels_refusal(pi_data->'labels');
+    IF v_why IS NOT NULL THEN
+        po_data := util.result_error('membership:invalid', v_why);
+        RETURN;
+    END IF;
+    v_labels := util.labels_merge('{}'::jsonb, pi_data->'labels');
     v_perms := rolebyte.user_type_permissions(pi_data->'permissions');
     IF v_perms IS NULL THEN
         po_data := util.result_error('membership:invalid',
             'a user type holds only permissions granted across the tenant, never one placed on a project nor the tenant''s setup');
         RETURN;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM rolebyte.tenant WHERE id = v_tenant) THEN
+    -- The tenant's row is held to the end of the act, as by every act that names
+    -- the tenant's user types, so a second one at the same moment waits and then
+    -- reads this one.
+    PERFORM 1 FROM rolebyte.tenant WHERE id = v_tenant FOR UPDATE;
+    IF NOT FOUND THEN
         po_data := util.result_error('tenant:not_found', 'tenant does not exist');
         RETURN;
     END IF;
@@ -244,9 +399,16 @@ BEGIN
         po_data := util.result_error('membership:conflict', 'the tenant already has a user type of that name');
         RETURN;
     END IF;
+    v_clash := rolebyte.user_type_reads_alike(v_tenant, NULL, v_name, v_labels);
+    IF v_clash IS NOT NULL THEN
+        po_data := util.result_error('membership:conflict',
+            'the tenant already has a user type reading the same in ' || (v_clash->>'language')
+                || ': ' || (v_clash->>'name'));
+        RETURN;
+    END IF;
 
     v_id := util.generate_ulid();
-    INSERT INTO rolebyte.user_type (id, tenant_id, name, description) VALUES (v_id, v_tenant, v_name, v_desc);
+    INSERT INTO rolebyte.user_type (id, tenant_id, name, labels, description) VALUES (v_id, v_tenant, v_name, v_labels, v_desc);
     INSERT INTO rolebyte.user_type_permission (user_type_id, permission_id) SELECT v_id, unnest(v_perms);
     INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
     VALUES (util.generate_ulid(), v_actor, v_tenant, 'userTypeDefined',
@@ -263,8 +425,13 @@ $$;
 REVOKE ALL ON PROCEDURE rolebyte.user_type_define(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.user_type_define(jsonb, jsonb) TO rolebyte_public;
 
--- user_type_update — rename a user type, or give it a new whole set of
--- permissions. Input {actor, tenantId, userTypeId, name?, description?, permissions?}.
+-- user_type_update — rename a user type, change its names in the app's other
+-- languages, or give it a new whole set of permissions. Input {actor, tenantId,
+-- userTypeId, name?, labels?, description?, permissions?}. `labels` are merged
+-- per language: a language sent with a name sets it, one sent with null removes
+-- it, one not sent is left. A type renamed onto another's name, or onto what
+-- another reads in any language the app speaks, is refused. Emits
+-- `userTypeChanged`, carrying the type as it now is.
 CREATE OR REPLACE PROCEDURE rolebyte.user_type_update(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -276,10 +443,25 @@ DECLARE
     v_id     text := NULLIF(btrim(pi_data->>'userTypeId'), '');
     v_row    rolebyte.user_type%ROWTYPE;
     v_name   text;
+    v_labels jsonb;
+    v_why    text;
+    v_clash  jsonb;
     v_perms  text[];
 BEGIN
     IF v_actor IS NULL OR v_tenant IS NULL OR v_id IS NULL THEN
         po_data := util.result_error('membership:invalid', 'actor, tenantId and userTypeId are required');
+        RETURN;
+    END IF;
+    v_why := rolebyte.name_labels_refusal(pi_data->'labels');
+    IF v_why IS NOT NULL THEN
+        po_data := util.result_error('membership:invalid', v_why);
+        RETURN;
+    END IF;
+    -- The tenant's row first, as every act naming the tenant's user types takes
+    -- it: a second change at the same moment waits, then reads this one's names.
+    PERFORM 1 FROM rolebyte.tenant WHERE id = v_tenant FOR UPDATE;
+    IF NOT FOUND THEN
+        po_data := util.result_error('membership:not_found', 'no such user type');
         RETURN;
     END IF;
     SELECT * INTO v_row FROM rolebyte.user_type WHERE tenant_id = v_tenant AND id = v_id FOR UPDATE;
@@ -292,10 +474,21 @@ BEGIN
         po_data := util.result_error('membership:invalid', 'a user type needs a name of 1 to 100 characters on one line');
         RETURN;
     END IF;
+    v_labels := CASE WHEN jsonb_typeof(pi_data->'labels') = 'object'
+                     THEN util.labels_merge(v_row.labels, pi_data->'labels') ELSE v_row.labels END;
     IF lower(v_name) <> lower(v_row.name)
        AND EXISTS (SELECT 1 FROM rolebyte.user_type WHERE tenant_id = v_tenant AND lower(name) = lower(v_name)) THEN
         po_data := util.result_error('membership:conflict', 'the tenant already has a user type of that name');
         RETURN;
+    END IF;
+    IF v_name <> v_row.name OR v_labels <> v_row.labels THEN
+        v_clash := rolebyte.user_type_reads_alike(v_tenant, v_id, v_name, v_labels);
+        IF v_clash IS NOT NULL THEN
+            po_data := util.result_error('membership:conflict',
+                'the tenant already has a user type reading the same in ' || (v_clash->>'language')
+                || ': ' || (v_clash->>'name'));
+            RETURN;
+        END IF;
     END IF;
     IF pi_data ? 'permissions' THEN
         v_perms := rolebyte.user_type_permissions(pi_data->'permissions');
@@ -308,6 +501,7 @@ BEGIN
 
     UPDATE rolebyte.user_type
        SET name = v_name,
+           labels = v_labels,
            description = CASE WHEN pi_data ? 'description' THEN btrim(COALESCE(pi_data->>'description', '')) ELSE description END
      WHERE id = v_id;
     IF v_perms IS NOT NULL THEN
@@ -362,6 +556,16 @@ BEGIN
             'people arriving through the corporate login receive this user type; choose another first');
         RETURN;
     END IF;
+    IF EXISTS (SELECT 1 FROM rolebyte.tenant WHERE id = v_tenant AND default_user_type_id = v_id) THEN
+        po_data := util.result_error('membership:conflict',
+            'this is the user type every new member receives; it cannot be deleted');
+        RETURN;
+    END IF;
+    IF EXISTS (SELECT 1 FROM rolebyte.chart_position WHERE tenant_id = v_tenant AND user_type_id = v_id) THEN
+        po_data := util.result_error('membership:conflict',
+            'a position in the chart of authority sets this user type; choose another there first');
+        RETURN;
+    END IF;
 
     DELETE FROM rolebyte.user_type_permission WHERE user_type_id = v_id;
     DELETE FROM rolebyte.user_type WHERE id = v_id;
@@ -405,8 +609,8 @@ $$;
 REVOKE ALL ON PROCEDURE rolebyte.user_type_list(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.user_type_list(jsonb, jsonb) TO rolebyte_public;
 
--- user_type_assign — give a member a user type, or take it away (userTypeId
--- empty). Set by an administrator, and recorded as such.
+-- user_type_assign — give a member a user type. Every member holds one, so it is
+-- never taken away, only changed. Set by an administrator, and recorded as such.
 CREATE OR REPLACE PROCEDURE rolebyte.user_type_assign(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -423,6 +627,10 @@ BEGIN
         po_data := util.result_error('membership:invalid', 'actor, tenantId and userId are required');
         RETURN;
     END IF;
+    IF v_type IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'every member has a user type; choose one');
+        RETURN;
+    END IF;
     SELECT user_type_id INTO v_before FROM rolebyte.user_account WHERE tenant_id = v_tenant AND id = v_user FOR UPDATE;
     IF NOT FOUND THEN
         po_data := util.result_error('membership:not_found', 'no such member');
@@ -435,7 +643,7 @@ BEGIN
 
     UPDATE rolebyte.user_account
        SET user_type_id = v_type,
-           user_type_source = CASE WHEN v_type IS NULL THEN NULL ELSE 'administrator' END
+           user_type_source = 'administrator'
      WHERE id = v_user;
     IF v_type IS DISTINCT FROM v_before THEN
         INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
@@ -443,8 +651,7 @@ BEGIN
                 jsonb_build_object('userTypeId', COALESCE(v_type, ''), 'from', COALESCE(v_before, ''), 'source', 'administrator'));
     END IF;
 
-    po_data := util.result_success(jsonb_build_object('userId', v_user, 'userTypeId', COALESCE(v_type, ''),
-                                                      'source', CASE WHEN v_type IS NULL THEN '' ELSE 'administrator' END));
+    po_data := util.result_success(jsonb_build_object('userId', v_user, 'userTypeId', v_type, 'source', 'administrator'));
 EXCEPTION
     WHEN sqlstate 'P0001' THEN
         RAISE;

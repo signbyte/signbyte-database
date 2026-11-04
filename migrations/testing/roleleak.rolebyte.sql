@@ -1,5 +1,5 @@
 -- Role-leak acceptance for the `rolebyte` location: the membership register's EXECUTE-only
--- role reaches tenants, members, roles, assignments and the history ONLY through the
+-- role reaches tenants, members, roles, assignments, a person's own language and the history ONLY through the
 -- SECURITY DEFINER procedures — never a direct table read or write, and never another
 -- schema's tables — and the other service roles cannot read the register's tables either.
 -- The history table adds the append-only guarantee at the GRANT boundary: even the owner
@@ -62,6 +62,40 @@ BEGIN
     PERFORM pg_temp.deny('rolebyte_public',
         'INSERT INTO rolebyte.user_account(id, tenant_id, subject_key, display_name) '
         || 'VALUES (''x'', ''x'', ''svc:x'', ''x'')');
+    -- the deployment's list of services, their roles and their permissions is
+    -- the deployment's to write: the register's own role runs none of the acts
+    -- that write it, so no request a tenant can make reaches them.
+    IF has_function_privilege('rolebyte_public', 'rolebyte.service_register(jsonb, jsonb)', 'EXECUTE')
+       OR has_function_privilege('rolebyte_public', 'rolebyte.role_define(jsonb, jsonb)', 'EXECUTE')
+       OR has_function_privilege('rolebyte_public', 'rolebyte.permission_declare(jsonb, jsonb)', 'EXECUTE')
+       OR has_function_privilege('rolebyte_public', 'rolebyte.permissions_register(jsonb, jsonb)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'ROLE LEAK: rolebyte_public may write the deployment''s list of services';
+    END IF;
+    PERFORM pg_temp.deny('rolebyte_public',
+        'CALL rolebyte.service_register(''{"actor":"x","service":"x"}''::jsonb, NULL::jsonb)');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'CALL rolebyte.role_define(''{"actor":"x","service":"x","group":"x","level":"x"}''::jsonb, NULL::jsonb)');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'CALL rolebyte.permission_declare(''{"actor":"x","service":"x","permission":{}}''::jsonb, NULL::jsonb)');
+    -- what a workspace is, its members may read.
+    IF NOT has_function_privilege('rolebyte_public', 'rolebyte.tenant_get(jsonb, jsonb)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'the register''s role must run rolebyte.tenant_get';
+    END IF;
+    -- a person's own language: read and set through its two procedures only, which
+    -- the register's role runs and no other role does (nothing is left to PUBLIC).
+    IF NOT has_function_privilege('rolebyte_public', 'rolebyte.person_language_get(jsonb, jsonb)', 'EXECUTE')
+       OR NOT has_function_privilege('rolebyte_public', 'rolebyte.person_language_set(jsonb, jsonb)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'the register''s role must run rolebyte.person_language_get and rolebyte.person_language_set';
+    END IF;
+    IF has_function_privilege('authbyte_public', 'rolebyte.person_language_get(jsonb, jsonb)', 'EXECUTE')
+       OR has_function_privilege('authbyte_public', 'rolebyte.person_language_set(jsonb, jsonb)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'ROLE LEAK: another service''s role may run a person''s language procedures';
+    END IF;
+    PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.person_setting');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'INSERT INTO rolebyte.person_setting(subject_key, language) VALUES (''sub:x'', ''en'')');
+    PERFORM pg_temp.deny('rolebyte_public', 'UPDATE rolebyte.person_setting SET language = NULL');
+    PERFORM pg_temp.deny('rolebyte_public', 'DELETE FROM rolebyte.person_setting');
     -- what a tenant has is the operator's to write: the register's own role can neither
     -- read nor write the table, nor run the procedures that do.
     PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.tenant_entitlement');
@@ -103,6 +137,26 @@ BEGIN
     PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.tenant_entitlement');
     PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.administrator_seed');
     PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.user_type');
+    PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.person_setting');
 END $$;
 
 SELECT 'ROLELEAK: PASS — the register role is table-isolated, its history is append-only at the grant boundary, and no other service role reads the register' AS result;
+
+-- The one-time bootstrap door runs as the register's own role and puts the
+-- register's own rung on the list — and nothing a caller names with it.
+DO $$
+DECLARE
+    v jsonb;
+BEGIN
+    SET ROLE rolebyte_public;
+    CALL rolebyte.own_rung_register('{"actor":"door","service":"intruder","group":"intruder","level":"admin"}'::jsonb, v);
+    RESET ROLE;
+    IF v->>'result' IS DISTINCT FROM 'success'
+       OR NOT EXISTS (SELECT 1 FROM rolebyte.role_definition
+                       WHERE service_key = 'rolebyte' AND role_group = 'membership' AND role_level = 'admin')
+       OR EXISTS (SELECT 1 FROM rolebyte.service WHERE key = 'intruder')
+       OR EXISTS (SELECT 1 FROM rolebyte.role_definition WHERE role_group = 'intruder') THEN
+        RAISE EXCEPTION 'ROLE LEAK: own_rung_register wrote more than the register''s own rung: %', v;
+    END IF;
+    RAISE NOTICE 'roleleak.rolebyte: the door''s own rung, and nothing else';
+END $$;

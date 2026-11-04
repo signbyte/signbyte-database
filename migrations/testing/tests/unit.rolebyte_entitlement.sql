@@ -238,6 +238,28 @@ BEGIN
         RAISE EXCEPTION 'the list must answer exactly what is in force, in order: %', v;
     END IF;
 
+    -- 10b. What a workspace is, for its members: its name and what is in force,
+    --      a whole service as an empty feature, nothing revoked.
+    v := pg_temp.ok('tenant_get', jsonb_build_object('tenantId', v_ta), 'what A is');
+    IF v->>'id' IS DISTINCT FROM v_ta OR v->>'name' IS DISTINCT FROM 'Entitlement A' THEN
+        RAISE EXCEPTION 'the workspace read answers its id and its name: %', v;
+    END IF;
+    IF (SELECT array_agg(x->>'service' || '|' || (x->>'feature') ORDER BY ord)
+          FROM jsonb_array_elements(v->'entitlements') WITH ORDINALITY AS t(x, ord))
+       IS DISTINCT FROM ARRAY['esaddon|', 'esdemo|', 'esother|spentTime'] THEN
+        RAISE EXCEPTION 'the workspace read answers exactly what is in force, in order: %', v;
+    END IF;
+    IF v::text LIKE '%entitledAt%' OR v::text LIKE '%revoked%' THEN
+        RAISE EXCEPTION 'the workspace read carries no dates and no revoked rows: %', v;
+    END IF;
+    v := pg_temp.ok('tenant_get', jsonb_build_object('tenantId',
+        pg_temp.ok('tenant_create', '{"actor":"ent-test","name":"Nothing given"}', 'bare tenant')->>'id'), 'a bare workspace');
+    IF v->'entitlements' IS DISTINCT FROM '[]'::jsonb THEN
+        RAISE EXCEPTION 'a workspace given nothing has an empty list, never null: %', v;
+    END IF;
+    PERFORM pg_temp.refused('tenant_get', '{"tenantId":"nosuchtenant"}', 'membership:not_found', 'an unknown workspace');
+    PERFORM pg_temp.refused('tenant_get', '{}', 'membership:invalid', 'no workspace named');
+
     -- 11. Every change is one event naming the operator, in the tenant's history.
     IF (SELECT count(*) FROM rolebyte.event WHERE tenant_id = v_ta AND kind = 'tenantEntitled' AND actor = 'op:test') <> 7
        OR (SELECT count(*) FROM rolebyte.event WHERE tenant_id = v_ta AND kind = 'tenantEntitlementRevoked' AND actor = 'op:test') <> 4 THEN

@@ -144,7 +144,7 @@ BEGIN
     v_ta := pg_temp.ok('tenant_open', jsonb_build_object('actor', 'op:test', 'name', 'Per field A',
         'administrator', jsonb_build_object('subjectKey', v_subs[1], 'displayName', 'Admin A')), 'open A')->'tenant'->>'id';
     v := pg_temp.ok('config_get', jsonb_build_object('tenantId', v_ta), 'read the section');
-    PERFORM pg_temp.is((SELECT p->>'class' FROM jsonb_array_elements(v->'services') s, jsonb_array_elements(s->'permissions') p
+    PERFORM pg_temp.is((SELECT p->>'class' FROM jsonb_array_elements(v->'section'->'services') s, jsonb_array_elements(s->'permissions') p
                          WHERE s->>'key' = 'pfledger' AND p->>'feature' = 'entry' AND p->>'act' = 'viewField'),
         'perField', 'the section carries the family''s class');
 
