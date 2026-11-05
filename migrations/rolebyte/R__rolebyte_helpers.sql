@@ -2,8 +2,8 @@
 -- person connects an AI app.
 --
 -- An administrator adds an assistant for one person (the register mints its
--- key), names and renames it, gives it roles as a person's are given, and may
--- give it to another person; a person may have several. The first assistant of a
+-- key), chosen then and never changed after, names and renames it, and gives it
+-- roles as a person's are given; a person may have several. The first assistant of a
 -- tenant brings the shipped Assistant role, holding what the services declared
 -- for the seed `assistant`, and every new assistant starts in it. The sign-in
 -- service asks for a person's own assistants when the person connects an app,
@@ -269,69 +269,12 @@ $$;
 REVOKE ALL ON PROCEDURE rolebyte.assistant_rename(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.assistant_rename(jsonb, jsonb) TO rolebyte_public;
 
--- assistant_person_set — give an assistant of the tenant, not removed, to one
--- active person of the tenant: theirs from then on, and no longer its earlier
--- person's, whose connected apps the sign-in service ends at their next
--- refresh. The same person again changes nothing and records nothing. Input
--- {actor, tenantId, userId, personId}. Emits `assistantPersonSet` {personId,
--- from}.
-CREATE OR REPLACE PROCEDURE rolebyte.assistant_person_set(IN pi_data jsonb, INOUT po_data jsonb)
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = rolebyte, util, pg_temp
-AS $$
-DECLARE
-    v_actor  text := NULLIF(btrim(pi_data->>'actor'), '');
-    v_tenant text := NULLIF(btrim(pi_data->>'tenantId'), '');
-    v_user   text := NULLIF(btrim(pi_data->>'userId'), '');
-    v_person text;
-    v_from   text;
-    v_row    rolebyte.user_account%ROWTYPE;
-BEGIN
-    IF v_actor IS NULL OR v_tenant IS NULL OR v_user IS NULL THEN
-        po_data := util.result_error('membership:invalid', 'actor, tenantId and userId are required');
-        RETURN;
-    END IF;
-    SELECT * INTO v_row FROM rolebyte.user_account
-     WHERE id = v_user AND tenant_id = v_tenant AND subject_key LIKE 'svc:assistant-%' AND status <> 'revoked'
-       FOR UPDATE;
-    IF NOT FOUND THEN
-        po_data := util.result_error('membership:not_found', 'assistant does not exist');
-        RETURN;
-    END IF;
-    v_person := rolebyte.assistant_person_of(v_tenant, pi_data->'personId');
-    IF v_person IS NULL THEN
-        po_data := util.result_error('membership:invalid', 'an assistant is one active person''s of this tenant');
-        RETURN;
-    END IF;
-
-    SELECT user_id INTO v_from FROM rolebyte.assistant_person WHERE assistant_id = v_row.id;
-    IF v_from IS NOT DISTINCT FROM v_person THEN
-        po_data := util.result_success(jsonb_build_object('id', v_row.id, 'person', rolebyte.assistant_person_json(v_row.id),
-                                                          'changed', false));
-        RETURN;
-    END IF;
-    INSERT INTO rolebyte.assistant_person (tenant_id, assistant_id, user_id) VALUES (v_tenant, v_row.id, v_person)
-    ON CONFLICT (assistant_id) DO UPDATE SET user_id = EXCLUDED.user_id, added_at = now();
-    INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
-    VALUES (util.generate_ulid(), v_actor, v_tenant, v_row.id, 'assistantPersonSet',
-            jsonb_build_object('personId', v_person, 'from', v_from));
-    po_data := util.result_success(jsonb_build_object('id', v_row.id, 'person', rolebyte.assistant_person_json(v_row.id),
-                                                      'changed', true));
-EXCEPTION
-    WHEN sqlstate 'P0001' THEN RAISE;
-    WHEN OTHERS THEN
-        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
-END;
-$$;
-
-REVOKE ALL ON PROCEDURE rolebyte.assistant_person_set(jsonb, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON PROCEDURE rolebyte.assistant_person_set(jsonb, jsonb) TO rolebyte_public;
-
 -- assistant_list — the tenant's assistants, every one ever added, removed ones
 -- included, so history keeps naming them; by name. With `userId`, that one
--- assistant alone (not found otherwise); with `withPerson`, each names its
--- person. Input {tenantId, userId?, withPerson?}.
+-- assistant alone (not found otherwise); with `withPerson`, each whole, for the
+-- administrator: its person, when it was added, and when it was removed (null
+-- while it is not), read from its removal's own line in the register's history.
+-- Input {tenantId, userId?, withPerson?}.
 CREATE OR REPLACE PROCEDURE rolebyte.assistant_list(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -348,7 +291,14 @@ BEGIN
         RETURN;
     END IF;
     SELECT COALESCE(jsonb_agg(rolebyte.assistant_json(u)
-               || CASE WHEN v_with THEN jsonb_build_object('person', rolebyte.assistant_person_json(u.id)) ELSE '{}'::jsonb END
+               || CASE WHEN v_with THEN jsonb_build_object(
+                      'person',    rolebyte.assistant_person_json(u.id),
+                      'addedAt',   u.created_at,
+                      'removedAt', CASE WHEN u.status = 'revoked' THEN
+                                       (SELECT max(e.at) FROM rolebyte.event e
+                                         WHERE e.user_id = u.id AND e.tenant_id = u.tenant_id AND e.kind = 'userRevoked')
+                                   END)
+                  ELSE '{}'::jsonb END
            ORDER BY lower(u.display_name), u.id), '[]'::jsonb)
       INTO v_items
       FROM rolebyte.user_account u

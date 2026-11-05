@@ -4,6 +4,16 @@ Notable changes to the signbyte database — the schema set and the migration im
 newest first, per release. Written for whoever applies the image to a database or
 integrates against the procedures.
 
+## v0.6.0
+
+### Changed — rolebyte: an assistant's person is chosen when it is added
+
+`rolebyte/V22` drops `rolebyte.assistant_person_set`: the person an assistant works for is chosen when it is added and
+never changed after; the `assistantPersonSet` lines it wrote stay in the history. `rolebyte.assistant_list` with
+`withPerson` also answers each assistant's `addedAt` and `removedAt` (`null` while it is not removed, otherwise the
+time of its removal's line in the history); without `withPerson` it answers as before. **Apply with** rolebyte v0.4.0:
+an older rolebyte calls the dropped procedure when an assistant's person is changed, and fails there.
+
 ## v0.5.0
 
 ### Changed — util: `util.labels_refusal` is declared STABLE
