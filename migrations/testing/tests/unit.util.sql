@@ -191,6 +191,24 @@ begin
     raise exception 'nothing is no number';
   end if;
 
+  -- A stored file's name holds only text: a control character, a text-direction
+  -- character and a line or paragraph separator are refused, each named; names in
+  -- any script pass, the joiners included.
+  if util.file_name_refusal('invoice_' || U&'\202E' || 'fdp.exe') is distinct from
+     'a file''s name holds only text, and U+202E is a text-direction character; rename the file without it' then
+    raise exception 'file_name_refusal: a right-to-left override: %', util.file_name_refusal('invoice_' || U&'\202E' || 'fdp.exe');
+  end if;
+  if position('U+0009 is a control character' in util.file_name_refusal('a' || chr(9) || 'b')) = 0
+     or position('U+0085 is a control character' in util.file_name_refusal('a' || U&'\0085' || 'b')) = 0
+     or position('U+2029 is a line-break character' in util.file_name_refusal('a' || U&'\2029' || 'b')) = 0
+     or position('U+2066 is a text-direction character' in util.file_name_refusal(U&'\2066' || 'b')) = 0 then
+    raise exception 'file_name_refusal names the first such character and its kind';
+  end if;
+  if util.file_name_refusal('Rasējums ' || U&'\0645\0644\0641' || ' ' || U&'\0915\094D\200D\0937' || '.pdf') is not null
+     or util.file_name_refusal('plain (2).PDF') is not null then
+    raise exception 'file_name_refusal passes names in any script';
+  end if;
+
   raise notice 'unit.util.sql: ALL ASSERTIONS PASSED';
 end $$;
 
