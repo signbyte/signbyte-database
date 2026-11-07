@@ -4,6 +4,22 @@ Notable changes to the signbyte database — the schema set and the migration im
 newest first, per release. Written for whoever applies the image to a database or
 integrates against the procedures.
 
+## v0.7.0
+
+### Changed — util: a name is at most 100 characters, in every language
+
+`util/V7` adds `util.name_refusal(text)`, which answers "a name is at most 100 characters" past that, and
+`util.labels_refusal` now refuses a name in another language past 100 characters and cuts a key that is not a language
+to 20 characters when it says it back. rolebyte's role, user type and position names in other languages were already
+held to 100 characters; past it, the refusal now reads "labels: the name in *lang* is at most 100 characters" where it
+read "… is 1 to 100 characters on one line" (still `membership:invalid`). **Apply:** nothing to act on.
+
+### Added — util: `util.file_name_refusal`
+
+`util/V6` adds `util.file_name_refusal(text)`: what is wrong with a stored file's name, or null when nothing is — a
+control character, a character that turns the direction text is drawn in, or a line or paragraph separator, named by
+its code point. A shared primitive; no procedure of this product calls it yet. **Apply:** nothing to act on.
+
 ## v0.6.0
 
 ### Changed — rolebyte: an assistant's person is chosen when it is added

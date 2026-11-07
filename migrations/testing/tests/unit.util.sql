@@ -161,6 +161,30 @@ begin
     raise exception 'a name that is empty once trimmed is refused';
   end if;
 
+  -- A name is at most 100 characters (not bytes), in every language. name_refusal
+  -- measures what it is given (its callers pass the trimmed name, as stored);
+  -- labels_refusal trims each name first. A key that is not a language is said
+  -- back cut to 20 characters.
+  if util.name_refusal(repeat('n', 100)) is not null or util.name_refusal(repeat('ā', 100)) is not null
+     or util.name_refusal(null) is not null then
+    raise exception 'name_refusal: up to 100 characters, or none, passes';
+  end if;
+  if util.name_refusal(repeat('n', 101)) is distinct from 'a name is at most 100 characters' then
+    raise exception 'name_refusal: 101 characters are refused: %', util.name_refusal(repeat('n', 101));
+  end if;
+  if util.labels_refusal(jsonb_build_object('lv', repeat('n', 100), 'en', '  ' || repeat('n', 100) || '  ')) is not null then
+    raise exception 'labels_refusal: names of up to 100 characters pass';
+  end if;
+  if util.labels_refusal(jsonb_build_object('lv', repeat('n', 101))) is distinct from
+     'labels: the name in lv is at most 100 characters' then
+    raise exception 'labels_refusal: a 101-character name is refused: %', util.labels_refusal(jsonb_build_object('lv', repeat('n', 101)));
+  end if;
+  if util.labels_refusal(jsonb_build_object(repeat('k', 5000), 'x')) is distinct from
+     'labels: ' || repeat('k', 20) || ' is not a language the app speaks (en, lv)' then
+    raise exception 'labels_refusal: a long key is said back cut to 20 characters: %',
+      left(util.labels_refusal(jsonb_build_object(repeat('k', 5000), 'x')), 200);
+  end if;
+
   -- The merge: set trimmed, null removes, unnamed languages stay.
   if util.labels_merge('{"en": "Welding", "lv": "Metināšana"}'::jsonb, '{"en": null}'::jsonb)
        is distinct from '{"lv": "Metināšana"}'::jsonb then
@@ -189,6 +213,24 @@ begin
   end loop;
   if util.list_number(null) is not null then
     raise exception 'nothing is no number';
+  end if;
+
+  -- A stored file's name holds only text: a control character, a text-direction
+  -- character and a line or paragraph separator are refused, each named; names in
+  -- any script pass, the joiners included.
+  if util.file_name_refusal('invoice_' || U&'\202E' || 'fdp.exe') is distinct from
+     'a file''s name holds only text, and U+202E is a text-direction character; rename the file without it' then
+    raise exception 'file_name_refusal: a right-to-left override: %', util.file_name_refusal('invoice_' || U&'\202E' || 'fdp.exe');
+  end if;
+  if position('U+0009 is a control character' in util.file_name_refusal('a' || chr(9) || 'b')) = 0
+     or position('U+0085 is a control character' in util.file_name_refusal('a' || U&'\0085' || 'b')) = 0
+     or position('U+2029 is a line-break character' in util.file_name_refusal('a' || U&'\2029' || 'b')) = 0
+     or position('U+2066 is a text-direction character' in util.file_name_refusal(U&'\2066' || 'b')) = 0 then
+    raise exception 'file_name_refusal names the first such character and its kind';
+  end if;
+  if util.file_name_refusal('Rasējums ' || U&'\0645\0644\0641' || ' ' || U&'\0915\094D\200D\0937' || '.pdf') is not null
+     or util.file_name_refusal('plain (2).PDF') is not null then
+    raise exception 'file_name_refusal passes names in any script';
   end if;
 
   raise notice 'unit.util.sql: ALL ASSERTIONS PASSED';
