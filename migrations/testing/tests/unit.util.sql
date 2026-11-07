@@ -161,6 +161,30 @@ begin
     raise exception 'a name that is empty once trimmed is refused';
   end if;
 
+  -- A name is at most 100 characters (not bytes), in every language. name_refusal
+  -- measures what it is given (its callers pass the trimmed name, as stored);
+  -- labels_refusal trims each name first. A key that is not a language is said
+  -- back cut to 20 characters.
+  if util.name_refusal(repeat('n', 100)) is not null or util.name_refusal(repeat('ā', 100)) is not null
+     or util.name_refusal(null) is not null then
+    raise exception 'name_refusal: up to 100 characters, or none, passes';
+  end if;
+  if util.name_refusal(repeat('n', 101)) is distinct from 'a name is at most 100 characters' then
+    raise exception 'name_refusal: 101 characters are refused: %', util.name_refusal(repeat('n', 101));
+  end if;
+  if util.labels_refusal(jsonb_build_object('lv', repeat('n', 100), 'en', '  ' || repeat('n', 100) || '  ')) is not null then
+    raise exception 'labels_refusal: names of up to 100 characters pass';
+  end if;
+  if util.labels_refusal(jsonb_build_object('lv', repeat('n', 101))) is distinct from
+     'labels: the name in lv is at most 100 characters' then
+    raise exception 'labels_refusal: a 101-character name is refused: %', util.labels_refusal(jsonb_build_object('lv', repeat('n', 101)));
+  end if;
+  if util.labels_refusal(jsonb_build_object(repeat('k', 5000), 'x')) is distinct from
+     'labels: ' || repeat('k', 20) || ' is not a language the app speaks (en, lv)' then
+    raise exception 'labels_refusal: a long key is said back cut to 20 characters: %',
+      left(util.labels_refusal(jsonb_build_object(repeat('k', 5000), 'x')), 200);
+  end if;
+
   -- The merge: set trimmed, null removes, unnamed languages stay.
   if util.labels_merge('{"en": "Welding", "lv": "Metināšana"}'::jsonb, '{"en": null}'::jsonb)
        is distinct from '{"lv": "Metināšana"}'::jsonb then
