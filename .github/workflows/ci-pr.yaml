@@ -8,6 +8,96 @@ permissions:
   contents: read
 
 jobs:
+  # Test each tree once. A tree that already passed the suite (both `verify` and
+  # `sql-quality` succeeded) in an earlier PUSH run of ci.yml is not tested again. The
+  # same tree is what a develop push, the pull request that merges it, the push of the
+  # merge and the version tag all carry, and each of those ran the whole suite.
+  # Only a push run counts, because its commit is exactly what it tested (a pull request
+  # run tests a merge commit that its record does not name), and only a run in which both
+  # suite jobs SUCCEEDED, so a skipped suite never vouches for another one. A manual run
+  # and a version tag always run the suite: the image published for a tag is built in its
+  # own run, from a base that is not pinned, so it is tested there. Anything that goes wrong
+  # in this lookup means "not proven" and the suite runs, even a failure of this job itself:
+  # the two suite jobs run unless the lookup positively found a proof. A skip is announced
+  # in the job's notice and summary, and the two suite jobs show as skipped.
+  proven:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      found: ${{ steps.look.outputs.found }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Has this exact tree already passed the suite on a push?
+      id: look
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        node <<'JS'
+        const { execFileSync } = require("node:child_process");
+        const { appendFileSync } = require("node:fs");
+
+        // The two jobs that make up "the suite". A run proves a tree only if both succeeded in it.
+        const SUITE = ["verify", "sql-quality"];
+        const api = process.env.GITHUB_API_URL || "https://api.github.com";
+        const repo = process.env.GITHUB_REPOSITORY;
+        const thisRun = String(process.env.GITHUB_RUN_ID);
+
+        // A workflow command is one line: % and line breaks in a message are escaped, as GitHub asks.
+        const escapeCommand = (text) => String(text).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+
+        // found=true makes the two suite jobs skip. It is said in a notice, in the summary and in the output.
+        function finish(found, level, message) {
+          console.log(`::${level}::${escapeCommand(message)}`);
+          if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${message}\n`);
+          appendFileSync(process.env.GITHUB_OUTPUT, `found=${found}\n`);
+        }
+
+        async function get(path) {
+          const res = await fetch(`${api}${path}`, {
+            headers: {
+              Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+              Accept: "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+            },
+          });
+          if (!res.ok) throw new Error(`${path} answered ${res.status}`);
+          return res.json();
+        }
+
+        async function look() {
+          if (process.env.GITHUB_EVENT_NAME === "workflow_dispatch") {
+            return finish(false, "notice", "A manual run: the suite runs.");
+          }
+          if ((process.env.GITHUB_REF || "").startsWith("refs/tags/")) {
+            return finish(false, "notice", "A version tag: the suite runs, because the image published for it is built in this run.");
+          }
+          const tree = execFileSync("git", ["rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).trim();
+          const list = await get(`/repos/${repo}/actions/workflows/ci.yml/runs?event=push&status=completed&per_page=100`);
+          for (const run of list.workflow_runs) {
+            if (String(run.id) === thisRun || run.head_commit?.tree_id !== tree) continue;
+            const { jobs } = await get(`/repos/${repo}/actions/runs/${run.id}/jobs?per_page=100`);
+            if (SUITE.every((name) => jobs.some((job) => job.name === name && job.conclusion === "success"))) {
+              return finish(true, "notice", `The suite did not run: tree ${tree.slice(0, 10)} already passed it in ${run.html_url} (commit ${run.head_sha.slice(0, 10)}).`);
+            }
+          }
+          return finish(false, "notice", `No earlier push run passed the suite on tree ${tree.slice(0, 10)}: it runs now.`);
+        }
+
+        look().catch((err) => {
+          // Never fail the run over this: an unanswered lookup means "not proven", so the suite runs.
+          try {
+            finish(false, "warning", `Could not look for an earlier proof (${err.message}): the suite runs.`);
+          } catch (e) {
+            console.log(`::warning::${escapeCommand(e.message)}`);
+          }
+        });
+        JS
+
   migration-immutability:
     runs-on: ubuntu-latest
     steps:
@@ -70,6 +160,9 @@ jobs:
         echo "OK: no versioned migration modified or deleted (bases compared:${bases})"
 
   verify:
+    needs: proven
+    # Runs unless the lookup positively found a proof; a failed lookup job is not a proof.
+    if: ${{ !cancelled() && needs.proven.outputs.found != 'true' }}
     runs-on: ubuntu-latest
     steps:
     - name: Checkout code
@@ -78,6 +171,9 @@ jobs:
       run: bash testing/verify.sh
 
   sql-quality:
+    needs: proven
+    # Runs unless the lookup positively found a proof; a failed lookup job is not a proof.
+    if: ${{ !cancelled() && needs.proven.outputs.found != 'true' }}
     runs-on: ubuntu-latest
     steps:
     - name: Checkout code
