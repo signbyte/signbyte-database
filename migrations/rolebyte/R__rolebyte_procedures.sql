@@ -190,6 +190,17 @@ BEGIN
         po_data := util.result_error('membership:invalid', 'a role group may not contain "/"');
         RETURN;
     END IF;
+    IF position('/' IN v_level) > 0 THEN
+        po_data := util.result_error('membership:invalid', 'a role level may not contain "/"');
+        RETURN;
+    END IF;
+    -- A role is rendered into a token as group:level, and a token's scopes are
+    -- separated by whitespace: a group or a level holding whitespace or a colon
+    -- would put a second scope into the token of whoever holds the role.
+    IF v_group ~ '[[:space:]:]' OR v_level ~ '[[:space:]:]' THEN
+        po_data := util.result_error('membership:invalid', 'a role group and level may not contain whitespace or ":"');
+        RETURN;
+    END IF;
 
     IF NOT EXISTS (SELECT 1 FROM rolebyte.service WHERE key = v_service) THEN
         po_data := util.result_error('membership:not_found', 'service is not registered');
@@ -3737,8 +3748,8 @@ GRANT EXECUTE ON PROCEDURE rolebyte.tenant_get(jsonb, jsonb) TO rolebyte_public;
 -- import, so it names no tenant, needs no version and writes no line in any
 -- tenant's history. Additive and idempotent: a second run reports every
 -- permission unchanged. One refused entry writes nothing, and the error names
--- it. Granted to nobody: the deployment calls it as the location's owner — a
--- service never registers itself.
+-- it. Granted to nobody: the deployment calls it as the location's owner. A
+-- service's own declaration is a different act, rolebyte.service_declare below.
 CREATE OR REPLACE PROCEDURE rolebyte.permissions_register(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -3783,6 +3794,272 @@ END;
 $$;
 
 REVOKE ALL ON PROCEDURE rolebyte.permissions_register(jsonb, jsonb) FROM PUBLIC;
+
+-- service_declare — a service declares itself: its key, its levels and the
+-- permissions it enforces, in the document shape permissions_register reads,
+-- written through the same vocabulary function under the same lock, so every
+-- line reads and every event lands as it does there. The caller is a backend
+-- service acting as itself: `actor` is its service subject (`svc:<client id>`),
+-- and `allowed` is the list of service keys the caller was granted outside this
+-- procedure; a key in the document that is not in it is refused, before
+-- anything is written. The document is read strictly: a member this register
+-- does not know, in the section, a service entry or a role entry, refuses it.
+-- Every shape and limit is judged before anything is written: a service key, a
+-- group and a level are each one lower-case word, texts have a length limit,
+-- and a group belongs to one service key. The checks that read nothing from the
+-- register's tables come first; the lock every registration shares is then
+-- taken, and the checks against what is already registered (a group's service
+-- key) are made under it, so two declarations made at once cannot both pass
+-- them. Every refusal is returned before any write. All or nothing: one refused line raises and nothing of the document stands,
+-- and the answer names the line. Nothing is inferred from an absence: a
+-- permission a later document leaves out stays as it was; it is retired by its
+-- own `retired` mark. The one write besides the vocabulary is a row per
+-- service key and declaring client (service_declaration) holding when it was
+-- first and last declared; that write makes no history event.
+--
+-- This is deliberately granted to the register's own role: it is the one
+-- registration a service's own request may reach. Every other act that writes
+-- the deployment's list stays the deployment's own.
+CREATE OR REPLACE PROCEDURE rolebyte.service_declare(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_actor   text := NULLIF(trim(pi_data->>'actor'), '');
+    v_allowed jsonb := pi_data->'allowed';
+    v_section jsonb := pi_data->'section';
+    v_member  text;
+    v_svc     jsonb;
+    v_role    jsonb;
+    v_key     text;
+    v_report  jsonb;
+    v_line    jsonb;
+    v_perm    jsonb;
+    v_groups  jsonb := '{}'::jsonb;
+    v_group   text;
+    v_prev    text;
+    -- A name that is a service key, a group or a level: one lower-case word.
+    c_word    constant text := '^[a-z][a-z0-9-]{0,63}$';
+BEGIN
+    IF v_actor IS NULL OR left(v_actor, 4) <> 'svc:' OR length(v_actor) = 4 THEN
+        po_data := util.result_error('membership:invalid', 'actor is a service subject, svc:<client id>');
+        RETURN;
+    END IF;
+    IF jsonb_typeof(v_allowed) IS DISTINCT FROM 'array'
+       OR EXISTS (SELECT 1 FROM jsonb_array_elements(v_allowed) a WHERE jsonb_typeof(a) IS DISTINCT FROM 'string') THEN
+        po_data := util.result_error('membership:invalid', 'allowed is a list of service keys');
+        RETURN;
+    END IF;
+    IF jsonb_typeof(v_section) IS DISTINCT FROM 'object'
+       OR jsonb_typeof(v_section->'services') IS DISTINCT FROM 'array' THEN
+        po_data := util.result_error('membership:config_bad_document', 'the section is an object carrying a services list');
+        RETURN;
+    END IF;
+
+    -- Strict reading: only the members this register knows.
+    SELECT k INTO v_member FROM jsonb_object_keys(v_section) k WHERE k <> 'services' LIMIT 1;
+    IF v_member IS NOT NULL THEN
+        po_data := util.result_error('membership:config_bad_document',
+            format('the document carries a member this register does not know: %s', left(v_member, 100)));
+        RETURN;
+    END IF;
+
+    -- What one call may cost: at most 50 services and 256 KiB of document.
+    IF jsonb_array_length(v_section->'services') > 50 THEN
+        po_data := util.result_error('membership:config_bad_document', 'a document declares at most 50 services');
+        RETURN;
+    END IF;
+    IF octet_length(v_section::text) > 262144 THEN
+        po_data := util.result_error('membership:config_bad_document', 'a document is at most 262144 bytes');
+        RETURN;
+    END IF;
+
+    -- Every check above reads nothing from the register's tables, so a malformed
+    -- or oversized document never waits for the lock. Every check below does, and
+    -- is made with the lock held: two declarations made at the same moment take
+    -- the lock one after the other, so the second sees what the first wrote and
+    -- both cannot pass a check against what is already registered. The lock every
+    -- registration shares is waited for at most five seconds, so a registration
+    -- stuck behind another does not hold a connection for ever; the caller is told
+    -- to try again (below). The setting is this transaction's only, and the
+    -- transaction's earlier value is put back once the lock is held.
+    v_prev := current_setting('lock_timeout');
+    PERFORM set_config('lock_timeout', '5s', true);
+    PERFORM pg_advisory_xact_lock(hashtextextended('rolebyte.config', 0));
+    PERFORM set_config('lock_timeout', v_prev, true);
+
+    FOR v_svc IN SELECT * FROM jsonb_array_elements(v_section->'services') LOOP
+        IF jsonb_typeof(v_svc) IS DISTINCT FROM 'object' THEN
+            po_data := util.result_error('membership:config_bad_document', 'a service entry is an object');
+            RETURN;
+        END IF;
+        SELECT k INTO v_member FROM jsonb_object_keys(v_svc) k
+         WHERE k NOT IN ('key', 'displayName', 'roles', 'permissions') LIMIT 1;
+        IF v_member IS NOT NULL THEN
+            po_data := util.result_error('membership:config_bad_document',
+                format('a service entry carries a member this register does not know: %s', left(v_member, 100)));
+            RETURN;
+        END IF;
+        IF jsonb_typeof(v_svc->'key') IS DISTINCT FROM 'string' OR NULLIF(trim(v_svc->>'key'), '') IS NULL THEN
+            po_data := util.result_error('membership:config_bad_document', 'a service entry is missing its key');
+            RETURN;
+        END IF;
+        -- A key that is not a key by shape is never repeated in the answer.
+        IF v_svc->>'key' !~ c_word THEN
+            po_data := util.result_error('membership:config_bad_document',
+                'a service entry has a key that is not a lower-case word of letters, digits and hyphens, at most 64 characters long');
+            RETURN;
+        END IF;
+        v_key := v_svc->>'key';
+        IF v_svc ? 'displayName' AND jsonb_typeof(v_svc->'displayName') NOT IN ('string', 'null') THEN
+            po_data := util.result_error('membership:config_bad_document',
+                format('the display name of service %s is text', v_key));
+            RETURN;
+        END IF;
+        IF jsonb_typeof(v_svc->'displayName') = 'string' AND char_length(v_svc->>'displayName') > 256 THEN
+            po_data := util.result_error('membership:config_bad_document',
+                format('the display name of service %s is at most 256 characters', v_key));
+            RETURN;
+        END IF;
+        IF v_svc ? 'roles' AND jsonb_typeof(v_svc->'roles') IS DISTINCT FROM 'array' THEN
+            po_data := util.result_error('membership:config_bad_document',
+                format('the roles of service %s are a list', v_key));
+            RETURN;
+        END IF;
+        IF v_svc ? 'permissions' AND jsonb_typeof(v_svc->'permissions') IS DISTINCT FROM 'array' THEN
+            po_data := util.result_error('membership:config_bad_document',
+                format('the permissions of service %s are a list', v_key));
+            RETURN;
+        END IF;
+        IF jsonb_array_length(COALESCE(v_svc->'roles', '[]'::jsonb)) > 50 THEN
+            po_data := util.result_error('membership:config_bad_document',
+                format('service %s declares at most 50 roles', v_key));
+            RETURN;
+        END IF;
+        IF jsonb_array_length(COALESCE(v_svc->'permissions', '[]'::jsonb)) > 500 THEN
+            po_data := util.result_error('membership:config_bad_document',
+                format('service %s declares at most 500 permissions', v_key));
+            RETURN;
+        END IF;
+
+        FOR v_role IN SELECT * FROM jsonb_array_elements(COALESCE(v_svc->'roles', '[]'::jsonb)) LOOP
+            IF jsonb_typeof(v_role) IS DISTINCT FROM 'object' THEN
+                po_data := util.result_error('membership:config_bad_document',
+                    format('a role of service %s is an object', v_key));
+                RETURN;
+            END IF;
+            SELECT k INTO v_member FROM jsonb_object_keys(v_role) k
+             WHERE k NOT IN ('group', 'level', 'description') LIMIT 1;
+            IF v_member IS NOT NULL THEN
+                po_data := util.result_error('membership:config_bad_document',
+                    format('a role of service %s carries a member this register does not know: %s',
+                           v_key, left(v_member, 100)));
+                RETURN;
+            END IF;
+            -- A level is rendered into a token as group:level, and a token's scopes are
+            -- separated by spaces: a level holding a space, a tab, a colon or a slash
+            -- would put a second scope into the token of whoever holds it. So a group
+            -- and a level are each one lower-case word, and are never echoed.
+            IF jsonb_typeof(v_role->'group') IS DISTINCT FROM 'string' OR v_role->>'group' !~ c_word THEN
+                po_data := util.result_error('membership:config_bad_document',
+                    format('a role of service %s has a group that is not a lower-case word of letters, digits and hyphens, at most 64 characters long', v_key));
+                RETURN;
+            END IF;
+            IF jsonb_typeof(v_role->'level') IS DISTINCT FROM 'string' OR v_role->>'level' !~ c_word THEN
+                po_data := util.result_error('membership:config_bad_document',
+                    format('a role of service %s has a level that is not a lower-case word of letters, digits and hyphens, at most 64 characters long', v_key));
+                RETURN;
+            END IF;
+            IF v_role ? 'description' AND jsonb_typeof(v_role->'description') NOT IN ('string', 'null') THEN
+                po_data := util.result_error('membership:config_bad_document',
+                    format('a role of service %s has a description that is not text', v_key));
+                RETURN;
+            END IF;
+            IF jsonb_typeof(v_role->'description') = 'string' AND char_length(v_role->>'description') > 256 THEN
+                po_data := util.result_error('membership:config_bad_document',
+                    format('a role of service %s has a description of more than 256 characters', v_key));
+                RETURN;
+            END IF;
+
+            -- A level reaches a token without its service key, and who administers a
+            -- tenant is decided by the group and the level alone, so a group must mean
+            -- one service's ladder: it is the register's own for `membership`, and
+            -- otherwise belongs to the first service that defined it.
+            v_group := v_role->>'group';
+            IF (v_group = 'membership' AND v_key <> 'rolebyte')
+               OR EXISTS (SELECT 1 FROM rolebyte.role_definition rd WHERE rd.role_group = v_group AND rd.service_key <> v_key)
+               OR (v_groups ? v_group AND v_groups->>v_group <> v_key) THEN
+                po_data := util.result_error('membership:config_key_conflict',
+                    format('service %s may not declare group %s: a group belongs to one service', v_key, v_group));
+                RETURN;
+            END IF;
+            v_groups := v_groups || jsonb_build_object(v_group, v_key);
+        END LOOP;
+
+        FOR v_perm IN SELECT * FROM jsonb_array_elements(COALESCE(v_svc->'permissions', '[]'::jsonb)) LOOP
+            IF jsonb_typeof(v_perm) = 'object' THEN
+                IF jsonb_typeof(v_perm->'description') = 'string' AND char_length(v_perm->>'description') > 256 THEN
+                    po_data := util.result_error('membership:config_bad_document',
+                        format('a permission of service %s has a description of more than 256 characters', v_key));
+                    RETURN;
+                END IF;
+                IF jsonb_typeof(v_perm->'labels') = 'object'
+                   AND EXISTS (SELECT 1 FROM jsonb_each(v_perm->'labels') l
+                                WHERE jsonb_typeof(l.value) = 'string' AND char_length(l.value #>> '{}') > 256) THEN
+                    po_data := util.result_error('membership:config_bad_document',
+                        format('a permission of service %s has a label of more than 256 characters', v_key));
+                    RETURN;
+                END IF;
+            END IF;
+        END LOOP;
+    END LOOP;
+
+    -- Only the keys the caller was granted, checked before anything is written.
+    SELECT trim(s->>'key') INTO v_key
+      FROM jsonb_array_elements(v_section->'services') s
+     WHERE NOT (v_allowed @> to_jsonb(trim(s->>'key')))
+     LIMIT 1;
+    IF v_key IS NOT NULL THEN
+        po_data := util.result_error('membership:forbidden',
+            format('the caller may not declare service %s', left(v_key, 100)));
+        RETURN;
+    END IF;
+
+    v_report := rolebyte.config_vocabulary(v_actor, v_section->'services');
+
+    SELECT e INTO v_line
+      FROM jsonb_array_elements((v_report->'services') || (v_report->'roles') || (v_report->'permissions')) e
+     WHERE e->>'status' = 'refused'
+     LIMIT 1;
+    IF v_line IS NOT NULL THEN
+        RAISE EXCEPTION '%', util.result_error('membership:' || (v_line->>'reason'),
+            COALESCE(NULLIF(v_line->>'key', ''), 'an entry') || ': ' || COALESCE(v_line->>'detail', 'refused'))
+            USING errcode = 'P0001';
+    END IF;
+
+    INSERT INTO rolebyte.service_declaration (service_key, declared_by, first_declared_at, last_declared_at)
+    SELECT DISTINCT trim(s->>'key'), v_actor, clock_timestamp(), clock_timestamp()
+      FROM jsonb_array_elements(v_section->'services') s
+    ON CONFLICT (service_key, declared_by) DO UPDATE SET last_declared_at = EXCLUDED.last_declared_at;
+
+    po_data := util.result_success(v_report);
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    -- The lock (or a row another registration holds) was not had in time: an outage
+    -- of the moment, not a decision about the document, so it is raised as an error
+    -- the caller can tell apart from a refusal and try again.
+    WHEN lock_not_available THEN
+        RAISE EXCEPTION '%', util.result_error('membership:busy', 'the registration lock is busy, try again')
+            USING errcode = 'P0001';
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.service_declare(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.service_declare(jsonb, jsonb) TO rolebyte_public;
 
 -- ===========================================================================
 -- Entitlement: what a tenant has, read by resolve. Written only by the

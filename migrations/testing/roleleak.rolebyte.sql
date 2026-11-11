@@ -64,7 +64,9 @@ BEGIN
         || 'VALUES (''x'', ''x'', ''svc:x'', ''x'')');
     -- the deployment's list of services, their roles and their permissions is
     -- the deployment's to write: the register's own role runs none of the acts
-    -- that write it, so no request a tenant can make reaches them.
+    -- that write it directly, so no request a tenant can make reaches them. The one
+    -- exception is a service's declaration of itself, which the register's role runs
+    -- and which is checked further down.
     IF has_function_privilege('rolebyte_public', 'rolebyte.service_register(jsonb, jsonb)', 'EXECUTE')
        OR has_function_privilege('rolebyte_public', 'rolebyte.role_define(jsonb, jsonb)', 'EXECUTE')
        OR has_function_privilege('rolebyte_public', 'rolebyte.permission_declare(jsonb, jsonb)', 'EXECUTE')
@@ -77,6 +79,23 @@ BEGIN
         'CALL rolebyte.role_define(''{"actor":"x","service":"x","group":"x","level":"x"}''::jsonb, NULL::jsonb)');
     PERFORM pg_temp.deny('rolebyte_public',
         'CALL rolebyte.permission_declare(''{"actor":"x","service":"x","permission":{}}''::jsonb, NULL::jsonb)');
+    -- a service's own declaration of itself is the one registration the register's
+    -- role runs, for a request a service makes; no other service's role runs it, and
+    -- nobody reads or writes the table of declarations directly.
+    IF NOT has_function_privilege('rolebyte_public', 'rolebyte.service_declare(jsonb, jsonb)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'the register''s role must run rolebyte.service_declare';
+    END IF;
+    IF has_function_privilege('authbyte_public', 'rolebyte.service_declare(jsonb, jsonb)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'ROLE LEAK: another service''s role may run rolebyte.service_declare';
+    END IF;
+    PERFORM pg_temp.deny('authbyte_public',
+        'CALL rolebyte.service_declare(''{"actor":"svc:x","allowed":[],"section":{"services":[]}}''::jsonb, NULL::jsonb)');
+    PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.service_declaration');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'INSERT INTO rolebyte.service_declaration(service_key, declared_by) VALUES (''x'', ''svc:x'')');
+    PERFORM pg_temp.deny('rolebyte_public', 'UPDATE rolebyte.service_declaration SET last_declared_at = now()');
+    PERFORM pg_temp.deny('rolebyte_public', 'DELETE FROM rolebyte.service_declaration');
+    PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.service_declaration');
     -- what a workspace is, its members may read.
     IF NOT has_function_privilege('rolebyte_public', 'rolebyte.tenant_get(jsonb, jsonb)', 'EXECUTE') THEN
         RAISE EXCEPTION 'the register''s role must run rolebyte.tenant_get';
@@ -159,4 +178,26 @@ BEGIN
         RAISE EXCEPTION 'ROLE LEAK: own_rung_register wrote more than the register''s own rung: %', v;
     END IF;
     RAISE NOTICE 'roleleak.rolebyte: the door''s own rung, and nothing else';
+END $$;
+
+-- A service's declaration runs as the register's own role and writes only the keys
+-- the caller was granted: a key outside the list is refused and nothing is written.
+DO $$
+DECLARE
+    v      jsonb;
+    before bigint;
+BEGIN
+    SELECT (SELECT count(*) FROM rolebyte.service) + (SELECT count(*) FROM rolebyte.event)
+           + (SELECT count(*) FROM rolebyte.service_declaration) INTO before;
+    SET ROLE rolebyte_public;
+    CALL rolebyte.service_declare('{"actor":"svc:leak-test","allowed":["leak-granted"],
+        "section":{"services":[{"key":"leak-granted"},{"key":"leak-intruder"}]}}'::jsonb, v);
+    RESET ROLE;
+    IF v->>'result' IS DISTINCT FROM 'error' OR v->>'code' IS DISTINCT FROM 'membership:forbidden'
+       OR EXISTS (SELECT 1 FROM rolebyte.service WHERE key IN ('leak-granted', 'leak-intruder'))
+       OR (SELECT (SELECT count(*) FROM rolebyte.service) + (SELECT count(*) FROM rolebyte.event)
+                  + (SELECT count(*) FROM rolebyte.service_declaration)) IS DISTINCT FROM before THEN
+        RAISE EXCEPTION 'ROLE LEAK: a declaration naming a key outside the granted list was not refused whole: %', v;
+    END IF;
+    RAISE NOTICE 'roleleak.rolebyte: a declaration writes only what the caller was granted';
 END $$;

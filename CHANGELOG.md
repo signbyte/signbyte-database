@@ -4,6 +4,25 @@ Notable changes to the signbyte database — the schema set and the migration im
 newest first, per release. Written for whoever applies the image to a database or
 integrates against the procedures.
 
+## v0.8.0
+
+### Added — rolebyte: a service declares itself to the register
+
+One migration, `rolebyte/V23`: the table `rolebyte.service_declaration` keeps, per service key and declaring client,
+when a declaration was first and last accepted. The new procedure `rolebyte.service_declare` takes `actor` (the
+declaring client, a service subject `svc:<client id>`), `allowed` (the service keys that client may declare) and
+`section` (a `services` list in the shape `permissions_register` reads). It writes through the same registering acts
+as `permissions_register` and answers the same report. It is all or nothing: one refused line leaves nothing of the
+document written. It is granted to the register's own role, while `service_register`, `role_define`,
+`permission_declare` and `permissions_register` keep their grants. It refuses a key outside `allowed`
+(`membership:forbidden`); a member it does not know, a group or level that is not one lower-case word of at most 64
+characters, more than 50 services, 50 levels or 500 permissions per service, a text over 256 characters and a document
+over 262144 bytes (`membership:config_bad_document`); and a group already defined under another service key, and
+`membership` under any key but `rolebyte` (`membership:config_key_conflict`). When the registration lock cannot be had
+within five seconds it answers `membership:busy`, to try again. `rolebyte.role_define` now also refuses whitespace,
+`:` and `/` in a group or level. **Apply:** an older rolebyte runs on it unchanged; the rolebyte release that declares
+its own levels at start (v0.5.0) needs this location version.
+
 ## v0.7.0
 
 ### Changed — util: a name is at most 100 characters, in every language
