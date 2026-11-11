@@ -204,7 +204,7 @@ END $$;
 
 -- The deployment's own company and its administrators are written only through their
 -- procedures: the register's role can neither read nor write the two tables, runs the
--- five procedures it is given, and no other service's role runs them.
+-- six procedures it is given, and no other service's role runs them.
 DO $$
 DECLARE
     v_proc text;
@@ -223,7 +223,8 @@ BEGIN
     PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.deployment_admin');
 
     FOREACH v_proc IN ARRAY ARRAY['deployment_company_mark', 'deployment_get', 'deployment_admin_add',
-                                  'deployment_admin_remove', 'deployment_admin_list'] LOOP
+                                  'deployment_admin_remove', 'deployment_admin_list',
+                                  'deployment_admin_apply'] LOOP
         IF NOT has_function_privilege('rolebyte_public', format('rolebyte.%s(jsonb, jsonb)', v_proc), 'EXECUTE') THEN
             RAISE EXCEPTION 'the register''s role must run rolebyte.%', v_proc;
         END IF;
@@ -246,5 +247,9 @@ BEGIN
         'CALL rolebyte.deployment_company_set(''{"actor":"x","tenantId":"x"}''::jsonb, NULL::jsonb)');
     PERFORM pg_temp.deny('authbyte_public',
         'CALL rolebyte.deployment_company_set(''{"actor":"x","tenantId":"x"}''::jsonb, NULL::jsonb)');
+    -- The helper that adds an invited member is not a service's call.
+    IF has_function_privilege('rolebyte_public', 'rolebyte.invited_member_add(text, text, text, text)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'ROLE LEAK: the register''s role may run rolebyte.invited_member_add';
+    END IF;
     RAISE NOTICE 'roleleak.rolebyte: the deployment''s tables are the procedures'' alone';
 END $$;

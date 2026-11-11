@@ -1133,6 +1133,39 @@ $$;
 REVOKE ALL ON PROCEDURE rolebyte.own_rung_register(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.own_rung_register(jsonb, jsonb) TO rolebyte_public;
 
+-- invited_member_add — add someone who is not yet a member of the tenant, invited,
+-- under the tenant's default user type, holding no role. Writes the account and
+-- its two history lines (`userInvited`, `userTypeAssigned`) and answers the new
+-- account. The caller has already checked that no account exists and holds the
+-- tenant's administrators' lock.
+CREATE OR REPLACE FUNCTION rolebyte.invited_member_add(p_actor text, p_tenant text, p_subject text, p_display text)
+RETURNS rolebyte.user_account
+LANGUAGE plpgsql
+VOLATILE
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_user rolebyte.user_account%ROWTYPE;
+    v_type text;
+BEGIN
+    v_type := rolebyte.ensure_default_user_type(p_actor, p_tenant, NULL);
+    INSERT INTO rolebyte.user_account (id, tenant_id, subject_key, display_name, status,
+                                       user_type_id, user_type_source)
+    VALUES (util.generate_ulid(), p_tenant, p_subject, p_display, 'invited', v_type, 'workspaceDefault')
+    RETURNING * INTO v_user;
+
+    INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+    VALUES (util.generate_ulid(), p_actor, p_tenant, v_user.id, 'userInvited',
+            jsonb_build_object('subjectKey', p_subject, 'displayName', p_display));
+    INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+    VALUES (util.generate_ulid(), p_actor, p_tenant, v_user.id, 'userTypeAssigned',
+            jsonb_build_object('userTypeId', v_type, 'from', '', 'source', 'workspaceDefault'));
+    RETURN v_user;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION rolebyte.invited_member_add(text, text, text, text) FROM PUBLIC;
+
 -- administrator_make — the one step the operator's acts share: make the person
 -- with this subject key an administrator of this tenant, whatever anyone else's
 -- state. A member receives the rung; someone not yet a member is added,
@@ -1155,7 +1188,6 @@ DECLARE
     v_rung    text;
     v_invited boolean := false;
     v_changed boolean := false;
-    v_type    text;
 BEGIN
     -- The message does not echo the key: this text reaches logs.
     IF p_subject IS NULL OR NOT rolebyte.is_typed_subject_key(p_subject) THEN
@@ -1180,18 +1212,7 @@ BEGIN
     END IF;
 
     IF NOT FOUND THEN
-        v_type := rolebyte.ensure_default_user_type(p_actor, p_tenant, NULL);
-        INSERT INTO rolebyte.user_account (id, tenant_id, subject_key, display_name, status,
-                                           user_type_id, user_type_source)
-        VALUES (util.generate_ulid(), p_tenant, p_subject, p_display, 'invited', v_type, 'workspaceDefault')
-        RETURNING * INTO v_user;
-
-        INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
-        VALUES (util.generate_ulid(), p_actor, p_tenant, v_user.id, 'userInvited',
-                jsonb_build_object('subjectKey', p_subject, 'displayName', p_display));
-        INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
-        VALUES (util.generate_ulid(), p_actor, p_tenant, v_user.id, 'userTypeAssigned',
-                jsonb_build_object('userTypeId', v_type, 'from', '', 'source', 'workspaceDefault'));
+        v_user := rolebyte.invited_member_add(p_actor, p_tenant, p_subject, p_display);
         v_invited := true;
     END IF;
 
@@ -4492,6 +4513,222 @@ $$;
 
 REVOKE ALL ON PROCEDURE rolebyte.deployment_admin_list(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.deployment_admin_list(jsonb, jsonb) TO rolebyte_public;
+
+-- deployment_admin_apply — applies the person the deployment's settings name, once
+-- per value. The register's own role runs it at start.
+--
+-- Input: `actor` (required); `mode`, exactly `saas` or `local`; `subjectKey`, a
+-- person's key (`sub:` and a 26-character id; a service's key is refused);
+-- `displayName` (optional; blank is absent). Refused `membership:invalid`, writing
+-- nothing, for no actor, any other mode and a key that is not a person's; no
+-- message repeats the key. Otherwise it always answers success with {outcome,
+-- companyId, userId, companyMade, memberAdded, companyMarked, listAdded,
+-- rungGranted}; companyId and userId are null where there is none. The three last
+-- are true only for what this call did: marked a company as the deployment's own
+-- (whatever the outcome that follows), put a new row on the deployment
+-- administrators' list, newly granted the company administrator's rung. The outcome
+-- is one of:
+--   applied        the value was new and has been applied and remembered; a value
+--                  is the person's key together with the mode, so the same person
+--                  in the other mode is new;
+--   unchanged      an account of the person exists and this value, key and mode, is
+--                  the one last applied: nothing is written, so an entry taken off
+--                  the list by hand is not put back;
+--   removedMember  the person's account in the company is revoked: one history line
+--                  (`deploymentAdminRefused`, from settings, reason revoked) and
+--                  nothing else, whatever the value, and the value is not remembered;
+--   nameNeeded     the person has no account and no `displayName` was given: nothing
+--                  is written (a company that had to be marked first stays marked);
+--   noCompany      none is marked and several exist: nothing is written.
+--
+-- The deployment's lock is taken first, then, when no company is marked, the lock
+-- `bootstrap_state` takes (so that the one-time bootstrap door and this procedure
+-- cannot both make a first company), then the company's administrators' lock, then
+-- the account's row, the order `user_revoke` documents. `bootstrap_state` takes its
+-- lock and nothing after it, so no procedure takes the two in the other order. The
+-- deployment's own
+-- company is the marked one; with none marked and exactly one company, that one is
+-- marked as `deployment_company_mark` marks it. With no company at all (a fresh
+-- deployment) and a name, one transaction makes a company with an empty name (its
+-- `tenantCreated` line) and no starting roles, which are made when the company's
+-- details are entered; marks it (`deploymentCompanyMarked`); makes the person its
+-- administrator, invited, with the name given; on `saas` puts them on the list; and
+-- remembers the value. `companyMade` and `memberAdded` are then true.
+--
+-- With a company: a person with no account and a name is added invited (on `saas`
+-- holding no role, on `local` holding the administrator's rung); a person with an
+-- account and a new value gains the rung on `local` and nothing about the account on
+-- `saas`. On `saas` the account is then put on the deployment's list as added from
+-- the settings (`deploymentAdminAdded` only for a new entry); on `local` the list is
+-- never written. Remembering the value sets the deployment's three columns and writes
+-- one history line (`deploymentAdminSettingApplied`, {mode}). A suspended company is
+-- treated like any other.
+CREATE OR REPLACE PROCEDURE rolebyte.deployment_admin_apply(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_actor    text := NULLIF(trim(pi_data->>'actor'), '');
+    v_mode     text := pi_data->>'mode';
+    v_subject  text := NULLIF(trim(pi_data->>'subjectKey'), '');
+    v_display  text := NULLIF(trim(pi_data->>'displayName'), '');
+    v_company  text;
+    v_last     text;
+    v_last_mode text;
+    v_count    integer;
+    v_made_co  boolean := false;
+    v_added    boolean := false;
+    v_marked   boolean := false;
+    v_listed   boolean := false;
+    v_rung     boolean := false;
+    v_user     rolebyte.user_account%ROWTYPE;
+    v_found    boolean;
+    v_res      jsonb;
+BEGIN
+    IF v_actor IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'actor is required');
+        RETURN;
+    END IF;
+    IF v_mode IS NULL OR v_mode NOT IN ('saas', 'local') THEN
+        po_data := util.result_error('membership:invalid', 'mode is saas or local');
+        RETURN;
+    END IF;
+    IF v_subject IS NULL OR left(v_subject, 4) <> 'sub:' OR NOT rolebyte.is_typed_subject_key(v_subject) THEN
+        po_data := util.result_error('membership:invalid', 'subjectKey must be a person''s key, sub:<person id>');
+        RETURN;
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtextextended('rolebyte.deployment', 0));
+
+    SELECT company_tenant_id, admin_setting_subject_key, admin_setting_mode
+      INTO v_company, v_last, v_last_mode
+      FROM rolebyte.deployment;
+
+    IF v_company IS NULL THEN
+        -- The one-time bootstrap door's lock, so the door and this procedure cannot
+        -- both make a first company.
+        PERFORM pg_advisory_xact_lock(hashtext('rolebyte.bootstrap'));
+
+        SELECT count(*), min(id) INTO v_count, v_company FROM rolebyte.tenant;
+        IF v_count > 1 THEN
+            po_data := util.result_success(jsonb_build_object(
+                'outcome', 'noCompany', 'companyId', NULL, 'userId', NULL,
+                'companyMade', false, 'memberAdded', false,
+                'companyMarked', false, 'listAdded', false, 'rungGranted', false));
+            RETURN;
+        END IF;
+        IF v_count = 1 THEN
+            INSERT INTO rolebyte.deployment (company_tenant_id) VALUES (v_company);
+            INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
+            VALUES (util.generate_ulid(), v_actor, v_company, 'deploymentCompanyMarked', '{}'::jsonb);
+            v_marked := true;
+        ELSE
+            -- A fresh deployment: the company is made here, with an empty name.
+            IF v_display IS NULL THEN
+                po_data := util.result_success(jsonb_build_object(
+                    'outcome', 'nameNeeded', 'companyId', NULL, 'userId', NULL,
+                    'companyMade', false, 'memberAdded', false,
+                    'companyMarked', false, 'listAdded', false, 'rungGranted', false));
+                RETURN;
+            END IF;
+            v_company := util.generate_ulid();
+            INSERT INTO rolebyte.tenant (id, name) VALUES (v_company, '');
+            INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
+            VALUES (util.generate_ulid(), v_actor, v_company, 'tenantCreated',
+                    jsonb_build_object('name', ''));
+            INSERT INTO rolebyte.deployment (company_tenant_id) VALUES (v_company);
+            INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
+            VALUES (util.generate_ulid(), v_actor, v_company, 'deploymentCompanyMarked', '{}'::jsonb);
+            v_made_co := true;
+            v_marked := true;
+        END IF;
+    END IF;
+
+    PERFORM rolebyte.administrator_lock(v_company);
+
+    SELECT * INTO v_user
+      FROM rolebyte.user_account
+     WHERE tenant_id = v_company AND subject_key = v_subject
+       FOR UPDATE;
+    v_found := FOUND;
+
+    IF v_found AND v_user.status = 'revoked' THEN
+        INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+        VALUES (util.generate_ulid(), v_actor, v_company, v_user.id, 'deploymentAdminRefused',
+                jsonb_build_object('from', 'settings', 'reason', 'revoked'));
+        po_data := util.result_success(jsonb_build_object(
+            'outcome', 'removedMember', 'companyId', v_company, 'userId', v_user.id,
+            'companyMade', false, 'memberAdded', false,
+            'companyMarked', v_marked, 'listAdded', false, 'rungGranted', false));
+        RETURN;
+    END IF;
+
+    IF v_found AND v_last IS NOT DISTINCT FROM v_subject AND v_last_mode IS NOT DISTINCT FROM v_mode THEN
+        po_data := util.result_success(jsonb_build_object(
+            'outcome', 'unchanged', 'companyId', v_company, 'userId', v_user.id,
+            'companyMade', false, 'memberAdded', false,
+            'companyMarked', v_marked, 'listAdded', false, 'rungGranted', false));
+        RETURN;
+    END IF;
+
+    IF NOT v_found AND v_display IS NULL THEN
+        po_data := util.result_success(jsonb_build_object(
+            'outcome', 'nameNeeded', 'companyId', v_company, 'userId', NULL,
+            'companyMade', false, 'memberAdded', false,
+            'companyMarked', v_marked, 'listAdded', false, 'rungGranted', false));
+        RETURN;
+    END IF;
+
+    IF v_mode = 'local' OR v_made_co THEN
+        -- The person becomes an administrator of the company: added when not a
+        -- member, the rung granted where it is lacking.
+        v_res := rolebyte.administrator_make(v_actor, v_company, v_subject, v_display);
+        IF v_res->>'result' IS DISTINCT FROM 'success' THEN
+            RAISE EXCEPTION '%', v_res USING errcode = 'P0001';
+        END IF;
+        v_user.id := v_res->'data'->>'userId';
+        v_added := (v_res->'data'->>'invited')::boolean;
+        v_rung := (v_res->'data'->>'changed')::boolean;
+    ELSIF NOT v_found THEN
+        -- On saas a new member holds no role: the right comes from the list.
+        v_user := rolebyte.invited_member_add(v_actor, v_company, v_subject, v_display);
+        v_added := true;
+    END IF;
+
+    IF v_mode = 'saas' THEN
+        INSERT INTO rolebyte.deployment_admin (user_id, added_by, added_from)
+        VALUES (v_user.id, v_actor, 'settings')
+        ON CONFLICT (user_id) DO NOTHING;
+        IF FOUND THEN
+            v_listed := true;
+            INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+            VALUES (util.generate_ulid(), v_actor, v_company, v_user.id, 'deploymentAdminAdded',
+                    jsonb_build_object('addedFrom', 'settings'));
+        END IF;
+    END IF;
+
+    UPDATE rolebyte.deployment
+       SET admin_setting_subject_key = v_subject, admin_setting_applied_at = now(),
+           admin_setting_mode = v_mode;
+    INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+    VALUES (util.generate_ulid(), v_actor, v_company, v_user.id, 'deploymentAdminSettingApplied',
+            jsonb_build_object('mode', v_mode));
+
+    po_data := util.result_success(jsonb_build_object(
+        'outcome', 'applied', 'companyId', v_company, 'userId', v_user.id,
+        'companyMade', v_made_co, 'memberAdded', v_added,
+        'companyMarked', v_marked, 'listAdded', v_listed, 'rungGranted', v_rung));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.deployment_admin_apply(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.deployment_admin_apply(jsonb, jsonb) TO rolebyte_public;
 
 -- ===========================================================================
 -- Entitlement: what a tenant has, read by resolve. Written only by the
