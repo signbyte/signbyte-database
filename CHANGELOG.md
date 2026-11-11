@@ -51,6 +51,25 @@ register's own: `service_declare` refuses a level in the group and a service wit
 (`membership:config_key_conflict`), `role_define` refuses the group and `service_register` the key
 (`membership:invalid`). **Apply:** an older rolebyte runs on it unchanged.
 
+### Added — rolebyte: the person a deployment's settings name
+
+One migration, `rolebyte/V25`: `rolebyte.deployment` gains three nullable columns, `admin_setting_subject_key`,
+`admin_setting_mode` and `admin_setting_applied_at`: the person last applied from the deployment's settings, in which
+mode, and when. The new procedure `rolebyte.deployment_admin_apply`, granted to the register's own role, takes `actor`,
+`mode` (`saas` or `local`), `subjectKey` (a person's `sub:` key) and an optional `displayName`; a missing actor, any
+other mode and a key that is not a person's are refused `membership:invalid` with nothing written. Every other call
+answers `{outcome, companyId, userId, companyMade, memberAdded, companyMarked, listAdded, rungGranted}`, the last three
+saying what the call itself changed. The outcome is `applied`; `unchanged` (an account exists and this value, person
+and mode, is the one last applied: nothing is written, so an entry taken off the list is not put back);
+`removedMember` (the person's account in the company is revoked: one history line, `deploymentAdminRefused`, and
+nothing else); `nameNeeded` (no account and no name); or `noCompany` (none marked and several exist). With no company
+at all and a name it makes a company with an empty name and no starting roles, marks it as the deployment's own and
+makes the person its administrator. On `saas` the person is put on the list of the deployment's administrators as
+added from the settings, a new member holding no role; on `local` the person holds the company's administrator rung
+and the list is never written. Each value applied writes one history line, `deploymentAdminSettingApplied`. When no
+company is marked the procedure also takes the lock the one-time bootstrap door takes. **Apply:** an older rolebyte
+runs on it unchanged.
+
 ## v0.7.0
 
 ### Changed — util: a name is at most 100 characters, in every language
