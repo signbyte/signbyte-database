@@ -506,5 +506,48 @@ BEGIN
         RAISE EXCEPTION 'a refused role_define should write nothing';
     END IF;
 
+    -- Only a lower-case word is a group or a level: an upper-case letter, a no-break
+    -- space (white space outside ASCII, which a scope is split on where it is read)
+    -- and a 65-character word are refused with nothing written; a 64-character word
+    -- is the longest accepted.
+    FOREACH v_bad IN ARRAY ARRAY['Read', 'rea' || chr(160) || 'd', 'a' || repeat('b', 64)] LOOP
+        v := NULL;
+        CALL rolebyte.role_define(jsonb_build_object('actor', 'op:test', 'service', 'decl-a', 'group', 'decl-a', 'level', v_bad), v);
+        IF v->>'code' IS DISTINCT FROM 'membership:invalid' THEN
+            RAISE EXCEPTION 'role_define should refuse the level of % characters: %', char_length(v_bad), v;
+        END IF;
+        v := NULL;
+        CALL rolebyte.role_define(jsonb_build_object('actor', 'op:test', 'service', 'decl-a', 'group', v_bad, 'level', 'read'), v);
+        IF v->>'code' IS DISTINCT FROM 'membership:invalid' THEN
+            RAISE EXCEPTION 'role_define should refuse the group of % characters: %', char_length(v_bad), v;
+        END IF;
+    END LOOP;
+    IF pg_temp.fingerprint() IS DISTINCT FROM v_fp THEN
+        RAISE EXCEPTION 'a refused role_define should write nothing';
+    END IF;
+    v := NULL;
+    CALL rolebyte.role_define(jsonb_build_object('actor', 'op:test', 'service', 'decl-a', 'group', 'decl-a',
+        'level', 'a' || repeat('b', 63)), v);
+    IF v->>'result' IS DISTINCT FROM 'success' THEN
+        RAISE EXCEPTION 'role_define should accept a level of 64 characters: %', v;
+    END IF;
+
+    -- The service key `deployment` is the register's own: refused by the deployment's
+    -- registration and by a service's declaration, with nothing written.
+    v_fp := pg_temp.fingerprint();
+    v := NULL;
+    CALL rolebyte.service_register('{"actor":"op:test","service":"deployment"}'::jsonb, v);
+    IF v->>'code' IS DISTINCT FROM 'membership:invalid' THEN
+        RAISE EXCEPTION 'service_register should refuse the key deployment: %', v;
+    END IF;
+    PERFORM pg_temp.refused('["deployment"]'::jsonb, '{"services":[{"key":"deployment"}]}'::jsonb,
+        'membership:config_key_conflict', 'the register''s own', 'declaring the service key deployment');
+    PERFORM pg_temp.refused('["deployment"]'::jsonb,
+        '{"services":[{"key":"deployment","permissions":[{"feature":"admin","act":"view","class":"ordinary","plane":"tenant"}]}]}'::jsonb,
+        'membership:config_key_conflict', 'the register''s own', 'declaring a permission under the service key deployment');
+    IF pg_temp.fingerprint() IS DISTINCT FROM v_fp THEN
+        RAISE EXCEPTION 'a refused key deployment should write nothing';
+    END IF;
+
     RAISE NOTICE 'unit.rolebyte_declaration: all assertions passed';
 END $$;

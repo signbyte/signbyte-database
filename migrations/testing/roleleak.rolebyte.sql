@@ -201,3 +201,50 @@ BEGIN
     END IF;
     RAISE NOTICE 'roleleak.rolebyte: a declaration writes only what the caller was granted';
 END $$;
+
+-- The deployment's own company and its administrators are written only through their
+-- procedures: the register's role can neither read nor write the two tables, runs the
+-- five procedures it is given, and no other service's role runs them.
+DO $$
+DECLARE
+    v_proc text;
+BEGIN
+    PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.deployment');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'INSERT INTO rolebyte.deployment(company_tenant_id) VALUES (''x'')');
+    PERFORM pg_temp.deny('rolebyte_public', 'UPDATE rolebyte.deployment SET company_tenant_id = ''x''');
+    PERFORM pg_temp.deny('rolebyte_public', 'DELETE FROM rolebyte.deployment');
+    PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.deployment_admin');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'INSERT INTO rolebyte.deployment_admin(user_id, added_by, added_from) VALUES (''x'', ''x'', ''settings'')');
+    PERFORM pg_temp.deny('rolebyte_public', 'UPDATE rolebyte.deployment_admin SET added_by = ''x''');
+    PERFORM pg_temp.deny('rolebyte_public', 'DELETE FROM rolebyte.deployment_admin');
+    PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.deployment');
+    PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.deployment_admin');
+
+    FOREACH v_proc IN ARRAY ARRAY['deployment_company_mark', 'deployment_get', 'deployment_admin_add',
+                                  'deployment_admin_remove', 'deployment_admin_list'] LOOP
+        IF NOT has_function_privilege('rolebyte_public', format('rolebyte.%s(jsonb, jsonb)', v_proc), 'EXECUTE') THEN
+            RAISE EXCEPTION 'the register''s role must run rolebyte.%', v_proc;
+        END IF;
+        IF has_function_privilege('authbyte_public', format('rolebyte.%s(jsonb, jsonb)', v_proc), 'EXECUTE') THEN
+            RAISE EXCEPTION 'ROLE LEAK: another service''s role may run rolebyte.%', v_proc;
+        END IF;
+        PERFORM pg_temp.deny('authbyte_public',
+            format('CALL rolebyte.%s(''{}''::jsonb, NULL::jsonb)', v_proc));
+    END LOOP;
+    -- Naming the deployment's company is the deployment's own act, run as the
+    -- location's owner: the register's role (which marks a company only when it is
+    -- the only one) and every other service's role are refused it.
+    IF has_function_privilege('rolebyte_public', 'rolebyte.deployment_company_set(jsonb, jsonb)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'ROLE LEAK: the register''s role may run rolebyte.deployment_company_set';
+    END IF;
+    IF has_function_privilege('authbyte_public', 'rolebyte.deployment_company_set(jsonb, jsonb)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'ROLE LEAK: another service''s role may run rolebyte.deployment_company_set';
+    END IF;
+    PERFORM pg_temp.deny('rolebyte_public',
+        'CALL rolebyte.deployment_company_set(''{"actor":"x","tenantId":"x"}''::jsonb, NULL::jsonb)');
+    PERFORM pg_temp.deny('authbyte_public',
+        'CALL rolebyte.deployment_company_set(''{"actor":"x","tenantId":"x"}''::jsonb, NULL::jsonb)');
+    RAISE NOTICE 'roleleak.rolebyte: the deployment''s tables are the procedures'' alone';
+END $$;

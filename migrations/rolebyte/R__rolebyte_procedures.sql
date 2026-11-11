@@ -122,6 +122,14 @@ BEGIN
         RETURN;
     END IF;
 
+    -- `deployment` is the register's own word: a permission is spelled
+    -- service/feature:act, so a service under this key could declare a scope that
+    -- reads as one of the deployment's own group.
+    IF v_key = 'deployment' THEN
+        po_data := util.result_error('membership:invalid', 'the service key deployment is the register''s own and is not a service');
+        RETURN;
+    END IF;
+
     v_display := COALESCE(NULLIF(trim(pi_data->>'displayName'), ''), v_key);
 
     INSERT INTO rolebyte.service (key, display_name)
@@ -156,6 +164,8 @@ REVOKE EXECUTE ON PROCEDURE rolebyte.service_register(jsonb, jsonb) FROM rolebyt
 
 -- role_define — one (group, level) role of a service, as data (idempotent
 -- upsert), defined by whoever runs the deployment. Emits `roleDefined` only when the row is new.
+-- The group `deployment` is the register's own and is refused for every service
+-- (`membership:invalid`): it is not a level anything may define.
 CREATE OR REPLACE PROCEDURE rolebyte.role_define(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -184,21 +194,22 @@ BEGIN
         RETURN;
     END IF;
 
-    -- `/` marks a permission; a role spelled like one would hand out an act
-    -- nobody declared or ticked.
-    IF position('/' IN v_group) > 0 THEN
-        po_data := util.result_error('membership:invalid', 'a role group may not contain "/"');
+    -- A role is rendered into a token as group:level, and a scope is split on white
+    -- space where a token is read, including white space outside ASCII (a no-break
+    -- space, say), which a list of forbidden characters would miss. So only a
+    -- known-safe alphabet is accepted: a group and a level are each one lower-case
+    -- word. That also keeps out `/`, which marks a permission, and `:`.
+    IF v_group !~ '^[a-z][a-z0-9-]{0,63}$' THEN
+        po_data := util.result_error('membership:invalid', 'a role group is a lower-case word of letters, digits and hyphens, at most 64 characters long');
         RETURN;
     END IF;
-    IF position('/' IN v_level) > 0 THEN
-        po_data := util.result_error('membership:invalid', 'a role level may not contain "/"');
+    IF v_level !~ '^[a-z][a-z0-9-]{0,63}$' THEN
+        po_data := util.result_error('membership:invalid', 'a role level is a lower-case word of letters, digits and hyphens, at most 64 characters long');
         RETURN;
     END IF;
-    -- A role is rendered into a token as group:level, and a token's scopes are
-    -- separated by whitespace: a group or a level holding whitespace or a colon
-    -- would put a second scope into the token of whoever holds the role.
-    IF v_group ~ '[[:space:]:]' OR v_level ~ '[[:space:]:]' THEN
-        po_data := util.result_error('membership:invalid', 'a role group and level may not contain whitespace or ":"');
+    -- The register's own group: nothing may define a level in it.
+    IF v_group = 'deployment' THEN
+        po_data := util.result_error('membership:invalid', 'the group deployment is the register''s own and is not a level anything may define');
         RETURN;
     END IF;
 
@@ -1364,7 +1375,9 @@ GRANT EXECUTE ON PROCEDURE rolebyte.role_revoke(jsonb, jsonb) TO rolebyte_public
 -- in the same act and with its own line (`chartPersonRemoved`, marked
 -- `revoked`), so the chart's editor never lists or counts someone who lifts
 -- nothing. The administrators' note about them is cleared in the same act, with
--- its own line (`noteChanged`, marked `revoked`) when there was one. Revoking the
+-- its own line (`noteChanged`, marked `revoked`) when there was one. An account on
+-- the deployment's list of administrators leaves it in the same act, with its own
+-- line (`deploymentAdminRemoved`, marked `revoked`). Revoking the
 -- tenant's last administrator is refused (administrator_removal_refusal).
 CREATE OR REPLACE PROCEDURE rolebyte.user_revoke(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
@@ -1386,6 +1399,16 @@ BEGIN
         po_data := util.result_error('membership:invalid', 'actor, tenantId and userId are required');
         RETURN;
     END IF;
+
+    -- The deployment's lock first, before any account row is locked. The acts that
+    -- write the deployment's list take that lock and then the account's row
+    -- (`deployment_admin_add` shares the row, `deployment_admin_remove` writes a
+    -- line that references it), so every path locks in the order lock, then row,
+    -- and two of them can never wait for each other. It is taken for every revoke,
+    -- not only for a listed account: whether the account is listed cannot be known
+    -- without a read that a concurrent add would make stale. A revoke is an
+    -- offboarding act, rare, and the lock is held only to the end of the act.
+    PERFORM pg_advisory_xact_lock(hashtextextended('rolebyte.deployment', 0));
 
     v_refusal := rolebyte.administrator_removal_refusal(v_tenant, v_user_id);
     IF v_refusal IS NOT NULL THEN
@@ -1424,6 +1447,16 @@ BEGIN
         INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
         VALUES (util.generate_ulid(), v_actor, v_tenant, v_user_id, 'chartPersonRemoved',
                 jsonb_build_object('positionId', v_left, 'revoked', true));
+    END IF;
+
+    -- A person who lost access also stops administering the deployment, in the
+    -- same act: the entry is deleted and its own line written, so nothing remains
+    -- to come back with the account.
+    DELETE FROM rolebyte.deployment_admin WHERE user_id = v_user_id;
+    IF FOUND THEN
+        INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+        VALUES (util.generate_ulid(), v_actor, v_tenant, v_user_id, 'deploymentAdminRemoved',
+                jsonb_build_object('revoked', true));
     END IF;
 
     po_data := util.result_success(jsonb_build_object('revoked', true));
@@ -1476,6 +1509,13 @@ GRANT EXECUTE ON PROCEDURE rolebyte.user_revoke(jsonb, jsonb) TO rolebyte_public
 -- A retired permission still reaches everyone whose role ticks it, and no longer
 -- reaches an administrator through the checkbox: it is kept for the roles that
 -- hold it, not handed out anew.
+--
+-- A membership carries a further member, `highScopes`, only for a person (a `sub:`
+-- key) whose account is in the deployment's own company and is on the list of the
+-- deployment's administrators: `["deployment:admin"]`, a scope that counts only on
+-- a strong sign-in, which the caller decides. In every other case the member is
+-- absent, not empty, so every other answer is unchanged. The group `deployment` is
+-- the register's own: a granted level in it is never answered in `scopes`.
 CREATE OR REPLACE PROCEDURE rolebyte.resolve(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1528,6 +1568,10 @@ BEGIN
                     FROM rolebyte.assignment a
                     JOIN rolebyte.role_definition rd ON rd.id = a.role_definition_id
                     WHERE a.user_id = u.id AND a.state = 'granted'
+                      -- The group `deployment` is the register's own: a level in it
+                      -- never reaches `scopes`, whatever is stored. The deployment's
+                      -- own right is answered only as `highScopes`, below.
+                      AND rd.role_group <> 'deployment'
                     UNION ALL
                     -- An administrator holds every declared permission, a
                     -- per-field family bare: every field of its kind. A role's
@@ -1568,7 +1612,19 @@ BEGIN
                                   OR starts_with(sp.feature_key, e.feature_key || '/')))
                 ) s
             ), '[]'::jsonb)
-        ) AS m
+        )
+        -- The scopes that count only on a strong sign-in, a member of the answer
+        -- only when due: this membership is a person's account in the deployment's
+        -- own company and is on the list of the deployment's administrators. Every
+        -- other membership answers exactly as it did without this member.
+        || CASE WHEN left(u.subject_key, 4) = 'sub:'
+                     AND EXISTS (SELECT 1
+                                   FROM rolebyte.deployment d
+                                   JOIN rolebyte.deployment_admin da ON da.user_id = u.id
+                                  WHERE d.company_tenant_id = u.tenant_id)
+                THEN jsonb_build_object('highScopes', jsonb_build_array('deployment:admin'))
+                ELSE '{}'::jsonb END
+        AS m
         FROM rolebyte.user_account u
         JOIN rolebyte.tenant t ON t.id = u.tenant_id
         CROSS JOIN LATERAL (SELECT rolebyte.is_administrator(u.id) AS yes) adm
@@ -3912,6 +3968,13 @@ BEGIN
             RETURN;
         END IF;
         v_key := v_svc->>'key';
+        -- The service key `deployment` is the register's own: a permission under it
+        -- would read as a scope of the group of the same name.
+        IF v_key = 'deployment' THEN
+            po_data := util.result_error('membership:config_key_conflict',
+                'the service key deployment is the register''s own and is not a service');
+            RETURN;
+        END IF;
         IF v_svc ? 'displayName' AND jsonb_typeof(v_svc->'displayName') NOT IN ('string', 'null') THEN
             po_data := util.result_error('membership:config_bad_document',
                 format('the display name of service %s is text', v_key));
@@ -3984,9 +4047,16 @@ BEGIN
 
             -- A level reaches a token without its service key, and who administers a
             -- tenant is decided by the group and the level alone, so a group must mean
-            -- one service's ladder: it is the register's own for `membership`, and
-            -- otherwise belongs to the first service that defined it.
+            -- one service's ladder: it is the register's own for `membership`
+            -- (declarable only under the key `rolebyte`) and for `deployment` (under
+            -- no key), and otherwise belongs to the first service that defined it.
             v_group := v_role->>'group';
+            -- The group `deployment` is the register's own, under any service key.
+            IF v_group = 'deployment' THEN
+                po_data := util.result_error('membership:config_key_conflict',
+                    format('service %s may not declare group deployment: the group is the register''s own and not a level anything may define', v_key));
+                RETURN;
+            END IF;
             IF (v_group = 'membership' AND v_key <> 'rolebyte')
                OR EXISTS (SELECT 1 FROM rolebyte.role_definition rd WHERE rd.role_group = v_group AND rd.service_key <> v_key)
                OR (v_groups ? v_group AND v_groups->>v_group <> v_key) THEN
@@ -4060,6 +4130,368 @@ $$;
 
 REVOKE ALL ON PROCEDURE rolebyte.service_declare(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.service_declare(jsonb, jsonb) TO rolebyte_public;
+
+-- ===========================================================================
+-- The deployment's own company, and the people who administer the deployment.
+--
+-- One tenant is the company that runs the deployment (rolebyte.deployment, at
+-- most one row). A short list (rolebyte.deployment_admin) names the people, each
+-- as their account in that company, who administer the whole deployment. The
+-- right is answered by `resolve` as the member `highScopes` of that company's
+-- membership only, so a person removed from the company stops having it at the
+-- next answer with no change to the list. The procedures below that write share
+-- one lock, so two calls made at once cannot both mark a company, and `user_revoke`
+-- takes the same lock before it touches an account, so the list and the accounts
+-- are always locked in the same order.
+-- ===========================================================================
+
+-- The deployment's own company is marked in two ways. The register marks one by
+-- itself only when there is no choice to make: exactly one company exists.
+-- With several companies the choice belongs to whoever runs the deployment, who
+-- makes it with `deployment_company_set`, which the register's own role is
+-- refused.
+--
+-- deployment_company_mark (the register's own, at its start) — marks the only
+-- company, and takes no tenant: an input carrying `tenantId` is refused
+-- (`membership:invalid`). Never an error otherwise. Nothing is marked and no
+-- company exists: {company: null, changed: false, companies: 0}. Exactly one
+-- company exists and none is marked: it is marked, with one history line in it
+-- (`deploymentCompanyMarked`), and the answer is {company: {id, name},
+-- changed: true, companies: 1}. A company is already marked, however many exist:
+-- the answer is that company, changed false. Several companies and none marked:
+-- nothing is written, {company: null, changed: false, companies: n}.
+CREATE OR REPLACE PROCEDURE rolebyte.deployment_company_mark(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_actor   text := NULLIF(trim(pi_data->>'actor'), '');
+    v_current text;
+    v_only    text;
+    v_count   integer;
+    v_name    text;
+BEGIN
+    IF v_actor IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'actor is required');
+        RETURN;
+    END IF;
+    IF pi_data ? 'tenantId' THEN
+        po_data := util.result_error('membership:invalid', 'this act names no company');
+        RETURN;
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtextextended('rolebyte.deployment', 0));
+
+    -- One statement, so the number and the only company come from the same
+    -- snapshot: a company opened a moment later cannot turn a count of one into a
+    -- choice already made.
+    SELECT count(*), min(id), min(name) INTO v_count, v_only, v_name FROM rolebyte.tenant;
+
+    SELECT company_tenant_id INTO v_current FROM rolebyte.deployment;
+    IF v_current IS NOT NULL THEN
+        SELECT name INTO v_name FROM rolebyte.tenant WHERE id = v_current;
+        po_data := util.result_success(jsonb_build_object(
+            'company', jsonb_build_object('id', v_current, 'name', v_name),
+            'changed', false,
+            'companies', v_count));
+        RETURN;
+    END IF;
+
+    -- No choice to make only when there is exactly one company; any other number
+    -- leaves the deployment without a company of its own.
+    IF v_count <> 1 THEN
+        po_data := util.result_success(jsonb_build_object(
+            'company', NULL,
+            'changed', false,
+            'companies', v_count));
+        RETURN;
+    END IF;
+
+    INSERT INTO rolebyte.deployment (company_tenant_id) VALUES (v_only);
+    INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
+    VALUES (util.generate_ulid(), v_actor, v_only, 'deploymentCompanyMarked', '{}'::jsonb);
+
+    po_data := util.result_success(jsonb_build_object(
+        'company', jsonb_build_object('id', v_only, 'name', v_name),
+        'changed', true,
+        'companies', 1));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.deployment_company_mark(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.deployment_company_mark(jsonb, jsonb) TO rolebyte_public;
+
+-- deployment_company_set — the deliberate act of whoever runs the deployment:
+-- names the tenant `tenantId` (required) as the deployment's own company. Granted
+-- to nobody: the deployment calls it as the location's owner, and the register's
+-- own role is refused it, so no request a tenant can make chooses the company.
+-- An unknown tenant is refused `membership:not_found`; with nothing marked the
+-- tenant is marked, with one history line in it (`deploymentCompanyMarked`); the
+-- tenant already marked changes nothing; a different one already marked is
+-- refused `membership:conflict`. Answers {company: {id, name}, changed}.
+CREATE OR REPLACE PROCEDURE rolebyte.deployment_company_set(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_actor   text := NULLIF(trim(pi_data->>'actor'), '');
+    v_tenant  text := NULLIF(trim(pi_data->>'tenantId'), '');
+    v_current text;
+    v_name    text;
+BEGIN
+    IF v_actor IS NULL OR v_tenant IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'actor and tenantId are required');
+        RETURN;
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtextextended('rolebyte.deployment', 0));
+
+    SELECT name INTO v_name FROM rolebyte.tenant WHERE id = v_tenant;
+    IF NOT FOUND THEN
+        po_data := util.result_error('membership:not_found', 'no such tenant');
+        RETURN;
+    END IF;
+
+    SELECT company_tenant_id INTO v_current FROM rolebyte.deployment;
+    IF v_current IS NOT NULL THEN
+        IF v_current <> v_tenant THEN
+            po_data := util.result_error('membership:conflict', 'the deployment already has a company of its own');
+            RETURN;
+        END IF;
+        po_data := util.result_success(jsonb_build_object(
+            'company', jsonb_build_object('id', v_tenant, 'name', v_name),
+            'changed', false));
+        RETURN;
+    END IF;
+
+    INSERT INTO rolebyte.deployment (company_tenant_id) VALUES (v_tenant);
+    INSERT INTO rolebyte.event (id, actor, tenant_id, kind, payload)
+    VALUES (util.generate_ulid(), v_actor, v_tenant, 'deploymentCompanyMarked', '{}'::jsonb);
+
+    po_data := util.result_success(jsonb_build_object(
+        'company', jsonb_build_object('id', v_tenant, 'name', v_name),
+        'changed', true));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.deployment_company_set(jsonb, jsonb) FROM PUBLIC;
+REVOKE EXECUTE ON PROCEDURE rolebyte.deployment_company_set(jsonb, jsonb) FROM rolebyte_public;
+
+-- deployment_get — the deployment's own company, for a member of it: answers
+-- {company: {id, name}} when `subjectKey` is a person's key (`sub:`) whose account
+-- in that company is active and the company itself is active, as `resolve` answers
+-- a membership; and {company: null} otherwise: no company marked, a suspended
+-- company, a member of another company only, a service's key, an unknown or an
+-- absent subject. Never an error for the subject; nothing here is a secret from a member.
+CREATE OR REPLACE PROCEDURE rolebyte.deployment_get(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_subject text := NULLIF(trim(pi_data->>'subjectKey'), '');
+    v_company jsonb;
+BEGIN
+    IF v_subject IS NOT NULL AND left(v_subject, 4) = 'sub:' THEN
+        SELECT jsonb_build_object('id', t.id, 'name', t.name) INTO v_company
+          FROM rolebyte.deployment d
+          JOIN rolebyte.tenant t ON t.id = d.company_tenant_id
+          JOIN rolebyte.user_account u ON u.tenant_id = t.id
+         WHERE u.subject_key = v_subject
+           AND u.status = 'active'
+           AND t.status = 'active';
+    END IF;
+
+    po_data := util.result_success(jsonb_build_object('company', v_company));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.deployment_get(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.deployment_get(jsonb, jsonb) TO rolebyte_public;
+
+-- deployment_admin_add — makes a person's account in the deployment's own company
+-- one of the deployment's administrators. `addedFrom` is `settings` or `screen`.
+-- Refused before any write: no company marked (`membership:conflict`), an
+-- `addedFrom` that is neither (`membership:invalid`), a subject that is not a
+-- person's key, so never a service's account (`membership:invalid`), no account
+-- of that subject in the deployment's own company, including a person who is a
+-- member of other companies only (`membership:not_found`), and a revoked account
+-- (`membership:conflict`). An invited account is accepted; the right is answered
+-- once the account is active. An account already on the list changes nothing.
+-- A new entry writes one history line in the company (`deploymentAdminAdded`).
+-- Answers {userId, changed}.
+CREATE OR REPLACE PROCEDURE rolebyte.deployment_admin_add(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_actor   text := NULLIF(trim(pi_data->>'actor'), '');
+    v_subject text := NULLIF(trim(pi_data->>'subjectKey'), '');
+    v_from    text := NULLIF(trim(pi_data->>'addedFrom'), '');
+    v_company text;
+    v_user_id text;
+    v_status  text;
+BEGIN
+    IF v_actor IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'actor is required');
+        RETURN;
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtextextended('rolebyte.deployment', 0));
+
+    SELECT company_tenant_id INTO v_company FROM rolebyte.deployment;
+    IF v_company IS NULL THEN
+        po_data := util.result_error('membership:conflict', 'the deployment has no company of its own yet');
+        RETURN;
+    END IF;
+    IF v_from IS NULL OR v_from NOT IN ('settings', 'screen') THEN
+        po_data := util.result_error('membership:invalid', 'addedFrom is settings or screen');
+        RETURN;
+    END IF;
+    IF v_subject IS NULL OR left(v_subject, 4) <> 'sub:' OR length(v_subject) = 4 THEN
+        po_data := util.result_error('membership:invalid', 'subjectKey is a person''s key, sub:<person id>');
+        RETURN;
+    END IF;
+
+    SELECT id, status INTO v_user_id, v_status
+      FROM rolebyte.user_account
+     WHERE tenant_id = v_company AND subject_key = v_subject
+       FOR SHARE;
+    IF v_user_id IS NULL THEN
+        po_data := util.result_error('membership:not_found', 'the person has no account in the deployment''s company');
+        RETURN;
+    END IF;
+    IF v_status = 'revoked' THEN
+        po_data := util.result_error('membership:conflict', 'the person''s account in the deployment''s company is revoked');
+        RETURN;
+    END IF;
+
+    INSERT INTO rolebyte.deployment_admin (user_id, added_by, added_from)
+    VALUES (v_user_id, v_actor, v_from)
+    ON CONFLICT (user_id) DO NOTHING;
+    IF NOT FOUND THEN
+        po_data := util.result_success(jsonb_build_object('userId', v_user_id, 'changed', false));
+        RETURN;
+    END IF;
+
+    INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+    VALUES (util.generate_ulid(), v_actor, v_company, v_user_id, 'deploymentAdminAdded',
+            jsonb_build_object('addedFrom', v_from));
+
+    po_data := util.result_success(jsonb_build_object('userId', v_user_id, 'changed', true));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.deployment_admin_add(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.deployment_admin_add(jsonb, jsonb) TO rolebyte_public;
+
+-- deployment_admin_remove — takes an account off the list of the deployment's
+-- administrators. An account that is not on it is refused `membership:not_found`.
+-- Otherwise the entry is deleted and one history line written in the company
+-- (`deploymentAdminRemoved`). Answers {userId, subjectKey, changed: true}.
+CREATE OR REPLACE PROCEDURE rolebyte.deployment_admin_remove(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+DECLARE
+    v_actor   text := NULLIF(trim(pi_data->>'actor'), '');
+    v_user_id text := NULLIF(trim(pi_data->>'userId'), '');
+    v_company text;
+    v_key     text;
+BEGIN
+    IF v_actor IS NULL OR v_user_id IS NULL THEN
+        po_data := util.result_error('membership:invalid', 'actor and userId are required');
+        RETURN;
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtextextended('rolebyte.deployment', 0));
+
+    DELETE FROM rolebyte.deployment_admin WHERE user_id = v_user_id;
+    IF NOT FOUND THEN
+        po_data := util.result_error('membership:not_found', 'the account is not a deployment administrator');
+        RETURN;
+    END IF;
+
+    SELECT COALESCE(d.company_tenant_id, u.tenant_id), u.subject_key INTO v_company, v_key
+      FROM rolebyte.user_account u
+      LEFT JOIN rolebyte.deployment d ON true
+     WHERE u.id = v_user_id;
+
+    INSERT INTO rolebyte.event (id, actor, tenant_id, user_id, kind, payload)
+    VALUES (util.generate_ulid(), v_actor, v_company, v_user_id, 'deploymentAdminRemoved', '{}'::jsonb);
+
+    po_data := util.result_success(jsonb_build_object('userId', v_user_id, 'subjectKey', v_key, 'changed', true));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.deployment_admin_remove(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.deployment_admin_remove(jsonb, jsonb) TO rolebyte_public;
+
+-- deployment_admin_list — the deployment's administrators whose account is not
+-- revoked, by display name then account id: {admins: [{userId, subjectKey,
+-- displayName, status, lastSignedInOn, addedBy, addedFrom, addedAt}]}. An empty
+-- list when no company is marked or nobody is on it. An entry whose account was
+-- revoked stays in the table but is not listed, and never carries the right.
+CREATE OR REPLACE PROCEDURE rolebyte.deployment_admin_list(IN pi_data jsonb, INOUT po_data jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = rolebyte, util, pg_temp
+AS $$
+BEGIN
+    po_data := util.result_success(jsonb_build_object('admins', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+                   'userId',         u.id,
+                   'subjectKey',     u.subject_key,
+                   'displayName',    u.display_name,
+                   'status',         u.status,
+                   'lastSignedInOn', u.last_signed_in_on,
+                   'addedBy',        da.added_by,
+                   'addedFrom',      da.added_from,
+                   'addedAt',        da.added_at)
+               ORDER BY u.display_name COLLATE "C", u.id COLLATE "C")
+          FROM rolebyte.deployment_admin da
+          JOIN rolebyte.user_account u ON u.id = da.user_id
+          JOIN rolebyte.deployment d ON d.company_tenant_id = u.tenant_id
+         WHERE u.status <> 'revoked'), '[]'::jsonb)));
+EXCEPTION
+    WHEN sqlstate 'P0001' THEN
+        RAISE;
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
+END;
+$$;
+
+REVOKE ALL ON PROCEDURE rolebyte.deployment_admin_list(jsonb, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE rolebyte.deployment_admin_list(jsonb, jsonb) TO rolebyte_public;
 
 -- ===========================================================================
 -- Entitlement: what a tenant has, read by resolve. Written only by the

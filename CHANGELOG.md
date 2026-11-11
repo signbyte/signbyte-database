@@ -19,9 +19,37 @@ document written. It is granted to the register's own role, while `service_regis
 characters, more than 50 services, 50 levels or 500 permissions per service, a text over 256 characters and a document
 over 262144 bytes (`membership:config_bad_document`); and a group already defined under another service key, and
 `membership` under any key but `rolebyte` (`membership:config_key_conflict`). When the registration lock cannot be had
-within five seconds it answers `membership:busy`, to try again. `rolebyte.role_define` now also refuses whitespace,
-`:` and `/` in a group or level. **Apply:** an older rolebyte runs on it unchanged; the rolebyte release that declares
+within five seconds it answers `membership:busy`, to try again. `rolebyte.role_define` now takes only a lower-case word
+(`^[a-z][a-z0-9-]{0,63}$`) as a group or a level. **Apply:** an older rolebyte runs on it unchanged; the rolebyte release that declares
 its own levels at start (v0.5.0) needs this location version.
+
+### Added — rolebyte: the deployment's own company and its deployment admins
+
+One migration, `rolebyte/V24`: `rolebyte.deployment` (at most one row, present once a company is marked) and
+`rolebyte.deployment_admin` (one row per person: the account, who added it, from `settings` or `screen`, and when).
+The register's own role has no access to either table. Six procedures, five granted to the register's role:
+`deployment_company_mark` (`actor`; takes no tenant, an input with `tenantId` is `membership:invalid`; marks the
+company by itself only when exactly one company exists, with one history line; answers
+`{company: {id, name} | null, changed, companies}`; with none, or with several and none marked, it writes nothing and
+answers a null company; with one already marked it answers it, `changed` false; never an error for these);
+`deployment_company_set` (`actor`, `tenantId`; the deployment's own act for a deployment with several companies,
+granted to nobody and run as the location's owner; an unknown tenant is `membership:not_found`, a different company
+than the marked one is `membership:conflict`, the marked one again changes nothing);
+`deployment_get` (optional `subjectKey`; answers `{company: {id, name} | null}`, the company only for a person whose
+account in it is active while the company is active); `deployment_admin_add` (`actor`, `subjectKey`, `addedFrom` = `settings` or `screen`;
+answers `{userId, changed}`; refuses no company marked and a revoked account with `membership:conflict`, a bad
+`addedFrom` or a key that is not a person's with `membership:invalid`, no account in the company, including a person
+in other companies only, with `membership:not_found`; an invited account is accepted); `deployment_admin_remove`
+(`actor`, `userId`; answers `{userId, subjectKey, changed: true}`; an account not listed is `membership:not_found`);
+`deployment_admin_list` (answers `{admins: [{userId, subjectKey, displayName, status, lastSignedInOn, addedBy,
+addedFrom, addedAt}]}` for entries whose account is not revoked). Each change of the company or the list is a history
+line in the company. `rolebyte.resolve` now gives a membership `"highScopes": ["deployment:admin"]` when it is a
+person's account in the deployment's own company and is on the list; in every other case the member is absent, so
+every other answer is unchanged. The scope is never in `scopes`. Revoking an account (`user_revoke`) deletes its entry
+on the list in the same act, with a history line. The group `deployment` and the service key `deployment` are the
+register's own: `service_declare` refuses a level in the group and a service with the key
+(`membership:config_key_conflict`), `role_define` refuses the group and `service_register` the key
+(`membership:invalid`). **Apply:** an older rolebyte runs on it unchanged.
 
 ## v0.7.0
 
