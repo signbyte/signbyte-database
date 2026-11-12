@@ -6,6 +6,37 @@ integrates against the procedures.
 
 ## v0.8.0
 
+### Added — rolebyte: a setup window for a company that was just opened
+
+One migration, `rolebyte/V28`: `rolebyte.user_account` gains `setup_until`, null on every existing row and settable only
+on a row whose key starts with `svc:`. A row that carries it is a setup account's row for ever: the register answers it
+as a member only while its window is open, and never otherwise. A window is open while the row is active, `setup_until`
+is in the future and nobody of the company has ever signed in: the company has no active account of a person (a key
+that starts with `sub:`) and its history has no line of a person's account becoming active (`claimAttached`,
+`directoryAdmitted`), so a company a person has signed in to is never opened or answered again, even if that person was
+removed since. A repeatable file
+adds two procedures granted to the register's own role, both behind the door's caller check: `company_setup_open`
+(`tenantId`, `account`) opens a window of ten minutes, a length that is not an input, for one service account of the
+company and answers `{account, scopes, endsAt}`; `company_setup_close` (`tenantId`) ends it and answers `{changed}`.
+Opening is refused `membership:invalid` for an account that is not a service account's key, `membership:not_found` for
+a company that does not exist or is not active, and `membership:conflict` when the account is listed under a product,
+when somebody of the company has signed in (even if removed since), when a window is already open in the company, or when the account is already a
+standing member of it. While the window is open the account holds exactly the company's permissions of the class
+`tenantConfiguration` that are not retired and whose service and feature the company is entitled to, as
+`service/feature:act` scopes: no level, no role, no administrator's box, no place on the list of the deployment's
+administrators and no scope for a strong sign-in. An entitlement taken away, or a person becoming active, ends the
+account's permissions or membership at once. `company_setup_close`, and every procedure that makes a person's account
+active (`claim_attach`, `directory_admit`), end the company's setup rows for good: each active setup row (one whose
+time ran out included) is made revoked with a `setupClosed` line of its own, so a second close ends nothing and a
+window never comes back. Both history lines carry the account's row (`user_id`) and the payload `{subjectKey}`. A setup
+row is never an ordinary member: `is_administrator` is false for it, and `role_grant`, `tenant_role_grant`,
+`user_type_assign` and `administrator_set` refuse it as they refuse a revoked account (`chart_person_place` already
+refuses a service account's key).
+`products_register` refuses a list that names,
+as a product's account, a key that has a setup row in any company (`membership:invalid`, 'product N lists an account
+that is used for setting companies up'). New history kinds: `setupOpened`, `setupClosed`.
+Nothing existing is answered differently.
+
 ### Changed — rolebyte: what a service declared is its own to change
 
 One migration, `rolebyte/V27`: `rolebyte.service_permission` gains `declared_by`, the declaring client's service

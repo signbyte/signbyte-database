@@ -631,7 +631,9 @@ BEGIN
         po_data := util.result_error('membership:invalid', 'every member has a user type; choose one');
         RETURN;
     END IF;
-    SELECT user_type_id INTO v_before FROM rolebyte.user_account WHERE tenant_id = v_tenant AND id = v_user FOR UPDATE;
+    -- A setup account's row is not a member whose type is set.
+    SELECT user_type_id INTO v_before FROM rolebyte.user_account
+     WHERE tenant_id = v_tenant AND id = v_user AND setup_until IS NULL FOR UPDATE;
     IF NOT FOUND THEN
         po_data := util.result_error('membership:not_found', 'no such member');
         RETURN;

@@ -1856,6 +1856,15 @@ BEGIN
                         format('product %s has an account that needs a key, svc:<client id>, that is not an assistant''s', v_pos));
                     RETURN;
                 END IF;
+                -- An account a company's setup window uses is not a product's: the follow of
+                -- a company's accounts would make its row active, and the register never
+                -- answers such a row outside a window.
+                IF EXISTS (SELECT 1 FROM rolebyte.user_account u
+                            WHERE u.subject_key = v_subject AND u.setup_until IS NOT NULL) THEN
+                    po_data := util.result_error('membership:invalid',
+                        format('product %s lists an account that is used for setting companies up', v_pos));
+                    RETURN;
+                END IF;
                 IF rolebyte.door_name(v_acct->'displayName') IS NULL THEN
                     po_data := util.result_error('membership:invalid',
                         format('product %s has an account that needs a displayName of 1 to 200 characters with no control character', v_pos));
@@ -1936,6 +1945,20 @@ BEGIN
     END LOOP;
 
     PERFORM pg_advisory_xact_lock(hashtextextended('rolebyte.deployment', 0));
+
+    -- The check on the accounts again, now that the lock is held: opening a setup
+    -- window takes the same lock, so no window can have been opened since the first
+    -- check.
+    FOR i IN 0 .. jsonb_array_length(v_norm) - 1 LOOP
+        IF EXISTS (SELECT 1
+                     FROM jsonb_array_elements(v_norm->i->'accounts') a
+                     JOIN rolebyte.user_account u ON u.subject_key = a->>'subjectKey'
+                    WHERE u.setup_until IS NOT NULL) THEN
+            po_data := util.result_error('membership:invalid',
+                format('product %s lists an account that is used for setting companies up', i + 1));
+            RETURN;
+        END IF;
+    END LOOP;
 
     -- A product some company has cannot leave the catalog.
     IF EXISTS (SELECT 1 FROM rolebyte.tenant_product tp

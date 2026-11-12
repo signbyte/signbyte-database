@@ -281,7 +281,8 @@ BEGIN
                                   'deployment_admins', 'deployment_door_check', 'company_open', 'company_has_set',
                                   'company_administrator_set', 'company_administrator_unset',
                                   'company_roles_seed', 'company_first_run', 'deployment_admin_grant',
-                                  'deployment_admin_revoke', 'local_company_follow'] LOOP
+                                  'deployment_admin_revoke', 'local_company_follow', 'company_setup_open',
+                                  'company_setup_close'] LOOP
         IF NOT has_function_privilege('rolebyte_public', format('rolebyte.%s(jsonb, jsonb)', v_proc), 'EXECUTE') THEN
             RAISE EXCEPTION 'the register''s role must run rolebyte.%', v_proc;
         END IF;
@@ -329,7 +330,9 @@ BEGIN
                                   'door_product_take(text, text, text)', 'door_local_products(text, text)',
                                   'door_product_json(text)',
                                   'door_company_json(text, boolean)', 'door_services_declared()',
-                                  'door_name(jsonb)', 'door_language(jsonb)'] LOOP
+                                  'door_name(jsonb)', 'door_language(jsonb)', 'setup_window_open(text)',
+                                  'setup_scopes(text)', 'setup_rows_end(text, text)',
+                                  'setup_company_entered(text)'] LOOP
         IF has_function_privilege('rolebyte_public', 'rolebyte.' || v_proc, 'EXECUTE') THEN
             RAISE EXCEPTION 'ROLE LEAK: the register''s role may run rolebyte.%', v_proc;
         END IF;

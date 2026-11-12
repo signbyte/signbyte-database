@@ -415,7 +415,9 @@ BEGIN
         'company_roles_seed', jsonb_build_object('tenantId', v_cust, 'language', 'lv'),
         'company_first_run', jsonb_build_object('name', 'Probe', 'language', 'en'),
         'deployment_admin_grant', jsonb_build_object('subjectKey', v_plain),
-        'deployment_admin_revoke', jsonb_build_object('userId', pg_temp.uid(v_dep, v_admin)));
+        'deployment_admin_revoke', jsonb_build_object('userId', pg_temp.uid(v_dep, v_admin)),
+        'company_setup_open', jsonb_build_object('tenantId', v_cust, 'account', 'svc:setup-probe'),
+        'company_setup_close', jsonb_build_object('tenantId', v_cust));
 
     -- A procedure added to the door later without the check must be added to the list above.
     SELECT array_agg(p.proname::text) INTO v_names
@@ -428,7 +430,7 @@ BEGIN
     IF v_extra IS NOT NULL THEN
         RAISE EXCEPTION 'procedures of the door that the caller''s check is not tested on: %', v_extra;
     END IF;
-    IF (SELECT count(*) FROM jsonb_object_keys(v_inputs)) IS DISTINCT FROM 14 THEN
+    IF (SELECT count(*) FROM jsonb_object_keys(v_inputs)) IS DISTINCT FROM 16 THEN
         RAISE EXCEPTION 'the list of the door''s procedures lost one';
     END IF;
 

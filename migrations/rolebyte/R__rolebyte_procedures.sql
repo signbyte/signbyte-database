@@ -809,6 +809,7 @@ DECLARE
     v_actor   text;
     v_subject text;
     v_claimed jsonb;
+    v_tenant  text;
 BEGIN
     v_actor := NULLIF(trim(pi_data->>'actor'), '');
     IF v_actor IS NULL THEN
@@ -847,6 +848,16 @@ BEGIN
     SELECT COALESCE(jsonb_agg(jsonb_build_object('userId', user_id, 'tenantId', tenant_id)), '[]'::jsonb)
     INTO v_claimed
     FROM logged;
+
+    -- A person who becomes active ends, for good, the setup window of each company
+    -- they became active in.
+    IF starts_with(v_subject, 'sub:') THEN
+        FOR v_tenant IN
+            SELECT DISTINCT c->>'tenantId' FROM jsonb_array_elements(v_claimed) c
+        LOOP
+            PERFORM rolebyte.setup_rows_end(v_actor, v_tenant);
+        END LOOP;
+    END IF;
 
     po_data := util.result_success(jsonb_build_object('claimed', v_claimed));
 EXCEPTION
@@ -1083,6 +1094,11 @@ BEGIN
         v_admitted := jsonb_build_array(jsonb_build_object('userId', v_user.id, 'tenantId', v_tenant));
     END IF;
 
+    -- A person who becomes active ends, for good, the company's setup window.
+    IF v_outcome = 'admitted' THEN
+        PERFORM rolebyte.setup_rows_end(v_actor, v_tenant);
+    END IF;
+
     po_data := util.result_success(jsonb_build_object(
         'outcome',  v_outcome,
         'tenantId', v_tenant,
@@ -1145,6 +1161,8 @@ AS $$
            AND a.state = 'granted'
            AND rolebyte.is_administrator_rung(rd.role_group, rd.role_level)
            AND u.status <> 'revoked'
+           -- A setup account's row is never an administrator, whatever it holds.
+           AND u.setup_until IS NULL
     );
 $$;
 
@@ -1346,7 +1364,8 @@ BEGIN
      WHERE tenant_id = p_tenant AND subject_key = p_subject
        FOR UPDATE;
 
-    IF FOUND AND v_user.status = 'revoked' THEN
+    -- A setup account's row is refused as a revoked account is.
+    IF FOUND AND (v_user.status = 'revoked' OR v_user.setup_until IS NOT NULL) THEN
         RETURN util.result_error('membership:conflict',
             format('%s no longer has access to this tenant, so cannot be made its administrator', v_user.display_name));
     END IF;
@@ -1416,8 +1435,10 @@ BEGIN
     END IF;
 
     -- Tenant-scoped user lookup: a foreign tenant's user answers not_found.
+    -- A setup account's row is refused as a revoked account is.
     IF NOT EXISTS (SELECT 1 FROM rolebyte.user_account
-                   WHERE id = v_user_id AND tenant_id = v_tenant AND status <> 'revoked') THEN
+                   WHERE id = v_user_id AND tenant_id = v_tenant AND status <> 'revoked'
+                     AND setup_until IS NULL) THEN
         po_data := util.result_error('membership:not_found', 'user does not exist');
         RETURN;
     END IF;
@@ -1681,6 +1702,10 @@ GRANT EXECUTE ON PROCEDURE rolebyte.user_revoke(jsonb, jsonb) TO rolebyte_public
 -- a strong sign-in, which the caller decides. In every other case the member is
 -- absent, not empty, so every other answer is unchanged. The group `deployment` is
 -- the register's own: a granted level in it is never answered in `scopes`.
+--
+-- A setup account's row (`setup_until` set) is answered only while its window is open
+-- (`setup_window_open`), with exactly the company's configuration permissions
+-- (`setup_scopes`) and never with `highScopes`; no level, role or tick is read for it.
 CREATE OR REPLACE PROCEDURE rolebyte.resolve(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1726,7 +1751,10 @@ BEGIN
             'tenantId',    u.tenant_id,
             'userId',      u.id,
             'displayName', u.display_name,
-            'scopes',      COALESCE((
+            -- A setup account's row (a window's, see `setup_scopes`) is answered with
+            -- the company's configuration permissions and with nothing else: none of
+            -- the branches below is read for it.
+            'scopes',      CASE WHEN u.setup_until IS NOT NULL THEN rolebyte.setup_scopes(u.tenant_id) ELSE COALESCE((
                 SELECT jsonb_agg(DISTINCT s.scope)
                 FROM (
                     SELECT rd.role_group || ':' || rd.role_level AS scope
@@ -1776,13 +1804,14 @@ BEGIN
                                   OR sp.feature_key = e.feature_key
                                   OR starts_with(sp.feature_key, e.feature_key || '/')))
                 ) s
-            ), '[]'::jsonb)
+            ), '[]'::jsonb) END
         )
         -- The scopes that count only on a strong sign-in, a member of the answer
         -- only when due: this membership is a person's account in the deployment's
         -- own company and is on the list of the deployment's administrators. Every
         -- other membership answers exactly as it did without this member.
         || CASE WHEN left(u.subject_key, 4) = 'sub:'
+                     AND u.setup_until IS NULL
                      AND EXISTS (SELECT 1
                                    FROM rolebyte.deployment d
                                    JOIN rolebyte.deployment_admin da ON da.user_id = u.id
@@ -1796,6 +1825,8 @@ BEGIN
         WHERE u.subject_key = v_subject
           AND u.status = 'active'
           AND t.status = 'active'
+          -- A setup account's row is a member only while its window is open.
+          AND (u.setup_until IS NULL OR rolebyte.setup_window_open(u.id))
     ) sub;
 
     po_data := util.result_success(jsonb_build_object('memberships', v_memberships));
@@ -3179,8 +3210,10 @@ BEGIN
     END IF;
 
     -- Tenant-scoped user lookup: a foreign tenant's user answers not_found.
+    -- A setup account's row is refused as a revoked account is.
     IF NOT EXISTS (SELECT 1 FROM rolebyte.user_account
-                   WHERE id = v_user_id AND tenant_id = v_tenant AND status <> 'revoked') THEN
+                   WHERE id = v_user_id AND tenant_id = v_tenant AND status <> 'revoked'
+                     AND setup_until IS NULL) THEN
         po_data := util.result_error('membership:not_found', 'user does not exist');
         RETURN;
     END IF;
