@@ -204,7 +204,8 @@ END $$;
 
 -- The deployment's own company and its administrators are written only through their
 -- procedures: the register's role can neither read nor write the two tables, runs the
--- six procedures it is given, and no other service's role runs them.
+-- three procedures it is given (and none of the older acts on the list itself), and no
+-- other service's role runs them.
 DO $$
 DECLARE
     v_proc text;
@@ -222,9 +223,7 @@ BEGIN
     PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.deployment');
     PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.deployment_admin');
 
-    FOREACH v_proc IN ARRAY ARRAY['deployment_company_mark', 'deployment_get', 'deployment_admin_add',
-                                  'deployment_admin_remove', 'deployment_admin_list',
-                                  'deployment_admin_apply'] LOOP
+    FOREACH v_proc IN ARRAY ARRAY['deployment_company_mark', 'deployment_get', 'deployment_admin_apply'] LOOP
         IF NOT has_function_privilege('rolebyte_public', format('rolebyte.%s(jsonb, jsonb)', v_proc), 'EXECUTE') THEN
             RAISE EXCEPTION 'the register''s role must run rolebyte.%', v_proc;
         END IF;
@@ -234,6 +233,23 @@ BEGIN
         PERFORM pg_temp.deny('authbyte_public',
             format('CALL rolebyte.%s(''{}''::jsonb, NULL::jsonb)', v_proc));
     END LOOP;
+    -- The list of the deployment's administrators is reached only through the door, which
+    -- proves who the caller is first: the register's role is refused the three older
+    -- procedures, and so is every other service's.
+    FOREACH v_proc IN ARRAY ARRAY['deployment_admin_add', 'deployment_admin_remove', 'deployment_admin_list'] LOOP
+        IF has_function_privilege('rolebyte_public', format('rolebyte.%s(jsonb, jsonb)', v_proc), 'EXECUTE') THEN
+            RAISE EXCEPTION 'ROLE LEAK: the register''s role may run rolebyte.%', v_proc;
+        END IF;
+        IF has_function_privilege('authbyte_public', format('rolebyte.%s(jsonb, jsonb)', v_proc), 'EXECUTE') THEN
+            RAISE EXCEPTION 'ROLE LEAK: another service''s role may run rolebyte.%', v_proc;
+        END IF;
+    END LOOP;
+    PERFORM pg_temp.deny('rolebyte_public',
+        'CALL rolebyte.deployment_admin_add(''{"actor":"x","subjectKey":"sub:x","addedFrom":"screen"}''::jsonb, NULL::jsonb)');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'CALL rolebyte.deployment_admin_remove(''{"actor":"x","userId":"x"}''::jsonb, NULL::jsonb)');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'CALL rolebyte.deployment_admin_list(''{}''::jsonb, NULL::jsonb)');
     -- Naming the deployment's company is the deployment's own act, run as the
     -- location's owner: the register's role (which marks a company only when it is
     -- the only one) and every other service's role are refused it.
@@ -252,4 +268,74 @@ BEGIN
         RAISE EXCEPTION 'ROLE LEAK: the register''s role may run rolebyte.invited_member_add';
     END IF;
     RAISE NOTICE 'roleleak.rolebyte: the deployment''s tables are the procedures'' alone';
+END $$;
+
+-- The deployment's door: the register's role runs each procedure of it and no other
+-- service's role does; the catalog of products is written only by the one act the
+-- register's role is refused; and the helpers are nobody's to call.
+DO $$
+DECLARE
+    v_proc text;
+BEGIN
+    FOREACH v_proc IN ARRAY ARRAY['company_list', 'company_get', 'company_administrators', 'deployment_products',
+                                  'deployment_admins', 'deployment_door_check', 'company_open', 'company_has_set',
+                                  'company_administrator_set', 'company_administrator_unset',
+                                  'company_roles_seed', 'company_first_run', 'deployment_admin_grant',
+                                  'deployment_admin_revoke', 'local_company_follow'] LOOP
+        IF NOT has_function_privilege('rolebyte_public', format('rolebyte.%s(jsonb, jsonb)', v_proc), 'EXECUTE') THEN
+            RAISE EXCEPTION 'the register''s role must run rolebyte.%', v_proc;
+        END IF;
+        IF has_function_privilege('authbyte_public', format('rolebyte.%s(jsonb, jsonb)', v_proc), 'EXECUTE') THEN
+            RAISE EXCEPTION 'ROLE LEAK: another service''s role may run rolebyte.%', v_proc;
+        END IF;
+        PERFORM pg_temp.deny('authbyte_public',
+            format('CALL rolebyte.%s(''{}''::jsonb, NULL::jsonb)', v_proc));
+    END LOOP;
+
+    -- The catalog of products is written by the deployment, as the location's owner.
+    IF has_function_privilege('rolebyte_public', 'rolebyte.products_register(jsonb, jsonb)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'ROLE LEAK: the register''s role may run rolebyte.products_register';
+    END IF;
+    IF has_function_privilege('authbyte_public', 'rolebyte.products_register(jsonb, jsonb)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'ROLE LEAK: another service''s role may run rolebyte.products_register';
+    END IF;
+    PERFORM pg_temp.deny('rolebyte_public',
+        'CALL rolebyte.products_register(''{"actor":"x","products":[]}''::jsonb, NULL::jsonb)');
+    PERFORM pg_temp.deny('authbyte_public',
+        'CALL rolebyte.products_register(''{"actor":"x","products":[]}''::jsonb, NULL::jsonb)');
+    PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.product');
+    PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.product_entitlement');
+    PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.product_requirement');
+    PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.product_account');
+    PERFORM pg_temp.deny('rolebyte_public', 'SELECT count(*) FROM rolebyte.tenant_product');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'INSERT INTO rolebyte.product(key, display_name, registered_by) VALUES (''x'', ''x'', ''x'')');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'INSERT INTO rolebyte.product_account(product_key, subject_key, display_name) VALUES (''x'', ''svc:x'', ''x'')');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'INSERT INTO rolebyte.tenant_product(tenant_id, product_key) VALUES (''x'', ''x'')');
+    PERFORM pg_temp.deny('rolebyte_public', 'UPDATE rolebyte.product SET display_name = ''x''');
+    PERFORM pg_temp.deny('rolebyte_public', 'DELETE FROM rolebyte.tenant_product');
+    PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.product_account');
+    PERFORM pg_temp.deny('authbyte_public', 'SELECT count(*) FROM rolebyte.tenant_product');
+
+    -- The helpers: no service's role may run any of them.
+    FOREACH v_proc IN ARRAY ARRAY['deployment_door_refusal(text, text)', 'door_first_run_refusal(text, text)',
+                                  'door_enter(jsonb, boolean, boolean)', 'product_offered(text)',
+                                  'product_accounts_follow(text, text)', 'door_entitle(text, text, text, text)',
+                                  'door_revoke_row(text, text, text, text)', 'door_topo(text[])',
+                                  'door_ticked(text, text)', 'door_need_missing(text, text)',
+                                  'door_tick(text, text, text, boolean)', 'door_product_give(text, text, text)',
+                                  'door_product_take(text, text, text)', 'door_local_products(text, text)',
+                                  'door_product_json(text)',
+                                  'door_company_json(text, boolean)', 'door_services_declared()',
+                                  'door_name(jsonb)', 'door_language(jsonb)'] LOOP
+        IF has_function_privilege('rolebyte_public', 'rolebyte.' || v_proc, 'EXECUTE') THEN
+            RAISE EXCEPTION 'ROLE LEAK: the register''s role may run rolebyte.%', v_proc;
+        END IF;
+        IF has_function_privilege('authbyte_public', 'rolebyte.' || v_proc, 'EXECUTE') THEN
+            RAISE EXCEPTION 'ROLE LEAK: another service''s role may run rolebyte.%', v_proc;
+        END IF;
+    END LOOP;
+    RAISE NOTICE 'roleleak.rolebyte: the deployment''s door, its catalog of products and its helpers';
 END $$;

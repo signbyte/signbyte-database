@@ -4427,7 +4427,9 @@ END;
 $$;
 
 REVOKE ALL ON PROCEDURE rolebyte.deployment_admin_add(jsonb, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON PROCEDURE rolebyte.deployment_admin_add(jsonb, jsonb) TO rolebyte_public;
+-- Not granted to the register's own role: the deployment's door
+-- (`deployment_admin_grant`) runs it, after proving who the caller is.
+REVOKE EXECUTE ON PROCEDURE rolebyte.deployment_admin_add(jsonb, jsonb) FROM rolebyte_public;
 
 -- deployment_admin_remove — takes an account off the list of the deployment's
 -- administrators. An account that is not on it is refused `membership:not_found`.
@@ -4475,7 +4477,9 @@ END;
 $$;
 
 REVOKE ALL ON PROCEDURE rolebyte.deployment_admin_remove(jsonb, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON PROCEDURE rolebyte.deployment_admin_remove(jsonb, jsonb) TO rolebyte_public;
+-- Not granted to the register's own role: the deployment's door
+-- (`deployment_admin_revoke`) runs it, after proving who the caller is.
+REVOKE EXECUTE ON PROCEDURE rolebyte.deployment_admin_remove(jsonb, jsonb) FROM rolebyte_public;
 
 -- deployment_admin_list — the deployment's administrators whose account is not
 -- revoked, by display name then account id: {admins: [{userId, subjectKey,
@@ -4512,7 +4516,9 @@ END;
 $$;
 
 REVOKE ALL ON PROCEDURE rolebyte.deployment_admin_list(jsonb, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON PROCEDURE rolebyte.deployment_admin_list(jsonb, jsonb) TO rolebyte_public;
+-- Not granted to the register's own role: the deployment's door
+-- (`deployment_admins`) runs it, after proving who the caller is.
+REVOKE EXECUTE ON PROCEDURE rolebyte.deployment_admin_list(jsonb, jsonb) FROM rolebyte_public;
 
 -- deployment_admin_apply — applies the person the deployment's settings name, once
 -- per value. The register's own role runs it at start.

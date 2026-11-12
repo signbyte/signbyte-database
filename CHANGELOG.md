@@ -70,6 +70,41 @@ and the list is never written. Each value applied writes one history line, `depl
 company is marked the procedure also takes the lock the one-time bootstrap door takes. **Apply:** an older rolebyte
 runs on it unchanged.
 
+### Added — rolebyte: the deployment's door, the catalog of products and their service accounts
+
+One migration, `rolebyte/V26`: the tables `product`, `product_entitlement`, `product_requirement`, `product_account`
+and `tenant_product` hold the products a deployment sells (what each gives, what it needs, the service accounts
+`svc:<client id>` it carries with their levels) and which products each company has. The register's own role has no
+access to them. A repeatable file adds the procedures the register's own role runs to open a company, say which
+products it has and name its administrators. Each one first proves that the calling person (`actor`) is a deployment
+administrator in the `saas` mode (`mode`): a person's key, an active account in the deployment's own company, which is
+active, on the list of the deployment's administrators. Every other case, the `local` mode and a service's key
+included, is refused `membership:forbidden` with one sentence, before anything about a company is read;
+`deployment_door_check` is that check alone. A missing actor or a mode that is neither `saas` nor `local` is
+`membership:invalid`. A writing procedure takes the deployment's lock and asks again, so a person taken off the list is
+refused at once. No refusal carries a person's name. Reads: `company_list`, `company_get`, `company_administrators`,
+`deployment_products`, `deployment_admins`. Writes: `company_open` (the company, its default user type, the
+administrator invited with the rung, the starting roles in `en` or `lv`, the products ticked with their entitlements and
+their service accounts as active members; a refusal after the first write leaves nothing), `company_has_set` (tick or
+untick a product: a product needs the products it lists, both ways; unticking closes a whole service when no other
+ticked product gives any of it), `company_administrator_set` and `company_administrator_unset`, `company_roles_seed`,
+`company_first_run` (name a deployment's own company the first time; on `local` its administrator may run it, and it
+gives the company every offered product), `deployment_admin_grant` and `deployment_admin_revoke` (the last deployment
+administrator whose account is active cannot be removed), `local_company_follow` (a deployment run on the customer's
+own machines has every product it offers), and `products_register`, granted to nobody and run as the location's owner,
+which makes the catalog equal to the list it is given. Only when asked (`adopt: true`) does it take a company that
+already holds every entitlement of a product as having it, and then it gives the product like any ticked one; a company
+with no ticked product is never touched, a list may not give the register's own service, and a list that would make a
+product need one a company having it has not ticked is refused. A product is offered only while every service it gives
+has a permission that is not retired. The follow of a company's service accounts never ends its last administrator. Giving a product makes its service accounts active members holding exactly their levels, and taking it away
+ends them; an account listed under several products holds the union. For an account on the list the list decides:
+levels given to it by hand are taken away, and an account a company's administrator removed is active again while a
+product that lists it is ticked. An administrator's level is never given to a service account nor taken from one.
+`deployment_admin_add`, `deployment_admin_remove` and `deployment_admin_list` are no longer granted to the register's
+own role; the door runs them. New history kinds: `tenantRenamed`, `productTicked`, `productUnticked`,
+`productRegistered`, `productUnregistered`, `serviceAccountAdded`, `serviceAccountRemoved`. **Apply:** an older
+rolebyte that calls those three procedures directly must call the door instead.
+
 ## v0.7.0
 
 ### Changed — util: a name is at most 100 characters, in every language
