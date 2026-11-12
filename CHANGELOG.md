@@ -6,6 +6,18 @@ integrates against the procedures.
 
 ## v0.8.0
 
+### Changed — rolebyte: a company's row says whether somebody of it has signed in; two refusals changed their reason
+
+No migration. The door's answer for a company (the list, one company, and the `company` in the answer of opening
+one) gains the boolean `entered`: true when the company has an active account of a person, or its history shows a
+person's account having become active; it stays true after that person's access is taken away. Opening a company under a name another company has
+(ignoring case) is now refused `membership:name_taken`, and opening a company or the first run before the
+deployment's services have declared themselves is now refused `membership:not_declared`. The sentences are unchanged and nothing is written. A caller that
+matched `membership:conflict` for these two cases must match the new reasons; every other `membership:conflict`
+refusal is unchanged. Apply order: the membership register's service must already be at the release that knows the
+two new reasons before this database release is applied; under an older service both refusals are answered as an
+internal error (500) instead of 409. The service's new release is safe against the older database.
+
 ### Added — rolebyte: a setup window for a company that was just opened
 
 One migration, `rolebyte/V28`: `rolebyte.user_account` gains `setup_until`, null on every existing row and settable only

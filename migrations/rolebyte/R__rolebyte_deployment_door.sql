@@ -410,8 +410,9 @@ REVOKE ALL ON FUNCTION rolebyte.door_product_take(text, text, text) FROM PUBLIC;
 
 -- door_company_json — a company as the door's reads answer it: id, name, status, when
 -- it was made, whether it is the deployment's own, the products it has, what it is
--- entitled to in force, and how many administrators it has. With `p_detail` each
--- entitlement also says when it was given.
+-- entitled to in force, how many administrators it has, and whether somebody of it has
+-- signed in (`entered`, from `setup_company_entered`, the one definition of that). With
+-- `p_detail` each entitlement also says when it was given.
 CREATE OR REPLACE FUNCTION rolebyte.door_company_json(p_tenant text, p_detail boolean)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -437,7 +438,8 @@ BEGIN
               FROM rolebyte.tenant_entitlement e
              WHERE e.tenant_id = t.id AND e.state = 'entitled'), '[]'::jsonb),
         'administrators', (SELECT count(*) FROM rolebyte.user_account u
-                            WHERE u.tenant_id = t.id AND rolebyte.is_administrator(u.id)))
+                            WHERE u.tenant_id = t.id AND rolebyte.is_administrator(u.id)),
+        'entered',   rolebyte.setup_company_entered(t.id))
       FROM rolebyte.tenant t
      WHERE t.id = p_tenant);
 END;
@@ -716,9 +718,10 @@ GRANT EXECUTE ON PROCEDURE rolebyte.deployment_door_check(jsonb, jsonb) TO roleb
 
 -- company_list — every company, in the order it was made: {companies: [{id, name,
 -- status, createdAt, own, products: [keys], entitlements: [{service, feature}],
--- administrators}]}. `own` is true for the deployment's own company, `products` are
--- the products it has, `entitlements` what it is entitled to in force, and
--- `administrators` is how many accounts are administrators of it now.
+-- administrators, entered}]}. `own` is true for the deployment's own company, `products`
+-- are the products it has, `entitlements` what it is entitled to in force,
+-- `administrators` is how many accounts are administrators of it now, and `entered` is
+-- whether somebody of it has signed in (true for good once a person's account was active).
 CREATE OR REPLACE PROCEDURE rolebyte.company_list(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -932,17 +935,17 @@ GRANT EXECUTE ON PROCEDURE rolebyte.deployment_admins(jsonb, jsonb) TO rolebyte_
 -- offers (`membership:not_found`) and every product a listed one needs also listed
 -- (`membership:conflict`); the administrator, an object whose key is a person's, never a
 -- service's, and whose name is a valid name; that the services have declared themselves
--- (`membership:conflict`); and that no other company has this name, ignoring case
--- (`membership:conflict`).
+-- (`membership:not_declared`); and that no other company has this name, ignoring case
+-- (`membership:name_taken`).
 --
 -- It writes, in one transaction: the company (`tenantCreated`), its default user type,
 -- its first administrator (invited, holding the administrator rung,
 -- `administratorSetByOperator`), its starting roles named in the language, each product
 -- ticked in an order that puts a needed one first with the entitlements it gives, and the
 -- service accounts the products carry as active members. A refusal after the first write
--- is raised, so nothing stands. Answers {company: {id, name, status, createdAt},
--- administrator: {userId, status}, roles, products: [keys], accounts: [keys of the
--- service accounts made members]}.
+-- is raised, so nothing stands. Answers {company: {id, name, status, createdAt, entered
+-- (false: its administrator is only invited)}, administrator: {userId, status}, roles,
+-- products: [keys], accounts: [keys of the service accounts made members]}.
 CREATE OR REPLACE PROCEDURE rolebyte.company_open(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1030,11 +1033,11 @@ BEGIN
     END IF;
 
     IF NOT rolebyte.door_services_declared() THEN
-        po_data := util.result_error('membership:conflict', 'the deployment''s services have not declared themselves yet');
+        po_data := util.result_error('membership:not_declared', 'the deployment''s services have not declared themselves yet');
         RETURN;
     END IF;
     IF EXISTS (SELECT 1 FROM rolebyte.tenant t WHERE lower(t.name) = lower(v_name)) THEN
-        po_data := util.result_error('membership:conflict', 'a company of this name already exists');
+        po_data := util.result_error('membership:name_taken', 'a company of this name already exists');
         RETURN;
     END IF;
 
@@ -1068,7 +1071,8 @@ BEGIN
             'id',        v_tenant.id,
             'name',      v_tenant.name,
             'status',    v_tenant.status,
-            'createdAt', v_tenant.created_at),
+            'createdAt', v_tenant.created_at,
+            'entered',   rolebyte.setup_company_entered(v_tenant.id)),
         'administrator', jsonb_build_object(
             'userId', v_made->'data'->>'userId',
             'status', v_made->'data'->>'status'),
@@ -1405,7 +1409,7 @@ REVOKE ALL ON FUNCTION rolebyte.door_local_products(text, text) FROM PUBLIC;
 -- administrator of it now; with no company marked that is refused the same way.
 --
 -- Checked before the first write: the name; the language (exactly `en` or `lv`); that
--- the services have declared themselves (`membership:conflict`); and that the marked
+-- the services have declared themselves (`membership:not_declared`); and that the marked
 -- company has no name yet (`membership:conflict`, 'the company is already set up').
 -- Writes the name (`tenantRenamed`, from empty), the default user type and the starting
 -- roles; on `local` it also gives the company every offered product it does not have and
@@ -1443,7 +1447,7 @@ BEGIN
         RETURN;
     END IF;
     IF NOT rolebyte.door_services_declared() THEN
-        po_data := util.result_error('membership:conflict', 'the deployment''s services have not declared themselves yet');
+        po_data := util.result_error('membership:not_declared', 'the deployment''s services have not declared themselves yet');
         RETURN;
     END IF;
 

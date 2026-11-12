@@ -524,6 +524,9 @@ BEGIN
         jsonb_build_object('subjectKey', v_p, 'displayName', ' Anna Ozola ')), 'open a company');
     v_t := v->'company'->>'id';
 
+    IF (v->'company'->>'entered')::boolean IS DISTINCT FROM false THEN
+        RAISE EXCEPTION 'the company just opened is answered as not entered: %', v;
+    END IF;
     IF v->'company'->>'name' IS DISTINCT FROM 'Acme SIA' OR v->'company'->>'status' IS DISTINCT FROM 'active'
        OR v->'company'->>'createdAt' IS NULL THEN
         RAISE EXCEPTION 'the company is answered trimmed, active, with its time: %', v;
@@ -704,20 +707,22 @@ BEGIN
     -- The name is taken, in another letter case.
     PERFORM pg_temp.dok('company_open', v_admin, pg_temp.oi('"Dup Co"'), 'the first of a name');
     PERFORM pg_temp.drefused('company_open', v_admin, pg_temp.oi('"DUP co"'),
-        'membership:conflict', 'a company of this name already exists', 'a name in another case');
+        'membership:name_taken', 'a company of this name already exists', 'a name in another case');
+    PERFORM pg_temp.drefused('company_open', v_admin, pg_temp.oi('"Dup Co"'),
+        'membership:name_taken', 'a company of this name already exists', 'a name in the same case');
     PERFORM pg_temp.drefused('company_open', v_admin, pg_temp.oi('"deployment CO"'),
-        'membership:conflict', 'a company of this name already exists', 'the deployment''s own company''s name');
+        'membership:name_taken', 'a company of this name already exists', 'the deployment''s own company''s name');
 
     -- No service has declared itself: checked after the rest, before the name. Rolled back below.
     BEGIN
         TRUNCATE rolebyte.service CASCADE;
         PERFORM pg_temp.drefused('company_open', v_admin, pg_temp.oi('"Early Co"', '"en"', '[]'),
-            'membership:conflict', 'the deployment''s services have not declared themselves yet',
+            'membership:not_declared', 'the deployment''s services have not declared themselves yet',
             'no service declared');
         -- the register's own key does not count as a declared service
         PERFORM rolebyte.administrator_rung('fx');
         PERFORM pg_temp.drefused('company_open', v_admin, pg_temp.oi('"Early Co"', '"en"', '[]'),
-            'membership:conflict', 'the deployment''s services have not declared themselves yet',
+            'membership:not_declared', 'the deployment''s services have not declared themselves yet',
             'only the register''s own key');
         RAISE EXCEPTION 'undo' USING errcode = 'P0002';
     EXCEPTION
@@ -1417,6 +1422,10 @@ BEGIN
               AND payload = '{"from":"","to":"Pirmā sabiedrība"}') IS DISTINCT FROM 1 THEN
         RAISE EXCEPTION 'the first run on saas: %', v;
     END IF;
+    IF (pg_temp.dok('company_get', v_a, jsonb_build_object('tenantId', v_dep), 'get the deployment''s company')
+            ->'company'->>'entered')::boolean IS DISTINCT FROM true THEN
+        RAISE EXCEPTION 'the deployment''s own company is entered after the first run';
+    END IF;
     PERFORM pg_temp.drefused('company_first_run', v_a, '{"name":"Atkal","language":"lv"}', 'membership:conflict',
         'the company is already set up', 'the first run twice');
 
@@ -1430,7 +1439,7 @@ BEGIN
     v_dep := pg_temp.dep();
     BEGIN
         TRUNCATE rolebyte.service CASCADE;
-        PERFORM pg_temp.drefused('company_first_run', v_a, '{"name":"Pirmā","language":"lv"}', 'membership:conflict',
+        PERFORM pg_temp.drefused('company_first_run', v_a, '{"name":"Pirmā","language":"lv"}', 'membership:not_declared',
             'the deployment''s services have not declared themselves yet', 'no service declared');
         IF (SELECT name FROM rolebyte.tenant WHERE id = v_dep) IS DISTINCT FROM '' THEN
             RAISE EXCEPTION 'the name must still be empty';
@@ -1663,7 +1672,7 @@ BEGIN
     IF (SELECT c FROM jsonb_array_elements(v->'companies') c WHERE c->>'id' = v_dep)
            IS DISTINCT FROM jsonb_build_object('id', v_dep, 'name', 'Deployment Co', 'status', 'active',
                'createdAt', (SELECT created_at FROM rolebyte.tenant WHERE id = v_dep), 'own', true,
-               'products', '[]'::jsonb, 'entitlements', '[]'::jsonb, 'administrators', 0)
+               'products', '[]'::jsonb, 'entitlements', '[]'::jsonb, 'administrators', 0, 'entered', true)
        OR (SELECT c->'products' FROM jsonb_array_elements(v->'companies') c WHERE c->>'id' = v_c1)
            IS DISTINCT FROM '["alpha-pack"]'::jsonb
        OR (SELECT c->'entitlements' FROM jsonb_array_elements(v->'companies') c WHERE c->>'id' = v_c1)
@@ -1698,6 +1707,38 @@ BEGIN
     PERFORM pg_temp.drefused('company_get', v_a, '{}', 'membership:invalid', NULL, 'get with no company');
     PERFORM pg_temp.drefused('company_get', v_a, jsonb_build_object('tenantId', pg_temp.person()),
         'membership:not_found', NULL, 'get an unknown company');
+    -- Whether somebody of a company has signed in: no for a company just opened and for one with
+    -- nobody, yes once its first person is active, and still yes after that person's access is gone.
+    v := pg_temp.dok('company_list', v_a, '{}', 'list the companies again');
+    IF (SELECT (c->>'entered')::boolean FROM jsonb_array_elements(v->'companies') c WHERE c->>'id' = v_c1)
+           IS DISTINCT FROM false
+       OR (SELECT (c->>'entered')::boolean FROM jsonb_array_elements(v->'companies') c WHERE c->>'id' = v_c2)
+           IS DISTINCT FROM false
+       OR (SELECT (c->>'entered')::boolean FROM jsonb_array_elements(v->'companies') c WHERE c->>'id' = v_dep)
+           IS DISTINCT FROM true THEN
+        RAISE EXCEPTION 'the list says who has been entered: %', v;
+    END IF;
+    v := pg_temp.dok('company_get', v_a, jsonb_build_object('tenantId', v_c1), 'get a company nobody has entered');
+    IF (v->'company'->>'entered')::boolean IS DISTINCT FROM false THEN
+        RAISE EXCEPTION 'a company just opened is not entered: %', v;
+    END IF;
+    PERFORM pg_temp.ok('claim_attach', jsonb_build_object('actor', 'fx', 'subjectKey',
+        (SELECT subject_key FROM rolebyte.user_account WHERE tenant_id = v_c1 AND subject_key LIKE 'sub:%')),
+        'its first person signs in');
+    v := pg_temp.dok('company_get', v_a, jsonb_build_object('tenantId', v_c1), 'get the company once entered');
+    IF (v->'company'->>'entered')::boolean IS DISTINCT FROM true THEN
+        RAISE EXCEPTION 'a company whose first person is active is entered: %', v;
+    END IF;
+    UPDATE rolebyte.user_account SET status = 'revoked' WHERE tenant_id = v_c1 AND subject_key LIKE 'sub:%';
+    v := pg_temp.dok('company_get', v_a, jsonb_build_object('tenantId', v_c1), 'get the company after access is taken');
+    IF (v->'company'->>'entered')::boolean IS DISTINCT FROM true THEN
+        RAISE EXCEPTION 'a company stays entered after its person lost access: %', v;
+    END IF;
+    v := pg_temp.dok('company_list', v_a, '{}', 'list the companies once more');
+    IF (SELECT (c->>'entered')::boolean FROM jsonb_array_elements(v->'companies') c WHERE c->>'id' = v_c1)
+           IS DISTINCT FROM true THEN
+        RAISE EXCEPTION 'the list keeps it entered: %', v;
+    END IF;
     RAISE NOTICE 'p: the reads of the companies, a suspended company';
 END $$;
 
