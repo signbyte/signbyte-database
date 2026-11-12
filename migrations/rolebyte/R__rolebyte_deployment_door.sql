@@ -459,7 +459,10 @@ REVOKE ALL ON FUNCTION rolebyte.door_company_json(text, boolean) FROM PUBLIC;
 --     cleared and its seat in the chart left, with the same history lines
 --     (`userRevoked`, `noteChanged`, `chartPersonRemoved`, then `serviceAccountRemoved`).
 -- For an account on the list the list decides. An account whose key is on no list, and
--- a person, is never touched.
+-- a person, is never touched, except an account named in `p_ended`: the keys that a
+-- product ticked for this company listed until the list was entered again and that no
+-- ticked product lists now. Such an account is ended exactly as one is that is listed but
+-- not wanted, by the same loop below.
 --
 -- Before an account is ended the company's last-administrator guard is asked
 -- (`administrator_removal_refusal`); if it refuses, the whole act is raised as
@@ -470,7 +473,10 @@ REVOKE ALL ON FUNCTION rolebyte.door_company_json(text, boolean) FROM PUBLIC;
 -- the default user type). Answers {added, removed, changed}: the keys made or made
 -- active again, the keys ended, and whether anything changed at all, a level granted or
 -- revoked included.
-CREATE OR REPLACE FUNCTION rolebyte.product_accounts_follow(p_actor text, p_tenant text)
+DROP FUNCTION IF EXISTS rolebyte.product_accounts_follow(text, text);
+
+CREATE OR REPLACE FUNCTION rolebyte.product_accounts_follow(p_actor text, p_tenant text,
+                                                            p_ended text[] DEFAULT '{}'::text[])
 RETURNS jsonb
 LANGUAGE plpgsql
 VOLATILE
@@ -582,7 +588,8 @@ BEGIN
           FROM rolebyte.user_account u
          WHERE u.tenant_id = p_tenant
            AND u.status <> 'revoked'
-           AND EXISTS (SELECT 1 FROM rolebyte.product_account pa WHERE pa.subject_key = u.subject_key)
+           AND (EXISTS (SELECT 1 FROM rolebyte.product_account pa WHERE pa.subject_key = u.subject_key)
+                OR u.subject_key = ANY (COALESCE(p_ended, '{}'::text[])))
            AND NOT EXISTS (SELECT 1
                              FROM rolebyte.product_account pa
                             WHERE pa.subject_key = u.subject_key
@@ -643,7 +650,7 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION rolebyte.product_accounts_follow(text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION rolebyte.product_accounts_follow(text, text, text[]) FROM PUBLIC;
 
 -- door_product_json — a product as `products_register` reads one: its key and name, what
 -- it gives, what it needs and its accounts, each list in a fixed order, so that two
@@ -1676,7 +1683,11 @@ GRANT EXECUTE ON PROCEDURE rolebyte.local_company_follow(jsonb, jsonb) TO roleby
 -- Then, only for a company with at least one ticked product: every entitlement its
 -- ticked products give is given where it is missing or was revoked, one the ticked
 -- products gave before this call and none gives now is revoked, entitlements no product
--- ever gave are left alone, and the company's service accounts are made to match. A
+-- ever gave are left alone, and the company's service accounts are made to match: an
+-- account that a product ticked for the company listed before this call and no ticked
+-- product lists now is ended like one whose product was taken away (which accounts leave
+-- is read before the old lists are replaced); an account no list ever named is left alone;
+-- ending a company's last administrator is refused and refuses the whole call. A
 -- company with no ticked product is not touched. Answers {registered, unregistered,
 -- adopted, companies}: the products added or changed, the products removed, the ticks
 -- adopted, and the companies in which anything changed.
@@ -1722,6 +1733,8 @@ DECLARE
     v_adopt     boolean := false;
     v_follow    jsonb;
     v_need      text;
+    v_listed    jsonb;
+    v_ended     text[];
 BEGIN
     IF v_actor IS NULL THEN
         po_data := util.result_error('membership:invalid', 'actor is required');
@@ -1951,6 +1964,14 @@ BEGIN
       JOIN rolebyte.product_entitlement pe ON pe.product_key = tp.product_key
      WHERE tp.state = 'ticked';
 
+    -- Which service accounts the ticked products listed, per company, before the old lists
+    -- are replaced: a company's account that no ticked product lists afterwards is ended.
+    SELECT COALESCE(jsonb_agg(DISTINCT jsonb_build_object('t', tp.tenant_id, 'k', pa.subject_key)), '[]'::jsonb)
+      INTO v_listed
+      FROM rolebyte.tenant_product tp
+      JOIN rolebyte.product_account pa ON pa.product_key = tp.product_key
+     WHERE tp.state = 'ticked';
+
     -- The catalog.
     FOR i IN 0 .. jsonb_array_length(v_norm) - 1 LOOP
         v_entry := v_norm->i;
@@ -2049,7 +2070,15 @@ BEGIN
             PERFORM rolebyte.door_revoke_row(v_actor, v_tenant, v_row.service_key, v_row.feature_key);
         END LOOP;
 
-        v_follow := rolebyte.product_accounts_follow(v_actor, v_tenant);
+        -- The accounts a ticked product of this company listed before and none lists now.
+        SELECT COALESCE(array_agg(DISTINCT l->>'k'), '{}'::text[]) INTO v_ended
+          FROM jsonb_array_elements(v_listed) l
+         WHERE l->>'t' = v_tenant
+           AND NOT EXISTS (SELECT 1 FROM rolebyte.product_account pa
+                            WHERE pa.subject_key = l->>'k'
+                              AND rolebyte.door_ticked(v_tenant, pa.product_key));
+
+        v_follow := rolebyte.product_accounts_follow(v_actor, v_tenant, v_ended);
 
         SELECT count(*) INTO v_ev_after FROM rolebyte.event WHERE tenant_id = v_tenant;
         IF v_ev_after > v_ev_before OR (v_follow->>'changed')::boolean THEN

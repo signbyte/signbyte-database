@@ -95,7 +95,9 @@ own machines has every product it offers), and `products_register`, granted to n
 which makes the catalog equal to the list it is given. Only when asked (`adopt: true`) does it take a company that
 already holds every entitlement of a product as having it, and then it gives the product like any ticked one; a company
 with no ticked product is never touched, a list may not give the register's own service, and a list that would make a
-product need one a company having it has not ticked is refused. A product is offered only while every service it gives
+product need one a company having it has not ticked is refused. Entering the list again also ends, in each company
+that has a ticked product, a service account that a ticked product listed before the entry and none lists after it, as
+taking the product away does. A product is offered only while every service it gives
 has a permission that is not retired. The follow of a company's service accounts never ends its last administrator. Giving a product makes its service accounts active members holding exactly their levels, and taking it away
 ends them; an account listed under several products holds the union. For an account on the list the list decides:
 levels given to it by hand are taken away, and an account a company's administrator removed is active again while a

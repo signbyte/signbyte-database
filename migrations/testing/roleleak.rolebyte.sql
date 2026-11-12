@@ -322,7 +322,7 @@ BEGIN
     -- The helpers: no service's role may run any of them.
     FOREACH v_proc IN ARRAY ARRAY['deployment_door_refusal(text, text)', 'door_first_run_refusal(text, text)',
                                   'door_enter(jsonb, boolean, boolean)', 'product_offered(text)',
-                                  'product_accounts_follow(text, text)', 'door_entitle(text, text, text, text)',
+                                  'product_accounts_follow(text, text, text[])', 'door_entitle(text, text, text, text)',
                                   'door_revoke_row(text, text, text, text)', 'door_topo(text[])',
                                   'door_ticked(text, text)', 'door_need_missing(text, text)',
                                   'door_tick(text, text, text, boolean)', 'door_product_give(text, text, text)',

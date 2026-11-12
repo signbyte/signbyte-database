@@ -16,7 +16,10 @@
 -- a product removed while a company has it, and needs that form a circle. The
 -- administrators of a company and of the deployment, the first run in both modes, the
 -- follow of a deployment run on the customer's own machines, the starting roles and the
--- products on offer each have a block too.
+-- products on offer each have a block too. A service account dropped from a product's list is
+-- ended where a ticked product listed it; the local mode's company administrator, an opening whose
+-- second product cannot be given, and what is offered (by permissions and by the time of the last
+-- declaration) have blocks of their own.
 --
 -- Not covered here, because it cannot be seen in one transaction: two sessions at once
 -- (the deployment's lock serialising two writers).
@@ -929,9 +932,18 @@ BEGIN
               AND payload = '{"product":"temp-pack"}') IS DISTINCT FROM 1 THEN
         RAISE EXCEPTION 'a shorter catalog: %', v;
     END IF;
-    -- An account whose key is on no list any more is left as it is.
-    IF pg_temp.status(v_c1, 'svc:alpha-new') IS DISTINCT FROM 'active' THEN
-        RAISE EXCEPTION 'an account whose key left the list is never touched';
+    -- An account that a product ticked for a company listed, and no list names any more, is ended
+    -- in every company that has the product; the accounts still listed stay as they were.
+    IF pg_temp.status(v_c1, 'svc:alpha-new') IS DISTINCT FROM 'revoked'
+       OR pg_temp.levels(v_c1, 'svc:alpha-new') IS DISTINCT FROM ''
+       OR pg_temp.status(v_c2, 'svc:alpha-new') IS DISTINCT FROM 'revoked'
+       OR pg_temp.levels(v_c2, 'svc:alpha-new') IS DISTINCT FROM ''
+       OR pg_temp.status(v_c3, 'svc:alpha-new') IS NOT NULL
+       OR pg_temp.lines('serviceAccountRemoved', v_c1) IS DISTINCT FROM 1
+       OR pg_temp.lines('serviceAccountRemoved', v_c2) IS DISTINCT FROM 1
+       OR pg_temp.status(v_c1, 'svc:alpha-api') IS DISTINCT FROM 'active'
+       OR pg_temp.status(v_c2, 'svc:alpha-api') IS DISTINCT FROM 'active' THEN
+        RAISE EXCEPTION 'an account that left every list is ended where a ticked product listed it';
     END IF;
 
     -- The same catalog again changes nothing, in the catalog or in any company.
@@ -1012,6 +1024,157 @@ BEGIN
     -- Put the catalog back as every block starts from it.
     PERFORM pg_temp.reg(pg_temp.cat1());
     RAISE NOTICE 'i: the catalog, longer, shorter, refused';
+END $$;
+
+-- i2. A service account that a product listed and the list no longer names: ended where a ticked
+-- product listed it, kept where another ticked product still lists it, and no other account touched.
+DO $$
+DECLARE
+    v_admin   text;
+    v_c1      text;
+    v_c2      text;
+    v_c4      text;
+    v_c5      text;
+    v         jsonb;
+    v_with    jsonb;
+    v_without jsonb;
+    v_late    jsonb;
+    v_snap_c1 text;
+    v_snap_c4 text;
+    v_before  text;
+BEGIN
+    v_admin := pg_temp.world('Deployment Co');
+    v_c1 := pg_temp.open_with(v_admin, 'One', '["alpha-pack"]');
+    v_c2 := pg_temp.open_with(v_admin, 'Two', '["alpha-pack","beta-pack"]');
+    v_c4 := pg_temp.customer('No ticks');
+
+    -- alpha-pack lists svc:gone as well; the second list leaves out svc:gone and svc:shared
+    -- (which beta-pack still lists).
+    v_with := jsonb_set(pg_temp.cat1(), '{0,accounts}', (pg_temp.cat1()->0->'accounts') ||
+        jsonb_build_array(pg_temp.acct('svc:gone', 'Gone', jsonb_build_array(pg_temp.lvl('alpha', 'api', 'read')))));
+    v_without := jsonb_set(pg_temp.cat1(), '{0,accounts}', (pg_temp.cat1()->0->'accounts') - 2);
+
+    v := pg_temp.reg(v_with);
+    IF (v->>'registered')::int IS DISTINCT FROM 1 OR (v->>'companies')::int IS DISTINCT FROM 2
+       OR pg_temp.status(v_c1, 'svc:gone') IS DISTINCT FROM 'active'
+       OR pg_temp.status(v_c2, 'svc:gone') IS DISTINCT FROM 'active'
+       OR pg_temp.levels(v_c2, 'svc:shared') IS DISTINCT FROM 'alpha api:read, beta api:sync' THEN
+        RAISE EXCEPTION 'the list that names svc:gone: %', v;
+    END IF;
+
+    -- An account made by hand in a company with a ticked product, and one with the same key as a
+    -- listed account in a company with no ticked product: neither is touched by the entry below.
+    PERFORM pg_temp.ok('user_invite', jsonb_build_object('actor', 'fx', 'tenantId', v_c1, 'subjectKey', 'svc:handmade',
+        'displayName', 'By hand', 'roles', jsonb_build_array(pg_temp.lvl('alpha', 'api', 'read'))), 'a hand-made account');
+    UPDATE rolebyte.user_account SET status = 'active' WHERE tenant_id = v_c1 AND subject_key = 'svc:handmade';
+    PERFORM pg_temp.ok('user_invite', jsonb_build_object('actor', 'fx', 'tenantId', v_c4, 'subjectKey', 'svc:gone',
+        'displayName', 'Gone, by hand', 'roles', jsonb_build_array(pg_temp.lvl('alpha', 'api', 'read'))),
+        'an account of the same key in a company with no ticked product');
+    UPDATE rolebyte.user_account SET status = 'active' WHERE tenant_id = v_c4 AND subject_key = 'svc:gone';
+    v_snap_c1 := pg_temp.snap(v_c1, ARRAY['svc:handmade']);
+    v_snap_c4 := pg_temp.snap(v_c4, ARRAY['svc:gone']);
+
+    v := pg_temp.reg(v_without);
+    IF (v->>'registered')::int IS DISTINCT FROM 1 OR (v->>'unregistered')::int IS DISTINCT FROM 0
+       OR (v->>'adopted')::int IS DISTINCT FROM 0 OR (v->>'companies')::int IS DISTINCT FROM 2 THEN
+        RAISE EXCEPTION 'the list that drops two accounts: %', v;
+    END IF;
+    -- svc:gone is ended in both companies that have alpha-pack.
+    IF pg_temp.status(v_c1, 'svc:gone') IS DISTINCT FROM 'revoked' OR pg_temp.levels(v_c1, 'svc:gone') IS DISTINCT FROM ''
+       OR pg_temp.status(v_c2, 'svc:gone') IS DISTINCT FROM 'revoked' OR pg_temp.levels(v_c2, 'svc:gone') IS DISTINCT FROM ''
+       OR pg_temp.lines('userRevoked', v_c1) IS DISTINCT FROM 2 OR pg_temp.lines('userRevoked', v_c2) IS DISTINCT FROM 1
+       OR pg_temp.lines('serviceAccountRemoved', v_c1) IS DISTINCT FROM 2
+       OR pg_temp.lines('serviceAccountRemoved', v_c2) IS DISTINCT FROM 1 THEN
+        RAISE EXCEPTION 'a dropped account is ended in every company that has its product';
+    END IF;
+    -- svc:shared is ended where only alpha-pack listed it, and stays, with beta-pack's levels only,
+    -- where beta-pack is ticked as well.
+    IF pg_temp.status(v_c1, 'svc:shared') IS DISTINCT FROM 'revoked' OR pg_temp.levels(v_c1, 'svc:shared') IS DISTINCT FROM ''
+       OR pg_temp.status(v_c2, 'svc:shared') IS DISTINCT FROM 'active'
+       OR pg_temp.levels(v_c2, 'svc:shared') IS DISTINCT FROM 'beta api:sync' THEN
+        RAISE EXCEPTION 'an account another ticked product still lists stays with that product''s levels only';
+    END IF;
+    -- What is still listed, an account made by hand and a company with no ticked product are as they were.
+    IF pg_temp.status(v_c1, 'svc:alpha-api') IS DISTINCT FROM 'active'
+       OR pg_temp.status(v_c1, 'svc:alpha-sync') IS DISTINCT FROM 'active'
+       OR pg_temp.snap(v_c1, ARRAY['svc:handmade']) IS DISTINCT FROM v_snap_c1
+       OR pg_temp.snap(v_c4, ARRAY['svc:gone']) IS DISTINCT FROM v_snap_c4
+       OR pg_temp.status(v_c4, 'svc:gone') IS DISTINCT FROM 'active' THEN
+        RAISE EXCEPTION 'listed accounts, an account made by hand and a company with no ticks are left as they are';
+    END IF;
+
+    -- The same list again changes nothing.
+    v_before := pg_temp.fingerprint();
+    v := pg_temp.reg(v_without);
+    IF (v->>'registered')::int IS DISTINCT FROM 0 OR (v->>'unregistered')::int IS DISTINCT FROM 0
+       OR (v->>'adopted')::int IS DISTINCT FROM 0 OR (v->>'companies')::int IS DISTINCT FROM 0
+       OR pg_temp.fingerprint() IS DISTINCT FROM v_before THEN
+        RAISE EXCEPTION 'the same list again: %', v;
+    END IF;
+
+    -- For an account whose key is on a list the list decides: an account a company made by hand under
+    -- a key that no list names is left alone, but once a list names the key under a product this company
+    -- does not have, the company's follow ends it; a company with no ticked product is never followed.
+    PERFORM pg_temp.ok('user_invite', jsonb_build_object('actor', 'fx', 'tenantId', v_c1, 'subjectKey', 'svc:late',
+        'displayName', 'Made by hand', 'roles', jsonb_build_array(pg_temp.lvl('alpha', 'api', 'read'))), 'a hand-made account');
+    UPDATE rolebyte.user_account SET status = 'active' WHERE tenant_id = v_c1 AND subject_key = 'svc:late';
+    PERFORM pg_temp.ok('user_invite', jsonb_build_object('actor', 'fx', 'tenantId', v_c4, 'subjectKey', 'svc:late',
+        'displayName', 'Made by hand', 'roles', jsonb_build_array(pg_temp.lvl('alpha', 'api', 'read'))), 'the same key by hand');
+    UPDATE rolebyte.user_account SET status = 'active' WHERE tenant_id = v_c4 AND subject_key = 'svc:late';
+    v_snap_c1 := pg_temp.snap(v_c1, ARRAY['svc:late']);
+    v_snap_c4 := pg_temp.snap(v_c4, ARRAY['svc:late']);
+    PERFORM pg_temp.reg(v_without);
+    IF pg_temp.snap(v_c1, ARRAY['svc:late']) IS DISTINCT FROM v_snap_c1
+       OR pg_temp.snap(v_c4, ARRAY['svc:late']) IS DISTINCT FROM v_snap_c4 THEN
+        RAISE EXCEPTION 'an entry that does not name the key leaves the hand-made accounts as they are';
+    END IF;
+    v_late := jsonb_set(v_without, '{1,accounts}', (v_without->1->'accounts') ||
+        jsonb_build_array(pg_temp.acct('svc:late', 'Late', jsonb_build_array(pg_temp.lvl('beta', 'api', 'sync')))));
+    v := pg_temp.reg(v_late);
+    IF (v->>'registered')::int IS DISTINCT FROM 1 OR (v->>'companies')::int IS DISTINCT FROM 2
+       OR pg_temp.status(v_c1, 'svc:late') IS DISTINCT FROM 'revoked'
+       OR pg_temp.levels(v_c1, 'svc:late') IS DISTINCT FROM ''
+       OR pg_temp.lines('userRevoked', v_c1) IS DISTINCT FROM 3
+       OR pg_temp.lines('serviceAccountRemoved', v_c1) IS DISTINCT FROM 3
+       OR pg_temp.status(v_c2, 'svc:late') IS DISTINCT FROM 'active'
+       OR pg_temp.snap(v_c4, ARRAY['svc:late']) IS DISTINCT FROM v_snap_c4 THEN
+        RAISE EXCEPTION 'a listed key ends the account a company made by hand, only where it is followed: %', v;
+    END IF;
+    v_before := pg_temp.fingerprint();
+    v := pg_temp.reg(v_late);
+    IF (v->>'registered')::int IS DISTINCT FROM 0 OR (v->>'companies')::int IS DISTINCT FROM 0
+       OR pg_temp.fingerprint() IS DISTINCT FROM v_before THEN
+        RAISE EXCEPTION 'the same entry again: %', v;
+    END IF;
+
+    -- A dropped account that is a company's last administrator: the whole entry is refused and
+    -- the list stays as it was; made right, the same entry is accepted.
+    PERFORM pg_temp.reg(v_with);
+    v_c5 := pg_temp.open_with(v_admin, 'Last', '["alpha-pack"]');
+    PERFORM pg_temp.ok('role_grant', jsonb_build_object('actor', 'fx', 'tenantId', v_c5,
+        'userId', pg_temp.uid(v_c5, 'svc:gone'), 'service', 'rolebyte', 'group', 'membership', 'level', 'admin'),
+        'a rung given to the account that is to be dropped');
+    UPDATE rolebyte.user_account SET status = 'revoked' WHERE tenant_id = v_c5 AND NOT subject_key LIKE 'svc:%';
+    PERFORM pg_temp.refused('products_register', jsonb_build_object('actor', 'fx', 'products', v_without),
+        'membership:conflict', 'a company keeps at least one administrator',
+        'a list that drops a company''s last administrator');
+    IF NOT EXISTS (SELECT 1 FROM rolebyte.product_account WHERE product_key = 'alpha-pack' AND subject_key = 'svc:gone')
+       OR pg_temp.status(v_c1, 'svc:gone') IS DISTINCT FROM 'active'
+       OR pg_temp.status(v_c5, 'svc:gone') IS DISTINCT FROM 'active' THEN
+        RAISE EXCEPTION 'a refused entry leaves the list and every company as they were';
+    END IF;
+    UPDATE rolebyte.user_account SET status = 'active' WHERE tenant_id = v_c5 AND NOT subject_key LIKE 'svc:%';
+    v := pg_temp.reg(v_without);
+    IF (v->>'companies')::int IS DISTINCT FROM 3
+       OR pg_temp.status(v_c5, 'svc:gone') IS DISTINCT FROM 'revoked'
+       OR pg_temp.status(v_c1, 'svc:gone') IS DISTINCT FROM 'revoked'
+       OR EXISTS (SELECT 1 FROM rolebyte.product_account WHERE subject_key = 'svc:gone') THEN
+        RAISE EXCEPTION 'the same entry with another administrator in the company: %', v;
+    END IF;
+
+    -- Put the catalog back as every block starts from it.
+    PERFORM pg_temp.reg(pg_temp.cat1());
+    RAISE NOTICE 'i2: a service account dropped from a product''s list';
 END $$;
 
 -- j and k. The administrators of a company, and the two fixed sentences.
@@ -1772,6 +1935,165 @@ BEGIN
     END IF;
     UPDATE rolebyte.product_account SET roles = '[]'::jsonb WHERE product_key = 'alpha-pack' AND subject_key = 'svc:alpha-sync';
     RAISE NOTICE 'q: products, the guard, what an untick takes, adoption, a catalog change';
+END $$;
+
+-- r. On the local mode the company's own administrator, who is on no list, is refused by every
+-- procedure of the door but the first run, which is the one a local deployment runs.
+DO $$
+DECLARE
+    v_a      text;
+    v_dep    text;
+    v_cust   text;
+    v_other  text;
+    v_local  text;
+    v_inputs jsonb;
+    v_proc   text;
+    v        jsonb;
+BEGIN
+    v_a := pg_temp.world('');
+    v_dep := pg_temp.dep();
+    v_cust := pg_temp.customer('Customer One');
+    v_other := pg_temp.member(v_cust, 'Other company', 'active');
+    v_local := pg_temp.member(v_dep, 'Local admin', 'active');
+    PERFORM pg_temp.ok('administrator_set', jsonb_build_object('actor', 'fx', 'tenantId', v_dep, 'subjectKey', v_local),
+        'make a company administrator');
+    IF EXISTS (SELECT 1 FROM rolebyte.deployment_admin da JOIN rolebyte.user_account u ON u.id = da.user_id
+                WHERE u.subject_key = v_local)
+       OR NOT rolebyte.is_administrator(pg_temp.uid(v_dep, v_local)) THEN
+        RAISE EXCEPTION 'the local administrator is an administrator of the company and on no list';
+    END IF;
+
+    v_inputs := jsonb_build_object(
+        'deployment_door_check', '{}'::jsonb,
+        'company_list', '{}'::jsonb,
+        'company_get', jsonb_build_object('tenantId', v_cust),
+        'company_administrators', jsonb_build_object('tenantId', v_cust),
+        'deployment_products', '{}'::jsonb,
+        'deployment_admins', '{}'::jsonb,
+        'company_open', pg_temp.oi(),
+        'company_has_set', jsonb_build_object('tenantId', v_cust, 'product', 'alpha-pack', 'has', true),
+        'company_administrator_set', jsonb_build_object('tenantId', v_cust, 'subjectKey', pg_temp.person(),
+                                                        'displayName', 'Probe'),
+        'company_administrator_unset', jsonb_build_object('tenantId', v_cust, 'userId', pg_temp.uid(v_cust, v_other)),
+        'company_roles_seed', jsonb_build_object('tenantId', v_cust, 'language', 'lv'),
+        'deployment_admin_grant', jsonb_build_object('subjectKey', v_other),
+        'deployment_admin_revoke', jsonb_build_object('userId', pg_temp.uid(v_dep, v_a)));
+    IF (SELECT count(*) FROM jsonb_object_keys(v_inputs)) IS DISTINCT FROM 13 THEN
+        RAISE EXCEPTION 'the list lost a procedure of the door';
+    END IF;
+
+    FOR v_proc IN SELECT k FROM jsonb_object_keys(v_inputs) k LOOP
+        PERFORM pg_temp.refused(v_proc,
+            (v_inputs->v_proc) || jsonb_build_object('actor', v_local, 'mode', 'local'),
+            'membership:forbidden', 'not a deployment administrator',
+            v_proc || ' on local by the company''s own administrator');
+    END LOOP;
+
+    -- The control: the first run, the one a local deployment runs, is accepted.
+    v := pg_temp.ok('company_first_run', jsonb_build_object('actor', v_local, 'mode', 'local', 'name', 'Own Co',
+        'language', 'en'), 'the first run on local by the company''s own administrator');
+    IF (SELECT name FROM rolebyte.tenant WHERE id = v_dep) IS DISTINCT FROM 'Own Co'
+       OR v->'company'->>'name' IS DISTINCT FROM 'Own Co' THEN
+        RAISE EXCEPTION 'the first run on local names the company: %', v;
+    END IF;
+    PERFORM pg_temp.refused('company_list', jsonb_build_object('actor', v_local, 'mode', 'local'),
+        'membership:forbidden', 'not a deployment administrator', 'a read on local after the first run');
+    RAISE NOTICE 'r: the local mode, the company''s own administrator';
+END $$;
+
+-- s. Opening a company with two products where the second cannot be given.
+DO $$
+DECLARE
+    v_a text;
+    v   jsonb;
+BEGIN
+    v_a := pg_temp.world('Deployment Co');
+
+    -- The second product is a key the list does not hold.
+    PERFORM pg_temp.drefused('company_open', v_a, pg_temp.oi('"Two Co"', '"en"', '["alpha-pack","nope"]'),
+        'membership:not_found', 'this deployment offers no such product', 'a second product the list does not hold');
+
+    -- The second product is in the list and not offered: every permission of its service is retired.
+    BEGIN
+        UPDATE rolebyte.service_permission SET retired_at = now() WHERE service_key = 'beta';
+        IF rolebyte.product_offered('beta-pack') IS DISTINCT FROM false
+           OR rolebyte.product_offered('alpha-pack') IS DISTINCT FROM true THEN
+            RAISE EXCEPTION 'only beta-pack is not offered now';
+        END IF;
+        PERFORM pg_temp.drefused('company_open', v_a, pg_temp.oi('"Two Co"', '"en"', '["alpha-pack","beta-pack"]'),
+            'membership:not_found', 'this deployment offers no such product', 'a second product that is not offered');
+        RAISE EXCEPTION 'undo' USING errcode = 'P0002';
+    EXCEPTION
+        WHEN sqlstate 'P0002' THEN NULL;
+    END;
+
+    -- The same opening with both valid is accepted.
+    v := pg_temp.dok('company_open', v_a, pg_temp.oi('"Two Co"', '"en"', '["alpha-pack","beta-pack"]'),
+        'open with two products that can be given');
+    IF pg_temp.products(v->'company'->>'id') IS DISTINCT FROM 'alpha-pack,beta-pack'
+       OR pg_temp.has_keys(v->'company'->>'id') IS DISTINCT FROM 'alpha,beta' THEN
+        RAISE EXCEPTION 'the opening with two valid products: %', v;
+    END IF;
+    RAISE NOTICE 's: an opening with a second product that cannot be given';
+END $$;
+
+-- t. What is offered: a product over a service with no permission at all is listed as not offered and is
+-- refused when ticked and when named at an opening; a service declared a day ago and one declared an hour
+-- ago are both offered, each showing its own time. A product that gives the register's own service is
+-- refused by the list (block i, the invalid product that gives `rolebyte`).
+DO $$
+DECLARE
+    v_a    text;
+    v_c    text;
+    v      jsonb;
+    v_day  timestamptz := now() - interval '1 day';
+    v_hour timestamptz := now() - interval '1 hour';
+BEGIN
+    v_a := pg_temp.world('Deployment Co');
+    v_c := pg_temp.customer('Ticks');
+    BEGIN
+        PERFORM pg_temp.ok('service_register', '{"actor":"fx","service":"bare","displayName":"Bare"}', 'register bare');
+        PERFORM pg_temp.reg(pg_temp.cat1() || jsonb_build_array(pg_temp.prod('bare-pack', 'Bare pack',
+            jsonb_build_array(pg_temp.give('bare', '')), '[]'::jsonb, '[]'::jsonb)));
+        v := pg_temp.dok('deployment_products', v_a, '{}', 'the products on offer');
+        IF (SELECT (p->>'offered')::boolean FROM jsonb_array_elements(v->'products') p WHERE p->>'key' = 'bare-pack')
+              IS DISTINCT FROM false
+           OR (SELECT p->'gives'->0->'lastDeclaredAt' FROM jsonb_array_elements(v->'products') p
+                WHERE p->>'key' = 'bare-pack') IS DISTINCT FROM 'null'::jsonb
+           OR (SELECT (p->'gives'->0->>'permissions')::int FROM jsonb_array_elements(v->'products') p
+                WHERE p->>'key' = 'bare-pack') IS DISTINCT FROM 0
+           OR (SELECT (p->>'offered')::boolean FROM jsonb_array_elements(v->'products') p WHERE p->>'key' = 'alpha-pack')
+              IS DISTINCT FROM true THEN
+            RAISE EXCEPTION 'a product over a service that never declared itself is listed as not offered: %', v;
+        END IF;
+        PERFORM pg_temp.drefused('company_has_set', v_a,
+            jsonb_build_object('tenantId', v_c, 'product', 'bare-pack', 'has', true), 'membership:not_found',
+            'this deployment offers no such product', 'tick a product over a service with no permission');
+        PERFORM pg_temp.drefused('company_open', v_a, pg_temp.oi('"Bare Co"', '"en"', '["bare-pack"]'),
+            'membership:not_found', 'this deployment offers no such product',
+            'open with a product over a service with no permission');
+        RAISE EXCEPTION 'undo' USING errcode = 'P0002';
+    EXCEPTION
+        WHEN sqlstate 'P0002' THEN NULL;
+    END;
+
+    -- Age never hides a product: alpha last declared a day ago, beta an hour ago.
+    UPDATE rolebyte.service_declaration SET last_declared_at = v_day WHERE service_key = 'alpha';
+    INSERT INTO rolebyte.service_declaration (service_key, declared_by, first_declared_at, last_declared_at)
+    VALUES ('beta', 'svc:beta-decl', v_day, v_hour);
+    v := pg_temp.dok('deployment_products', v_a, '{}', 'the products on offer, declared at different times');
+    IF (SELECT (p->>'offered')::boolean FROM jsonb_array_elements(v->'products') p WHERE p->>'key' = 'alpha-pack')
+          IS DISTINCT FROM true
+       OR (SELECT (p->'gives'->0->>'lastDeclaredAt')::timestamptz FROM jsonb_array_elements(v->'products') p
+            WHERE p->>'key' = 'alpha-pack') IS DISTINCT FROM v_day
+       OR (SELECT (p->>'offered')::boolean FROM jsonb_array_elements(v->'products') p WHERE p->>'key' = 'beta-pack')
+          IS DISTINCT FROM true
+       OR (SELECT (p->'gives'->0->>'lastDeclaredAt')::timestamptz FROM jsonb_array_elements(v->'products') p
+            WHERE p->>'key' = 'beta-pack') IS DISTINCT FROM v_hour THEN
+        RAISE EXCEPTION 'a product declared a day ago and one an hour ago are both offered, each with its own time: %', v;
+    END IF;
+    PERFORM pg_temp.has_set(v_a, v_c, 'alpha-pack', true);
+    RAISE NOTICE 't: what is offered';
     RAISE NOTICE 'PASS unit.rolebyte_deployment_door';
 END $$;
 
