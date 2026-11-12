@@ -6,6 +6,29 @@ integrates against the procedures.
 
 ## v0.8.0
 
+### Changed — rolebyte: what a service declared is its own to change
+
+One migration, `rolebyte/V27`: `rolebyte.service_permission` gains `declared_by`, the declaring client's service
+subject (filled in from the history for every permission a service's declaration line shows, null for the rest), and
+`retired_by`, the client whose declaration retired the permission (null when it is not retired or the deployment
+retired it). In `service_declare`: a permission another client declared may be repeated unchanged but not changed or
+retired (`membership:config_key_conflict`, "was declared by another client, and only that client changes it"); the
+first client to name a permission with no declarer takes it (history line `permissionClaimed`); an entry without the
+`retired` mark reinstates a permission only when the same client's declaration retired it, otherwise it stays retired
+and the line says so; a level may be defined only in the group named like the service key, a group the caller lists
+in the new optional `groups`, a group the key already holds, or `membership` under `rolebyte` (`membership:forbidden`
+otherwise), and every key is checked against the grant before any group; the groups `declare` and `declare-group` are
+reserved (also in `role_define`); a document names a service, a permission and a level once and puts at most 20
+labels on a permission; one service key holds at most 1000 permissions and 100 levels through a declaration (a
+document that adds nothing is never refused for it). On both paths the chart of authority is all or nothing under one
+service key. The deployment's own registration still changes and reinstates any permission and has no limit.
+**Apply:** the caller of `service_declare` passes in `groups` the groups the declaring client is granted; a level in
+a group not named like its key, not in `groups` and not already the key's is refused. **Also apply:** the migration
+cannot tell who retired a permission before it ran, so every permission retired when it runs counts afterwards as
+retired by the deployment, and no service's declaration reinstates it. After the upgrade list them (`SELECT
+service_key, feature_key, act FROM rolebyte.service_permission WHERE retired_at IS NOT NULL`) and reinstate, through
+the deployment's own registration, any that a service should still hand out.
+
 ### Added — rolebyte: a service declares itself to the register
 
 One migration, `rolebyte/V23`: the table `rolebyte.service_declaration` keeps, per service key and declaring client,

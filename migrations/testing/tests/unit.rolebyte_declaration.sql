@@ -14,14 +14,16 @@
 -- Declares a document as a client granted the listed keys and returns the answer.
 -- A refusal raised after a write (the structured error as an exception) is
 -- returned as the structured error, so a test reads both the same way.
-CREATE OR REPLACE FUNCTION pg_temp.declare(p_actor text, p_allowed jsonb, p_section jsonb) RETURNS jsonb
+CREATE OR REPLACE FUNCTION pg_temp.declare(p_actor text, p_allowed jsonb, p_section jsonb, p_groups jsonb DEFAULT NULL)
+RETURNS jsonb
 LANGUAGE plpgsql AS $$
 DECLARE
     v jsonb;
 BEGIN
     BEGIN
         CALL rolebyte.service_declare(jsonb_build_object(
-            'actor', p_actor, 'allowed', p_allowed, 'section', p_section), v);
+            'actor', p_actor, 'allowed', p_allowed, 'section', p_section)
+            || CASE WHEN p_groups IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('groups', p_groups) END, v);
     EXCEPTION
         WHEN sqlstate 'P0001' THEN
             v := sqlerrm::jsonb;
@@ -43,14 +45,15 @@ LANGUAGE sql AS $$
 $$;
 
 -- The document must be refused with exactly this code, name this text, and change nothing.
-CREATE OR REPLACE FUNCTION pg_temp.refused(p_allowed jsonb, p_section jsonb, p_code text, p_names text, p_why text)
+CREATE OR REPLACE FUNCTION pg_temp.refused(p_allowed jsonb, p_section jsonb, p_code text, p_names text, p_why text,
+                                           p_groups jsonb DEFAULT NULL)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
     v      jsonb;
     before text := pg_temp.fingerprint();
 BEGIN
-    v := pg_temp.declare('svc:declare-test', p_allowed, p_section);
+    v := pg_temp.declare('svc:declare-test', p_allowed, p_section, p_groups);
     IF v->>'result' IS DISTINCT FROM 'error' OR v->>'code' IS DISTINCT FROM p_code THEN
         RAISE EXCEPTION '% should be refused %: %', p_why, p_code, v;
     END IF;
@@ -289,10 +292,11 @@ LANGUAGE sql AS $$
 $$;
 
 -- The document must be accepted, and its answer must carry no refused line.
-CREATE OR REPLACE FUNCTION pg_temp.accepted(p_allowed jsonb, p_section jsonb, p_why text) RETURNS jsonb
+CREATE OR REPLACE FUNCTION pg_temp.accepted(p_allowed jsonb, p_section jsonb, p_why text, p_groups jsonb DEFAULT NULL)
+RETURNS jsonb
 LANGUAGE plpgsql AS $$
 DECLARE
-    v jsonb := pg_temp.declare('svc:declare-test', p_allowed, p_section);
+    v jsonb := pg_temp.declare('svc:declare-test', p_allowed, p_section, p_groups);
 BEGIN
     IF v->>'result' IS DISTINCT FROM 'success' THEN
         RAISE EXCEPTION '% should be accepted: %', p_why, left(v::text, 300);
@@ -410,16 +414,18 @@ BEGIN
         'membership:config_key_conflict', 'service ' || v_k || ' may not declare group membership', 'the group membership under another key');
     -- a group another key already defined (decl-a defined the group decl-a above)
     PERFORM pg_temp.refused(to_jsonb(ARRAY[v_k]), pg_temp.doc(v_k, pg_temp.role(to_jsonb('decl-a'::text), to_jsonb('read'::text))),
-        'membership:config_key_conflict', 'service ' || v_k || ' may not declare group decl-a', 'a group defined under another key');
+        'membership:config_key_conflict', 'service ' || v_k || ' may not declare group decl-a', 'a group defined under another key',
+        '["decl-a"]'::jsonb);
     -- two keys of one document naming one group
     PERFORM pg_temp.refused(to_jsonb(ARRAY[v_k || '-1', v_k || '-2']),
         jsonb_build_object('services', jsonb_build_array(
             jsonb_build_object('key', v_k || '-1', 'roles', pg_temp.role(to_jsonb('shared-' || v_sfx), to_jsonb('read'::text))),
             jsonb_build_object('key', v_k || '-2', 'roles', pg_temp.role(to_jsonb('shared-' || v_sfx), to_jsonb('write'::text))))),
-        'membership:config_key_conflict', 'service ' || v_k || '-2 may not declare group shared-' || v_sfx, 'two keys naming one group');
-    -- a group of its own is accepted, and the repeat changes nothing
+        'membership:config_key_conflict', 'service ' || v_k || '-2 may not declare group shared-' || v_sfx, 'two keys naming one group',
+        to_jsonb(ARRAY['shared-' || v_sfx]));
+    -- a group the caller names is accepted, and the repeat (the key now holds it) changes nothing
     v_doc := pg_temp.doc(v_k, pg_temp.role(to_jsonb('own-' || v_sfx), to_jsonb('read'::text)));
-    PERFORM pg_temp.accepted(to_jsonb(ARRAY[v_k]), v_doc, 'a group of its own');
+    PERFORM pg_temp.accepted(to_jsonb(ARRAY[v_k]), v_doc, 'a group the caller names', to_jsonb(ARRAY['own-' || v_sfx]));
     v_fp := pg_temp.fingerprint();
     v := pg_temp.accepted(to_jsonb(ARRAY[v_k]), v_doc, 'the repeat of a group of its own');
     IF EXISTS (SELECT 1 FROM jsonb_array_elements((v->'data'->'services') || (v->'data'->'roles')) e WHERE e->>'status' IS DISTINCT FROM 'unchanged') THEN

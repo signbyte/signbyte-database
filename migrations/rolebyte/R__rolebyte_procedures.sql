@@ -164,8 +164,9 @@ REVOKE EXECUTE ON PROCEDURE rolebyte.service_register(jsonb, jsonb) FROM rolebyt
 
 -- role_define — one (group, level) role of a service, as data (idempotent
 -- upsert), defined by whoever runs the deployment. Emits `roleDefined` only when the row is new.
--- The group `deployment` is the register's own and is refused for every service
--- (`membership:invalid`): it is not a level anything may define.
+-- The groups `deployment`, `declare` and `declare-group` are the register's own
+-- and are refused for every service (`membership:invalid`): they are not levels
+-- anything may define.
 CREATE OR REPLACE PROCEDURE rolebyte.role_define(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -212,6 +213,12 @@ BEGIN
         po_data := util.result_error('membership:invalid', 'the group deployment is the register''s own and is not a level anything may define');
         RETURN;
     END IF;
+    -- The two groups the declaration acts are named after are reserved too.
+    IF v_group IN ('declare', 'declare-group') THEN
+        po_data := util.result_error('membership:invalid',
+            format('the group %s is reserved and is not a level anything may define', v_group));
+        RETURN;
+    END IF;
 
     IF NOT EXISTS (SELECT 1 FROM rolebyte.service WHERE key = v_service) THEN
         po_data := util.result_error('membership:not_found', 'service is not registered');
@@ -254,6 +261,31 @@ $$;
 REVOKE ALL ON PROCEDURE rolebyte.role_define(jsonb, jsonb) FROM PUBLIC;
 REVOKE EXECUTE ON PROCEDURE rolebyte.role_define(jsonb, jsonb) FROM rolebyte_public;
 
+-- permission_plane_clash — whether a permission of the given plane may be added
+-- under a service key. The chart of authority is all or nothing under a key: a
+-- key that holds a permission of the chart takes no other plane, and a key that
+-- holds a permission of another plane takes no chart permission. Retired rows
+-- count; rows with no plane are ignored. Answers `chart` when the key already
+-- holds the chart and the new plane is another, `other` when the key holds
+-- another plane and the new one is the chart, and null when the plane fits.
+CREATE OR REPLACE FUNCTION rolebyte.permission_plane_clash(p_service text, p_plane text) RETURNS text
+LANGUAGE sql
+STABLE
+SET search_path = rolebyte, pg_temp
+AS $$
+    SELECT CASE
+        WHEN p_plane <> 'chart'
+             AND EXISTS (SELECT 1 FROM rolebyte.service_permission WHERE service_key = p_service AND plane = 'chart')
+            THEN 'chart'
+        WHEN p_plane = 'chart'
+             AND EXISTS (SELECT 1 FROM rolebyte.service_permission
+                          WHERE service_key = p_service AND plane IS NOT NULL AND plane <> 'chart')
+            THEN 'other'
+    END;
+$$;
+
+REVOKE ALL ON FUNCTION rolebyte.permission_plane_clash(text, text) FROM PUBLIC;
+
 -- permission_declare — a service declares one act it enforces on one of its
 -- features. Additive: a new permission is created, an identical one reports
 -- `unchanged`, and a changed description, labels or retired mark is updated and
@@ -272,6 +304,19 @@ REVOKE EXECUTE ON PROCEDURE rolebyte.role_define(jsonb, jsonb) FROM rolebyte_pub
 -- names the roles the register creates with every new tenant that hold the
 -- permission (`worker`, `manager`; Guest holds nothing); only an ordinary
 -- permission on the object plane carries any.
+--
+-- `declaredBy` (the declaring client's service subject) is set only by a
+-- service's own declaration; the deployment's registration leaves it out. With
+-- it: a new permission is stored with that client as its declarer; one with no
+-- declarer is claimed by it (`permissionClaimed`, and `declarer` among the
+-- changes); one another client declared may be repeated unchanged, and any
+-- change to it is refused (`membership:conflict`) with nothing written; a
+-- declaration that retires a permission remembers its client (`retired_by`), and
+-- an entry that does not mark a retired permission reinstates it only when that
+-- client retired it, otherwise it stays retired and the line says so (`detail`).
+-- Without it nothing of this applies: the deployment's own retirement leaves
+-- `retired_by` null, and the declarer is never touched.
+-- On both paths the chart's plane is all or nothing under one service key.
 CREATE OR REPLACE PROCEDURE rolebyte.permission_declare(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -294,6 +339,8 @@ DECLARE
     v_changed boolean := false;
     v_changes text[] := '{}'::text[];
     v_row     rolebyte.service_permission%ROWTYPE;
+    v_declarer text;
+    v_detail  text;
 BEGIN
     v_actor := NULLIF(trim(pi_data->>'actor'), '');
     IF v_actor IS NULL THEN
@@ -306,6 +353,9 @@ BEGIN
         po_data := util.result_error('membership:invalid', 'service is required');
         RETURN;
     END IF;
+
+    v_declarer := CASE WHEN jsonb_typeof(pi_data->'declaredBy') = 'string'
+                       THEN NULLIF(trim(pi_data->>'declaredBy'), '') END;
 
     v_decl := pi_data->'permission';
     IF jsonb_typeof(v_decl) IS DISTINCT FROM 'object' THEN
@@ -416,10 +466,24 @@ BEGIN
     FOR UPDATE;
 
     IF NOT FOUND THEN
+        v_detail := rolebyte.permission_plane_clash(v_service, v_plane);
+        IF v_detail = 'chart' THEN
+            po_data := util.result_error('membership:conflict',
+                format('%s is a %s permission, and service %s holds only permissions of the chart of authority',
+                       v_name, v_plane, v_service));
+            RETURN;
+        ELSIF v_detail = 'other' THEN
+            po_data := util.result_error('membership:conflict',
+                format('%s is a permission of the chart of authority, and service %s holds permissions of other planes',
+                       v_name, v_service));
+            RETURN;
+        END IF;
         INSERT INTO rolebyte.service_permission
-               (id, service_key, feature_key, act, description, class, plane, labels, retired_at, seeds)
+               (id, service_key, feature_key, act, description, class, plane, labels, retired_at, seeds, declared_by,
+                retired_by)
         VALUES (util.generate_ulid(), v_service, v_feature, v_act, v_desc, v_class, v_plane, v_labels,
-                CASE WHEN v_retired THEN now() END, v_seeds)
+                CASE WHEN v_retired THEN now() END, v_seeds, v_declarer,
+                CASE WHEN v_retired THEN v_declarer END)
         ON CONFLICT (service_key, feature_key, act) DO NOTHING;
         IF NOT FOUND THEN
             -- A concurrent declaration of the same permission won the insert:
@@ -448,6 +512,54 @@ BEGIN
             format('%s is declared as a %s permission, and a permission''s plane never changes',
                    v_name, v_row.plane));
         RETURN;
+    END IF;
+
+    -- A permission another client declared is that client's to change. An entry
+    -- that would change nothing is accepted as it stands; one that would change
+    -- anything is refused, and nothing is written.
+    IF v_declarer IS NOT NULL AND v_row.declared_by IS NOT NULL AND v_row.declared_by <> v_declarer THEN
+        IF v_row.plane IS NULL
+           OR v_row.description <> v_desc
+           OR v_row.labels <> v_labels
+           OR v_row.seeds <> v_seeds
+           OR (v_retired AND v_row.retired_at IS NULL) THEN
+            po_data := util.result_error('membership:conflict',
+                format('%s was declared by another client, and only that client changes it', v_name));
+            RETURN;
+        END IF;
+        po_data := util.result_success(jsonb_build_object('permission', v_name, 'status', 'unchanged',
+            'changes', '[]'::jsonb) ||
+            CASE WHEN v_row.retired_at IS NOT NULL AND NOT v_retired
+                 THEN jsonb_build_object('detail', 'retired in the register; a declaration does not reinstate it')
+                 ELSE '{}'::jsonb END);
+        RETURN;
+    END IF;
+
+    -- A permission with no plane takes one; the chart's plane stays all or
+    -- nothing under a service key.
+    IF v_row.plane IS NULL THEN
+        v_detail := rolebyte.permission_plane_clash(v_service, v_plane);
+        IF v_detail = 'chart' THEN
+            po_data := util.result_error('membership:conflict',
+                format('%s is a %s permission, and service %s holds only permissions of the chart of authority',
+                       v_name, v_plane, v_service));
+            RETURN;
+        ELSIF v_detail = 'other' THEN
+            po_data := util.result_error('membership:conflict',
+                format('%s is a permission of the chart of authority, and service %s holds permissions of other planes',
+                       v_name, v_service));
+            RETURN;
+        END IF;
+    END IF;
+
+    -- A service's declaration of a permission no client has declared takes it.
+    IF v_declarer IS NOT NULL AND v_row.declared_by IS NULL THEN
+        UPDATE rolebyte.service_permission SET declared_by = v_declarer WHERE id = v_row.id;
+        INSERT INTO rolebyte.event (id, actor, kind, payload)
+        VALUES (util.generate_ulid(), v_declarer, 'permissionClaimed',
+                jsonb_build_object('service', v_service, 'permission', v_name));
+        v_changed := true;
+        v_changes := v_changes || 'declarer'::text;
     END IF;
 
     IF v_row.plane IS NULL THEN
@@ -489,21 +601,53 @@ BEGIN
         v_changes := v_changes || 'seeds'::text;
     END IF;
 
-    IF (v_row.retired_at IS NOT NULL) <> v_retired THEN
-        UPDATE rolebyte.service_permission
-           SET retired_at = CASE WHEN v_retired THEN now() END
-         WHERE id = v_row.id;
+    -- The retired mark. The deployment's own registration retires and reinstates
+    -- at will, and a retirement it makes is its own (`retired_by` null). A
+    -- service's declaration retires a permission as itself, and reinstates only
+    -- a retirement its own client made: an entry that does not mark a permission
+    -- the deployment, or another client's declaration, retired leaves it retired
+    -- and says so.
+    v_detail := NULL;
+    IF v_declarer IS NULL THEN
+        IF (v_row.retired_at IS NOT NULL) <> v_retired THEN
+            UPDATE rolebyte.service_permission
+               SET retired_at = CASE WHEN v_retired THEN now() END, retired_by = NULL
+             WHERE id = v_row.id;
+            INSERT INTO rolebyte.event (id, actor, kind, payload)
+            VALUES (util.generate_ulid(), v_actor,
+                    CASE WHEN v_retired THEN 'permissionRetired' ELSE 'permissionReinstated' END,
+                    jsonb_build_object('service', v_service, 'permission', v_name));
+            v_changed := true;
+            v_changes := v_changes || 'retired'::text;
+        ELSIF v_retired AND v_row.retired_by IS NOT NULL THEN
+            -- Already retired by a client: the retirement becomes the deployment's.
+            UPDATE rolebyte.service_permission SET retired_by = NULL WHERE id = v_row.id;
+        END IF;
+    ELSIF v_retired AND v_row.retired_at IS NULL THEN
+        UPDATE rolebyte.service_permission SET retired_at = now(), retired_by = v_declarer WHERE id = v_row.id;
         INSERT INTO rolebyte.event (id, actor, kind, payload)
-        VALUES (util.generate_ulid(), v_actor,
-                CASE WHEN v_retired THEN 'permissionRetired' ELSE 'permissionReinstated' END,
+        VALUES (util.generate_ulid(), v_actor, 'permissionRetired',
                 jsonb_build_object('service', v_service, 'permission', v_name));
         v_changed := true;
         v_changes := v_changes || 'retired'::text;
+    ELSIF NOT v_retired AND v_row.retired_at IS NOT NULL THEN
+        IF v_row.retired_by IS NOT DISTINCT FROM v_declarer THEN
+            UPDATE rolebyte.service_permission SET retired_at = NULL, retired_by = NULL WHERE id = v_row.id;
+            INSERT INTO rolebyte.event (id, actor, kind, payload)
+            VALUES (util.generate_ulid(), v_actor, 'permissionReinstated',
+                    jsonb_build_object('service', v_service, 'permission', v_name));
+            v_changed := true;
+            v_changes := v_changes || 'retired'::text;
+        ELSE
+            v_detail := 'retired in the register; a declaration does not reinstate it';
+        END IF;
     END IF;
 
     po_data := util.result_success(jsonb_build_object('permission', v_name,
         'status', CASE WHEN v_changed THEN 'changed' ELSE 'unchanged' END,
-        'changes', to_jsonb(v_changes)));
+        'changes', to_jsonb(v_changes)) ||
+        CASE WHEN v_detail IS NOT NULL THEN jsonb_build_object('detail', v_detail)
+             ELSE '{}'::jsonb END);
 EXCEPTION
     WHEN sqlstate 'P0001' THEN
         RAISE;
@@ -3470,7 +3614,10 @@ REVOKE ALL ON FUNCTION rolebyte.config_item(text, text, text, text) FROM PUBLIC;
 -- registering procedures every other caller uses, so the events land
 -- identically. A refused entry is a line of the report, never an error, and
 -- the caller decides whether anything stands. Nothing is ever removed.
-CREATE OR REPLACE FUNCTION rolebyte.config_vocabulary(p_actor text, p_services jsonb) RETURNS jsonb
+-- `p_declarer` is the declaring client of a service's own declaration, handed
+-- down to each permission; the deployment's own callers leave it out.
+CREATE OR REPLACE FUNCTION rolebyte.config_vocabulary(
+    p_actor text, p_services jsonb, p_declarer text DEFAULT NULL) RETURNS jsonb
 LANGUAGE plpgsql
 SET search_path = rolebyte, util, pg_temp
 AS $$
@@ -3538,7 +3685,8 @@ BEGIN
             CALL rolebyte.permission_declare(jsonb_build_object(
                 'actor',      p_actor,
                 'service',    v_key,
-                'permission', v_perm), v_out);
+                'permission', v_perm,
+                'declaredBy', p_declarer), v_out);
             IF v_out->>'result' IS DISTINCT FROM 'success' THEN
                 -- A class or a plane that is not the one declared is a key that
                 -- already means something else; anything else is a malformed entry.
@@ -3547,7 +3695,10 @@ BEGIN
                     v_out->>'message');
             ELSE
                 v_perms := v_perms || rolebyte.config_item(v_out->'data'->>'permission', v_out->'data'->>'status', NULL,
-                    (SELECT string_agg(c, ', ') FROM jsonb_array_elements_text(COALESCE(v_out->'data'->'changes', '[]'::jsonb)) c));
+                    -- the changes, then (after "; ") a note the permission carries, such as
+                    -- that it stays retired
+                    (SELECT concat_ws('; ', string_agg(c, ', '), v_out->'data'->>'detail')
+                       FROM jsonb_array_elements_text(COALESCE(v_out->'data'->'changes', '[]'::jsonb)) c));
             END IF;
         END LOOP;
     END LOOP;
@@ -3556,7 +3707,7 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION rolebyte.config_vocabulary(text, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION rolebyte.config_vocabulary(text, jsonb, text) FROM PUBLIC;
 
 -- config_apply — preview or apply one section. `dryRun` answers the report and
 -- writes nothing. An apply writes one thing, the `configApplied` line in the
@@ -3894,6 +4045,21 @@ REVOKE ALL ON PROCEDURE rolebyte.permissions_register(jsonb, jsonb) FROM PUBLIC;
 -- service key and declaring client (service_declaration) holding when it was
 -- first and last declared; that write makes no history event.
 --
+-- The caller is also the declarer of every permission the document names: a
+-- permission another client declared is changed only by that client, a
+-- permission nobody declared is taken by the first client to name it, and a
+-- retired permission is reinstated only by the client whose declaration retired
+-- it (see permission_declare). A document names a service, a permission and a
+-- level once. At most 20 labels sit on one permission. Every service key is
+-- checked against `allowed` before any group is judged. A level may be
+-- defined only in a group the caller may use under its key: the group named
+-- like the key, a group the caller lists in the optional `groups` of the call,
+-- a group the key already holds a level of, or `membership` under `rolebyte`;
+-- the groups `declare` and `declare-group` are reserved. One service key may
+-- come to hold at most 1000 permissions and 100 levels, retired permissions
+-- counted; a document that adds nothing new is not refused for a total the
+-- deployment's own registration has already passed.
+--
 -- This is deliberately granted to the register's own role: it is the one
 -- registration a service's own request may reach. Every other act that writes
 -- the deployment's list stays the deployment's own.
@@ -3916,6 +4082,15 @@ DECLARE
     v_groups  jsonb := '{}'::jsonb;
     v_group   text;
     v_prev    text;
+    -- The groups the caller names as its own beyond the service key.
+    v_named   jsonb := CASE WHEN jsonb_typeof(pi_data->'groups') = 'array' THEN pi_data->'groups'
+                            ELSE '[]'::jsonb END;
+    v_total   text;
+    v_held    int;
+    v_new     int;
+    v_seen    jsonb := '{}'::jsonb;
+    v_dup_a   text;
+    v_dup_b   text;
     -- A name that is a service key, a group or a level: one lower-case word.
     c_word    constant text := '^[a-z][a-z0-9-]{0,63}$';
 BEGIN
@@ -3926,6 +4101,13 @@ BEGIN
     IF jsonb_typeof(v_allowed) IS DISTINCT FROM 'array'
        OR EXISTS (SELECT 1 FROM jsonb_array_elements(v_allowed) a WHERE jsonb_typeof(a) IS DISTINCT FROM 'string') THEN
         po_data := util.result_error('membership:invalid', 'allowed is a list of service keys');
+        RETURN;
+    END IF;
+    -- `groups` is optional: absent or null is an empty list.
+    IF jsonb_typeof(pi_data->'groups') IS NOT NULL AND jsonb_typeof(pi_data->'groups') <> 'null'
+       AND (jsonb_typeof(pi_data->'groups') <> 'array'
+            OR EXISTS (SELECT 1 FROM jsonb_array_elements(pi_data->'groups') g WHERE jsonb_typeof(g) IS DISTINCT FROM 'string')) THEN
+        po_data := util.result_error('membership:invalid', 'groups is a list of group names');
         RETURN;
     END IF;
     IF jsonb_typeof(v_section) IS DISTINCT FROM 'object'
@@ -3996,6 +4178,13 @@ BEGIN
                 'the service key deployment is the register''s own and is not a service');
             RETURN;
         END IF;
+        -- A document names a service once.
+        IF v_seen ? v_key THEN
+            po_data := util.result_error('membership:config_bad_document',
+                format('service %s is named more than once in the document', v_key));
+            RETURN;
+        END IF;
+        v_seen := v_seen || jsonb_build_object(v_key, true);
         IF v_svc ? 'displayName' AND jsonb_typeof(v_svc->'displayName') NOT IN ('string', 'null') THEN
             po_data := util.result_error('membership:config_bad_document',
                 format('the display name of service %s is text', v_key));
@@ -4066,33 +4255,30 @@ BEGIN
                 RETURN;
             END IF;
 
-            -- A level reaches a token without its service key, and who administers a
-            -- tenant is decided by the group and the level alone, so a group must mean
-            -- one service's ladder: it is the register's own for `membership`
-            -- (declarable only under the key `rolebyte`) and for `deployment` (under
-            -- no key), and otherwise belongs to the first service that defined it.
-            v_group := v_role->>'group';
-            -- The group `deployment` is the register's own, under any service key.
-            IF v_group = 'deployment' THEN
-                po_data := util.result_error('membership:config_key_conflict',
-                    format('service %s may not declare group deployment: the group is the register''s own and not a level anything may define', v_key));
-                RETURN;
-            END IF;
-            IF (v_group = 'membership' AND v_key <> 'rolebyte')
-               OR EXISTS (SELECT 1 FROM rolebyte.role_definition rd WHERE rd.role_group = v_group AND rd.service_key <> v_key)
-               OR (v_groups ? v_group AND v_groups->>v_group <> v_key) THEN
-                po_data := util.result_error('membership:config_key_conflict',
-                    format('service %s may not declare group %s: a group belongs to one service', v_key, v_group));
-                RETURN;
-            END IF;
-            v_groups := v_groups || jsonb_build_object(v_group, v_key);
         END LOOP;
+
+        -- A document names a level once.
+        SELECT r->>'group', r->>'level' INTO v_dup_a, v_dup_b
+          FROM jsonb_array_elements(COALESCE(v_svc->'roles', '[]'::jsonb)) r
+         GROUP BY r->>'group', r->>'level' HAVING count(*) > 1
+         LIMIT 1;
+        IF v_dup_a IS NOT NULL THEN
+            po_data := util.result_error('membership:config_bad_document',
+                format('service %s names the level %s:%s more than once', v_key, v_dup_a, v_dup_b));
+            RETURN;
+        END IF;
 
         FOR v_perm IN SELECT * FROM jsonb_array_elements(COALESCE(v_svc->'permissions', '[]'::jsonb)) LOOP
             IF jsonb_typeof(v_perm) = 'object' THEN
                 IF jsonb_typeof(v_perm->'description') = 'string' AND char_length(v_perm->>'description') > 256 THEN
                     po_data := util.result_error('membership:config_bad_document',
                         format('a permission of service %s has a description of more than 256 characters', v_key));
+                    RETURN;
+                END IF;
+                IF jsonb_typeof(v_perm->'labels') = 'object'
+                   AND (SELECT count(*) FROM jsonb_object_keys(v_perm->'labels')) > 20 THEN
+                    po_data := util.result_error('membership:config_bad_document',
+                        format('a permission of service %s has more than 20 labels', v_key));
                     RETURN;
                 END IF;
                 IF jsonb_typeof(v_perm->'labels') = 'object'
@@ -4104,9 +4290,23 @@ BEGIN
                 END IF;
             END IF;
         END LOOP;
+
+        -- A document names a permission once.
+        SELECT p->>'feature', p->>'act' INTO v_dup_a, v_dup_b
+          FROM jsonb_array_elements(COALESCE(v_svc->'permissions', '[]'::jsonb)) p
+         WHERE jsonb_typeof(p) = 'object' AND jsonb_typeof(p->'feature') = 'string' AND jsonb_typeof(p->'act') = 'string'
+         GROUP BY p->>'feature', p->>'act' HAVING count(*) > 1
+         LIMIT 1;
+        IF v_dup_a IS NOT NULL THEN
+            po_data := util.result_error('membership:config_bad_document',
+                format('service %s names the permission %s:%s more than once', v_key, left(v_dup_a, 100), left(v_dup_b, 100)));
+            RETURN;
+        END IF;
     END LOOP;
 
-    -- Only the keys the caller was granted, checked before anything is written.
+    -- Only the keys the caller was granted, checked before anything is written and
+    -- before any group of the document is judged, so the answer about a group never
+    -- tells a caller anything about a key it may not declare.
     SELECT trim(s->>'key') INTO v_key
       FROM jsonb_array_elements(v_section->'services') s
      WHERE NOT (v_allowed @> to_jsonb(trim(s->>'key')))
@@ -4117,7 +4317,97 @@ BEGIN
         RETURN;
     END IF;
 
-    v_report := rolebyte.config_vocabulary(v_actor, v_section->'services');
+    -- A level reaches a token without its service key, and who administers a
+    -- tenant is decided by the group and the level alone, so a group must mean
+    -- one service's ladder: it is the register's own for `membership`
+    -- (declarable only under the key `rolebyte`) and for `deployment` (under
+    -- no key), and otherwise belongs to the first service that defined it.
+    FOR v_svc IN SELECT * FROM jsonb_array_elements(v_section->'services') LOOP
+        v_key := v_svc->>'key';
+        FOR v_role IN SELECT * FROM jsonb_array_elements(COALESCE(v_svc->'roles', '[]'::jsonb)) LOOP
+            v_group := v_role->>'group';
+            -- The group `deployment` is the register's own, under any service key.
+            IF v_group = 'deployment' THEN
+                po_data := util.result_error('membership:config_key_conflict',
+                    format('service %s may not declare group deployment: the group is the register''s own and not a level anything may define', v_key));
+                RETURN;
+            END IF;
+            -- The groups the declaration acts are named after are reserved.
+            IF v_group IN ('declare', 'declare-group') THEN
+                po_data := util.result_error('membership:config_key_conflict',
+                    format('service %s may not declare group %s: the group is reserved', v_key, v_group));
+                RETURN;
+            END IF;
+            -- The group `membership` is the register's own: under any other key it is a
+            -- key conflict whether or not the caller lists it, before the caller's
+            -- grant is looked at.
+            IF v_group = 'membership' AND v_key <> 'rolebyte' THEN
+                po_data := util.result_error('membership:config_key_conflict',
+                    format('service %s may not declare group %s: a group belongs to one service', v_key, v_group));
+                RETURN;
+            END IF;
+            -- A caller defines levels only in a group it may use under this key: the
+            -- group named like the key, one the caller names in `groups`, one this
+            -- key already holds a level of, or (for the register's own key) the
+            -- group membership.
+            IF NOT (v_group = v_key
+                    OR v_named @> to_jsonb(v_group)
+                    OR EXISTS (SELECT 1 FROM rolebyte.role_definition rd
+                                WHERE rd.service_key = v_key AND rd.role_group = v_group)
+                    OR (v_group = 'membership' AND v_key = 'rolebyte')) THEN
+                po_data := util.result_error('membership:forbidden',
+                    format('the caller may not declare group %s', left(v_group, 100)));
+                RETURN;
+            END IF;
+            IF EXISTS (SELECT 1 FROM rolebyte.role_definition rd WHERE rd.role_group = v_group AND rd.service_key <> v_key)
+               OR (v_groups ? v_group AND v_groups->>v_group <> v_key) THEN
+                po_data := util.result_error('membership:config_key_conflict',
+                    format('service %s may not declare group %s: a group belongs to one service', v_key, v_group));
+                RETURN;
+            END IF;
+            v_groups := v_groups || jsonb_build_object(v_group, v_key);
+        END LOOP;
+    END LOOP;
+
+    -- What one service key may come to hold: the permissions and levels it
+    -- already has (retired permissions count) plus the document's that it does
+    -- not have yet. Judged before anything is written; the deployment's own
+    -- registration has no such limit.
+    -- A key the deployment's registration has taken past a limit still accepts a
+    -- declaration that adds nothing new; only a document that adds is refused.
+    FOR v_total IN SELECT DISTINCT trim(s->>'key') FROM jsonb_array_elements(v_section->'services') s LOOP
+        SELECT count(*) INTO v_held FROM rolebyte.service_permission sp WHERE sp.service_key = v_total;
+        SELECT count(*) INTO v_new FROM (
+                    SELECT DISTINCT p->>'feature' AS f, p->>'act' AS a
+                      FROM jsonb_array_elements(v_section->'services') s,
+                           jsonb_array_elements(COALESCE(s->'permissions', '[]'::jsonb)) p
+                     WHERE trim(s->>'key') = v_total
+                       AND jsonb_typeof(p) = 'object'
+                       AND jsonb_typeof(p->'feature') = 'string' AND jsonb_typeof(p->'act') = 'string') n
+                 WHERE NOT EXISTS (SELECT 1 FROM rolebyte.service_permission sp
+                                    WHERE sp.service_key = v_total AND sp.feature_key = n.f AND sp.act = n.a);
+        IF v_new > 0 AND v_held + v_new > 1000 THEN
+            po_data := util.result_error('membership:config_bad_document',
+                format('service %s would hold more than 1000 permissions', v_total));
+            RETURN;
+        END IF;
+
+        SELECT count(*) INTO v_held FROM rolebyte.role_definition rd WHERE rd.service_key = v_total;
+        SELECT count(*) INTO v_new FROM (
+                    SELECT DISTINCT r->>'group' AS g, r->>'level' AS l
+                      FROM jsonb_array_elements(v_section->'services') s,
+                           jsonb_array_elements(COALESCE(s->'roles', '[]'::jsonb)) r
+                     WHERE trim(s->>'key') = v_total) n
+                 WHERE NOT EXISTS (SELECT 1 FROM rolebyte.role_definition rd
+                                    WHERE rd.service_key = v_total AND rd.role_group = n.g AND rd.role_level = n.l);
+        IF v_new > 0 AND v_held + v_new > 100 THEN
+            po_data := util.result_error('membership:config_bad_document',
+                format('service %s would hold more than 100 levels', v_total));
+            RETURN;
+        END IF;
+    END LOOP;
+
+    v_report := rolebyte.config_vocabulary(v_actor, v_section->'services', v_actor);
 
     SELECT e INTO v_line
       FROM jsonb_array_elements((v_report->'services') || (v_report->'roles') || (v_report->'permissions')) e
