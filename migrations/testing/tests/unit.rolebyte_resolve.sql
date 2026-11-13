@@ -67,13 +67,29 @@ BEGIN
     RETURN util.result_success(jsonb_build_object('memberships', v_memberships));
 END $$;
 
--- The subject's answer must be byte-identical to the reference.
+-- An answer with the key `tenantName` taken out of each membership.
+CREATE OR REPLACE FUNCTION pg_temp.without_tenant_name(p_answer jsonb) RETURNS jsonb
+LANGUAGE sql AS $$
+    SELECT jsonb_set(p_answer, '{data,memberships}',
+        COALESCE((SELECT jsonb_agg(m - 'tenantName' ORDER BY ord)
+                    FROM jsonb_array_elements(p_answer->'data'->'memberships') WITH ORDINALITY t(m, ord)), '[]'::jsonb));
+$$;
+
+-- The subject's answer must be byte-identical to the reference. The company's name was
+-- added to the answer after the reference's time, so it is taken out before the two are
+-- compared, and it is checked on its own further down in this file; here the answer must
+-- carry it in every membership, so taking it out cannot hide its absence.
 CREATE OR REPLACE FUNCTION pg_temp.same_as_before(p_subject text, p_why text) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-    v_now    text := pg_temp.resolved(p_subject)::text;
+    v_answer jsonb := pg_temp.resolved(p_subject);
+    v_now    text := pg_temp.without_tenant_name(v_answer)::text;
     v_before text := pg_temp.resolved_before_tenant_roles(p_subject)::text;
 BEGIN
+    IF EXISTS (SELECT 1 FROM jsonb_array_elements(v_answer->'data'->'memberships') m
+                WHERE jsonb_typeof(m->'tenantName') IS DISTINCT FROM 'string') THEN
+        RAISE EXCEPTION '% must be answered with the company''s name in every membership: %', p_why, v_answer;
+    END IF;
     IF v_now IS DISTINCT FROM v_before THEN
         RAISE EXCEPTION '% must resolve exactly as before tenant roles: now %, before %', p_why, v_now, v_before;
     END IF;
@@ -283,3 +299,147 @@ BEGIN
 
     RAISE NOTICE 'unit.rolebyte_resolve: all assertions passed (% subjects byte-identical to the reference)', v_n;
 END $$;
+
+-- Each membership is answered with its company's name, `tenantName`, exactly as stored.
+-- Done in a transaction that is rolled back, so the companies and people it makes reach
+-- no test that runs after it.
+BEGIN;
+
+-- The ids of the memberships a subject is answered, sorted.
+CREATE OR REPLACE FUNCTION pg_temp.listed_tenants(p_subject text) RETURNS text[]
+LANGUAGE sql AS $$
+    SELECT COALESCE(array_agg(m->>'tenantId' ORDER BY m->>'tenantId'), '{}')
+      FROM jsonb_array_elements(pg_temp.resolved(p_subject)->'data'->'memberships') m;
+$$;
+
+-- The subject's one membership in a tenant.
+CREATE OR REPLACE FUNCTION pg_temp.membership_in(p_subject text, p_tenant text) RETURNS jsonb
+LANGUAGE sql AS $$
+    SELECT m
+      FROM jsonb_array_elements(pg_temp.resolved(p_subject)->'data'->'memberships') m
+     WHERE m->>'tenantId' = p_tenant;
+$$;
+
+-- The memberships must be listed for exactly these tenants, in any order.
+CREATE OR REPLACE FUNCTION pg_temp.listed_exactly(p_subject text, p_tenants text[], p_why text) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_got text[] := pg_temp.listed_tenants(p_subject);
+BEGIN
+    IF v_got IS DISTINCT FROM (SELECT COALESCE(array_agg(x ORDER BY x), '{}') FROM unnest(p_tenants) x) THEN
+        RAISE EXCEPTION '%: expected memberships in %, got %', p_why, p_tenants, v_got;
+    END IF;
+END $$;
+
+-- The subject's membership in the tenant must carry exactly this name.
+CREATE OR REPLACE FUNCTION pg_temp.named(p_subject text, p_tenant text, p_name text, p_why text) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_m jsonb := pg_temp.membership_in(p_subject, p_tenant);
+BEGIN
+    IF v_m IS NULL OR NOT (v_m ? 'tenantName') OR jsonb_typeof(v_m->'tenantName') IS DISTINCT FROM 'string'
+       OR v_m->>'tenantName' IS DISTINCT FROM p_name THEN
+        RAISE EXCEPTION '%: expected tenantName "%", got %', p_why, p_name, v_m;
+    END IF;
+END $$;
+
+DO $$
+DECLARE
+    v_ta  text;
+    v_tb  text;
+    v_tc  text;
+    v_td  text;
+    v_te  text;
+    v_tf  text;
+    v_long text := 'āķž"''' || repeat('x', 195);
+    v_p1  text := 'sub:' || util.generate_ulid();   -- active in two active companies
+    v_p2  text := 'sub:' || util.generate_ulid();   -- active in one company
+    v_p3  text := 'sub:' || util.generate_ulid();   -- a company with an empty name
+    v_p4  text := 'sub:' || util.generate_ulid();   -- a company with a long, odd name
+    v_p5  text := 'sub:' || util.generate_ulid();   -- one of each kind that must not be listed
+    v_p6  text := 'svc:name-test-' || util.generate_ulid();   -- a service's account
+    v_u   text;
+    v_m   jsonb;
+    v_keys text[];
+BEGIN
+    v_ta := pg_temp.ok('tenant_create', '{"actor":"name-test","name":"Ābolu sabiedrība"}', 'company A')->>'id';
+    v_tb := pg_temp.ok('tenant_create', '{"actor":"name-test","name":"Bērzu birojs"}', 'company B')->>'id';
+    v_tc := pg_temp.ok('tenant_create', '{"actor":"name-test","name":"Company C"}', 'company C')->>'id';
+    v_td := pg_temp.ok('tenant_create', jsonb_build_object('actor', 'name-test', 'name', v_long), 'company with an odd name')->>'id';
+    v_te := pg_temp.ok('tenant_create', '{"actor":"name-test","name":"Company E"}', 'company E')->>'id';
+    v_tf := pg_temp.ok('tenant_create', '{"actor":"name-test","name":"Company F"}', 'company F')->>'id';
+
+    -- Active in two active companies: both memberships, each with its own company's name.
+    PERFORM pg_temp.ok('user_invite', jsonb_build_object('actor', 'name-test', 'tenantId', v_ta, 'subjectKey', v_p1, 'displayName', 'Person 1'), 'invite 1 in A');
+    PERFORM pg_temp.ok('user_invite', jsonb_build_object('actor', 'name-test', 'tenantId', v_tb, 'subjectKey', v_p1, 'displayName', 'Person 1'), 'invite 1 in B');
+    PERFORM pg_temp.ok('claim_attach', jsonb_build_object('actor', 'name-test', 'subjectKey', v_p1), 'claim 1');
+    PERFORM pg_temp.listed_exactly(v_p1, ARRAY[v_ta, v_tb], 'a person in two companies');
+    PERFORM pg_temp.named(v_p1, v_ta, 'Ābolu sabiedrība', 'person 1 in A');
+    PERFORM pg_temp.named(v_p1, v_tb, 'Bērzu birojs', 'person 1 in B');
+
+    -- One company: the name is there, every other key as it was.
+    v_u := pg_temp.ok('user_invite', jsonb_build_object('actor', 'name-test', 'tenantId', v_tc, 'subjectKey', v_p2, 'displayName', 'Person 2'), 'invite 2')->>'id';
+    PERFORM pg_temp.ok('claim_attach', jsonb_build_object('actor', 'name-test', 'subjectKey', v_p2), 'claim 2');
+    v_m := pg_temp.membership_in(v_p2, v_tc);
+    SELECT array_agg(k ORDER BY k) INTO v_keys FROM jsonb_object_keys(v_m) k;
+    IF v_keys IS DISTINCT FROM ARRAY['displayName', 'scopes', 'tenantId', 'tenantName', 'userId'] THEN
+        RAISE EXCEPTION 'a membership carries tenantName beside its other keys, no more: %', v_m;
+    END IF;
+    IF v_m->>'tenantId' IS DISTINCT FROM v_tc OR v_m->>'userId' IS DISTINCT FROM v_u
+       OR v_m->>'displayName' IS DISTINCT FROM 'Person 2' OR v_m->'scopes' IS DISTINCT FROM '[]'::jsonb
+       OR v_m->>'tenantName' IS DISTINCT FROM 'Company C' THEN
+        RAISE EXCEPTION 'a membership of one company: %', v_m;
+    END IF;
+    PERFORM pg_temp.listed_exactly(v_p2, ARRAY[v_tc], 'a person in one company');
+
+    -- A company whose name is the empty string: listed, with tenantName ''.
+    UPDATE rolebyte.tenant SET name = '' WHERE id = v_te;
+    PERFORM pg_temp.ok('user_invite', jsonb_build_object('actor', 'name-test', 'tenantId', v_te, 'subjectKey', v_p3, 'displayName', 'Person 3'), 'invite 3');
+    PERFORM pg_temp.ok('claim_attach', jsonb_build_object('actor', 'name-test', 'subjectKey', v_p3), 'claim 3');
+    PERFORM pg_temp.listed_exactly(v_p3, ARRAY[v_te], 'a company with an empty name');
+    PERFORM pg_temp.named(v_p3, v_te, '', 'an empty name');
+
+    -- Latvian letters, a double quote, an apostrophe, 200 characters: answered unchanged.
+    IF char_length(v_long) <> 200 THEN
+        RAISE EXCEPTION 'the odd name should be 200 characters, is %', char_length(v_long);
+    END IF;
+    PERFORM pg_temp.ok('user_invite', jsonb_build_object('actor', 'name-test', 'tenantId', v_td, 'subjectKey', v_p4, 'displayName', 'Person 4'), 'invite 4');
+    PERFORM pg_temp.ok('claim_attach', jsonb_build_object('actor', 'name-test', 'subjectKey', v_p4), 'claim 4');
+    PERFORM pg_temp.named(v_p4, v_td, v_long, 'a long name with Latvian letters, a quote and an apostrophe');
+    IF (SELECT name FROM rolebyte.tenant WHERE id = v_td) IS DISTINCT FROM v_long THEN
+        RAISE EXCEPTION 'the stored name must be the one given';
+    END IF;
+
+    -- An invited account, a revoked account and an active account in a suspended company
+    --     are not listed; the listed set is exactly the one active membership.
+    PERFORM pg_temp.ok('user_invite', jsonb_build_object('actor', 'name-test', 'tenantId', v_ta, 'subjectKey', v_p5, 'displayName', 'Person 5'), 'invite 5 in A');
+    PERFORM pg_temp.ok('claim_attach', jsonb_build_object('actor', 'name-test', 'subjectKey', v_p5), 'claim 5');
+    -- Invited in B, revoked in C, active in the suspended company F.
+    PERFORM pg_temp.ok('user_invite', jsonb_build_object('actor', 'name-test', 'tenantId', v_tb, 'subjectKey', v_p5, 'displayName', 'Person 5'), 'invite 5 in B');
+    PERFORM pg_temp.ok('user_invite', jsonb_build_object('actor', 'name-test', 'tenantId', v_tc, 'subjectKey', v_p5, 'displayName', 'Person 5'), 'invite 5 in C');
+    PERFORM pg_temp.ok('user_invite', jsonb_build_object('actor', 'name-test', 'tenantId', v_tf, 'subjectKey', v_p5, 'displayName', 'Person 5'), 'invite 5 in F');
+    UPDATE rolebyte.user_account SET status = 'active' WHERE tenant_id IN (v_tc, v_tf) AND subject_key = v_p5;
+    PERFORM pg_temp.ok('user_revoke', jsonb_build_object('actor', 'name-test', 'tenantId', v_tc,
+        'userId', (SELECT id FROM rolebyte.user_account WHERE tenant_id = v_tc AND subject_key = v_p5)), 'revoke 5 in C');
+    UPDATE rolebyte.tenant SET status = 'suspended' WHERE id = v_tf;
+    IF (SELECT status FROM rolebyte.user_account WHERE tenant_id = v_ta AND subject_key = v_p5) IS DISTINCT FROM 'active'
+       OR (SELECT status FROM rolebyte.user_account WHERE tenant_id = v_tb AND subject_key = v_p5) IS DISTINCT FROM 'invited'
+       OR (SELECT status FROM rolebyte.user_account WHERE tenant_id = v_tc AND subject_key = v_p5) IS DISTINCT FROM 'revoked'
+       OR (SELECT status FROM rolebyte.user_account WHERE tenant_id = v_tf AND subject_key = v_p5) IS DISTINCT FROM 'active' THEN
+        RAISE EXCEPTION 'the fixture for person 5 should hold active, invited, revoked and active-in-suspended accounts';
+    END IF;
+    PERFORM pg_temp.listed_exactly(v_p5, ARRAY[v_ta], 'only the active account in an active company is listed');
+    PERFORM pg_temp.named(v_p5, v_ta, 'Ābolu sabiedrība', 'person 5 in A');
+
+    -- A service's account in two companies: both listed, each with its name.
+    PERFORM pg_temp.ok('user_invite', jsonb_build_object('actor', 'name-test', 'tenantId', v_ta, 'subjectKey', v_p6, 'displayName', 'A service'), 'invite the service in A');
+    PERFORM pg_temp.ok('user_invite', jsonb_build_object('actor', 'name-test', 'tenantId', v_tb, 'subjectKey', v_p6, 'displayName', 'A service'), 'invite the service in B');
+    UPDATE rolebyte.user_account SET status = 'active' WHERE subject_key = v_p6;
+    PERFORM pg_temp.listed_exactly(v_p6, ARRAY[v_ta, v_tb], 'a service in two companies');
+    PERFORM pg_temp.named(v_p6, v_ta, 'Ābolu sabiedrība', 'the service in A');
+    PERFORM pg_temp.named(v_p6, v_tb, 'Bērzu birojs', 'the service in B');
+
+    RAISE NOTICE 'unit.rolebyte_resolve: tenantName assertions passed';
+END $$;
+
+ROLLBACK;

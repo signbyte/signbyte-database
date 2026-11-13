@@ -71,6 +71,16 @@ BEGIN
     RETURN v;
 END $$;
 
+-- An answer with the key `tenantName` taken out of each membership. The company's name
+-- was added to the answer after the reference below was written, so it is taken out
+-- before the two are compared, and it is checked on its own in unit.rolebyte_resolve.
+CREATE OR REPLACE FUNCTION pg_temp.without_tenant_name(p_answer jsonb) RETURNS jsonb
+LANGUAGE sql AS $$
+    SELECT jsonb_set(p_answer, '{data,memberships}',
+        COALESCE((SELECT jsonb_agg(m - 'tenantName' ORDER BY ord)
+                    FROM jsonb_array_elements(p_answer->'data'->'memberships') WITH ORDINALITY t(m, ord)), '[]'::jsonb));
+$$;
+
 -- What the register answered before a tenant role could reach a token, kept as
 -- the reference the byte-identity is measured against. Never edited to follow
 -- the procedure.
@@ -298,12 +308,12 @@ BEGIN
     -- 5. Where nothing is declared, an administrator resolves as before: B has
     --    only a service that declares no permission.
     PERFORM pg_temp.ok('entitlement_grant', jsonb_build_object('actor', 'op:test', 'tenantId', v_tb, 'service', 'adbare'), 'entitle B adbare');
-    IF pg_temp.resolved(v_s[2])::text IS DISTINCT FROM pg_temp.resolved_before_tenant_roles(v_s[2])::text THEN
+    IF pg_temp.without_tenant_name(pg_temp.resolved(v_s[2]))::text IS DISTINCT FROM pg_temp.resolved_before_tenant_roles(v_s[2])::text THEN
         RAISE EXCEPTION 'an administrator where nothing is declared must resolve as the reference: %', pg_temp.resolved(v_s[2]);
     END IF;
     --    And a person with only service roles, in a tenant with every box entitled.
     PERFORM pg_temp.ok('tenant_role_revoke', jsonb_build_object('actor', v_s[1], 'tenantId', v_ta, 'userId', v_martins, 'roleId', v_role), 'revoke the role');
-    IF pg_temp.resolved(v_s[3])::text IS DISTINCT FROM pg_temp.resolved_before_tenant_roles(v_s[3])::text THEN
+    IF pg_temp.without_tenant_name(pg_temp.resolved(v_s[3]))::text IS DISTINCT FROM pg_temp.resolved_before_tenant_roles(v_s[3])::text THEN
         RAISE EXCEPTION 'a service-only person must resolve as the reference: %', pg_temp.resolved(v_s[3]);
     END IF;
 

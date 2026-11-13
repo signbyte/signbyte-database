@@ -551,6 +551,405 @@ BEGIN
     RAISE NOTICE 'PASS unit.rolebyte_deployment';
 END $$;
 
+-- The last deployment administrator's access cannot be ended outside the deployment's
+-- own door. Helpers first, then one block per rule.
+
+-- A fresh deployment: every company emptied, one company opened and marked as the
+-- deployment's own. Returns its id.
+CREATE OR REPLACE FUNCTION pg_temp.g_fresh() RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_t text;
+BEGIN
+    TRUNCATE rolebyte.tenant CASCADE;
+    v_t := pg_temp.ok('tenant_create', '{"actor":"guard-test","name":"Guard Co"}', 'open the deployment''s company')->>'id';
+    PERFORM pg_temp.ok('deployment_company_mark', '{"actor":"guard-test"}', 'mark the deployment''s company');
+    RETURN v_t;
+END $$;
+
+-- A person in a company: invited, and active unless said otherwise. Returns the account id.
+CREATE OR REPLACE FUNCTION pg_temp.g_member(p_tenant text, p_name text, p_active boolean DEFAULT true) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_key text := 'sub:' || util.generate_ulid();
+    v_id  text;
+BEGIN
+    v_id := pg_temp.ok('user_invite', jsonb_build_object('actor', 'guard-test', 'tenantId', p_tenant,
+        'subjectKey', v_key, 'displayName', p_name), 'invite ' || p_name)->>'id';
+    IF p_active THEN
+        PERFORM pg_temp.ok('claim_attach', jsonb_build_object('actor', 'guard-test', 'subjectKey', v_key), 'claim ' || p_name);
+    END IF;
+    RETURN v_id;
+END $$;
+
+-- An account's subject key.
+CREATE OR REPLACE FUNCTION pg_temp.g_key(p_uid text) RETURNS text
+LANGUAGE sql AS $$ SELECT subject_key FROM rolebyte.user_account WHERE id = p_uid $$;
+
+-- Puts an account on the deployment's list.
+CREATE OR REPLACE FUNCTION pg_temp.g_list(p_uid text) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM pg_temp.ok('deployment_admin_add', jsonb_build_object('actor', 'guard-test',
+        'subjectKey', pg_temp.g_key(p_uid), 'addedFrom', 'settings'), 'list ' || p_uid);
+END $$;
+
+-- Makes an existing member an administrator of their company.
+CREATE OR REPLACE FUNCTION pg_temp.g_make_admin(p_tenant text, p_uid text) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM pg_temp.ok('administrator_set', jsonb_build_object('actor', 'op:guard-test', 'tenantId', p_tenant,
+        'subjectKey', pg_temp.g_key(p_uid)), 'make ' || p_uid || ' an administrator');
+END $$;
+
+-- A new, active member who administers the company and is not on the deployment's list.
+CREATE OR REPLACE FUNCTION pg_temp.g_boss(p_tenant text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_id text := pg_temp.g_member(p_tenant, 'Company Administrator');
+BEGIN
+    PERFORM pg_temp.g_make_admin(p_tenant, v_id);
+    RETURN v_id;
+END $$;
+
+-- user_revoke, answered whole; p_extra is merged into the input.
+CREATE OR REPLACE FUNCTION pg_temp.g_revoke(p_actor_uid text, p_tenant text, p_uid text, p_extra jsonb DEFAULT '{}') RETURNS jsonb
+LANGUAGE sql AS $$
+    SELECT pg_temp.rb('user_revoke', jsonb_build_object('actor', pg_temp.g_key(p_actor_uid), 'tenantId', p_tenant,
+                                                         'userId', p_uid) || p_extra)
+$$;
+
+-- Everything a revoke could touch: accounts, the list, the chart's places and the history.
+CREATE OR REPLACE FUNCTION pg_temp.g_snap() RETURNS text
+LANGUAGE sql AS $$
+    SELECT md5(concat_ws('|',
+        (SELECT coalesce(string_agg(t::text, ',' ORDER BY t::text), '') FROM rolebyte.user_account t),
+        (SELECT coalesce(string_agg(t::text, ',' ORDER BY t::text), '') FROM rolebyte.deployment_admin t),
+        (SELECT coalesce(string_agg(t::text, ',' ORDER BY t::text), '') FROM rolebyte.chart_holder t),
+        (SELECT coalesce(string_agg(t::text, ',' ORDER BY t::text), '') FROM rolebyte.assignment t),
+        (SELECT count(*) FROM rolebyte.event)))
+$$;
+
+-- The call must be refused with exactly this code and sentence, and nothing may change.
+CREATE OR REPLACE FUNCTION pg_temp.g_refused(p_actor_uid text, p_tenant text, p_uid text, p_extra jsonb,
+                                             p_code text, p_says text, p_why text) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    v      jsonb;
+    before text := pg_temp.g_snap();
+BEGIN
+    v := pg_temp.g_revoke(p_actor_uid, p_tenant, p_uid, p_extra);
+    IF v->>'result' IS DISTINCT FROM 'error' OR v->>'code' IS DISTINCT FROM p_code
+       OR v->>'message' IS DISTINCT FROM p_says THEN
+        RAISE EXCEPTION '% should be refused % saying "%": %', p_why, p_code, p_says, v;
+    END IF;
+    IF pg_temp.g_snap() IS DISTINCT FROM before THEN
+        RAISE EXCEPTION '% was refused but changed something', p_why;
+    END IF;
+END $$;
+
+-- The call must succeed.
+CREATE OR REPLACE FUNCTION pg_temp.g_allowed(p_actor_uid text, p_tenant text, p_uid text, p_extra jsonb, p_why text) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    v jsonb := pg_temp.g_revoke(p_actor_uid, p_tenant, p_uid, p_extra);
+BEGIN
+    IF v->>'result' IS DISTINCT FROM 'success' THEN
+        RAISE EXCEPTION '% should be allowed: %', p_why, v;
+    END IF;
+END $$;
+
+DO $$
+DECLARE
+    v_t      text;
+    v_boss   text;
+    v_a      text;
+    v_pos    text;
+    v_events bigint;
+BEGIN
+    -- The only active entry on the list, revoked by another administrator of the company:
+    -- refused, and the account, its entry, its note, its place and the history stand.
+    v_t := pg_temp.g_fresh();
+    v_boss := pg_temp.g_boss(v_t);
+    v_a := pg_temp.g_member(v_t, 'Last One');
+    PERFORM pg_temp.g_list(v_a);
+    PERFORM pg_temp.ok('user_note_set', jsonb_build_object('actor', pg_temp.g_key(v_boss), 'tenantId', v_t,
+        'userId', v_a, 'note', 'keep this note'), 'a note about the last one');
+    v_pos := util.generate_ulid();
+    INSERT INTO rolebyte.chart_position (id, tenant_id, name) VALUES (v_pos, v_t, 'Meistars');
+    INSERT INTO rolebyte.chart_holder (tenant_id, user_id, position_id) VALUES (v_t, v_a, v_pos);
+    v_events := (SELECT count(*) FROM rolebyte.event WHERE tenant_id = v_t);
+
+    PERFORM pg_temp.g_refused(v_boss, v_t, v_a, '{}', 'membership:last_deployment_admin',
+        'this person is the last deployment administrator; add another deployment administrator first',
+        'revoking the last deployment administrator');
+    IF (SELECT status FROM rolebyte.user_account WHERE id = v_a) IS DISTINCT FROM 'active'
+       OR NOT EXISTS (SELECT 1 FROM rolebyte.deployment_admin WHERE user_id = v_a)
+       OR (SELECT note FROM rolebyte.user_account WHERE id = v_a) IS DISTINCT FROM 'keep this note'
+       OR (SELECT position_id FROM rolebyte.chart_holder WHERE tenant_id = v_t AND user_id = v_a) IS DISTINCT FROM v_pos
+       OR (SELECT count(*) FROM rolebyte.event WHERE tenant_id = v_t) IS DISTINCT FROM v_events THEN
+        RAISE EXCEPTION 'a refused revoke of the last deployment administrator must leave account, entry, note, place and history';
+    END IF;
+
+    -- The same call a second time: refused again, still nothing written.
+    PERFORM pg_temp.g_refused(v_boss, v_t, v_a, '{}', 'membership:last_deployment_admin',
+        'this person is the last deployment administrator; add another deployment administrator first',
+        'revoking the last deployment administrator a second time');
+
+    -- A mode of `saas` named, and a mode of JSON null, are guarded exactly as no mode.
+    PERFORM pg_temp.g_refused(v_boss, v_t, v_a, '{"mode":"saas"}', 'membership:last_deployment_admin',
+        'this person is the last deployment administrator; add another deployment administrator first',
+        'revoking the last one on mode saas');
+    PERFORM pg_temp.g_refused(v_boss, v_t, v_a, '{"mode":null}', 'membership:last_deployment_admin',
+        'this person is the last deployment administrator; add another deployment administrator first',
+        'revoking the last one with a null mode');
+
+    -- Any other mode is refused before anything else, whoever is revoked.
+    PERFORM pg_temp.g_refused(v_boss, v_t, v_a, '{"mode":"SaaS"}', 'membership:invalid', 'mode is saas or local', 'mode SaaS');
+    PERFORM pg_temp.g_refused(v_boss, v_t, v_a, '{"mode":"x"}', 'membership:invalid', 'mode is saas or local', 'mode x');
+    PERFORM pg_temp.g_refused(v_boss, v_t, v_a, '{"mode":""}', 'membership:invalid', 'mode is saas or local', 'an empty mode');
+    PERFORM pg_temp.g_refused(v_boss, v_t, v_a, '{"mode":5}', 'membership:invalid', 'mode is saas or local', 'a mode that is not text');
+    PERFORM pg_temp.g_refused(v_boss, v_t, pg_temp.g_member(v_t, 'Someone Else'), '{"mode":"x"}', 'membership:invalid',
+        'mode is saas or local', 'a bad mode while revoking someone who is not listed');
+
+    -- Revoked by the last one themselves, with another administrator in the company.
+    PERFORM pg_temp.g_refused(v_a, v_t, v_a, '{}', 'membership:last_deployment_admin',
+        'this person is the last deployment administrator; add another deployment administrator first',
+        'the last one revoking their own account');
+
+    -- On the register's own mode `local` the list is not guarded: the revoke goes ahead.
+    PERFORM pg_temp.g_allowed(v_boss, v_t, v_a, '{"mode":"local"}', 'revoking the only entry on mode local');
+    IF (SELECT status FROM rolebyte.user_account WHERE id = v_a) IS DISTINCT FROM 'revoked'
+       OR EXISTS (SELECT 1 FROM rolebyte.deployment_admin WHERE user_id = v_a) THEN
+        RAISE EXCEPTION 'on mode local the account is revoked and its entry gone';
+    END IF;
+
+    RAISE NOTICE 'PASS unit.rolebyte_deployment (the last one refused)';
+END $$;
+
+-- The last one is the company's last administrator too: the company's own refusal is
+-- answered, as it always was, and nothing is written.
+DO $$
+DECLARE
+    v_t text;
+    v_a text;
+BEGIN
+    v_t := pg_temp.g_fresh();
+    v_a := pg_temp.g_member(v_t, 'Last One');
+    PERFORM pg_temp.g_make_admin(v_t, v_a);
+    PERFORM pg_temp.g_list(v_a);
+    PERFORM pg_temp.g_refused(v_a, v_t, v_a, '{}', 'membership:conflict',
+        'Last One is this tenant''s last administrator; make someone else an administrator first',
+        'revoking the company''s last administrator who is the last deployment administrator');
+    RAISE NOTICE 'PASS unit.rolebyte_deployment (the company''s own refusal first)';
+END $$;
+
+-- What is allowed: another entry active, an entry that is not the last one, an account the
+-- list does not hold, another company's member.
+DO $$
+DECLARE
+    v_t     text;
+    v_o     text;
+    v_boss  text;
+    v_a     text;
+    v_b     text;
+    v_i     text;
+    v_n     text;
+    v_x     text;
+    v_other text;
+    v_lines bigint;
+BEGIN
+    -- Two active entries; one is revoked through user_revoke: the account is revoked, its
+    -- entry gone, the other remains, and the history is as it was before the rule.
+    v_t := pg_temp.g_fresh();
+    v_boss := pg_temp.g_boss(v_t);
+    v_a := pg_temp.g_member(v_t, 'First One');
+    v_b := pg_temp.g_member(v_t, 'Second One');
+    PERFORM pg_temp.g_list(v_a);
+    PERFORM pg_temp.g_list(v_b);
+    PERFORM pg_temp.g_allowed(v_boss, v_t, v_a, '{}', 'revoking one of two active entries');
+    IF (SELECT status FROM rolebyte.user_account WHERE id = v_a) IS DISTINCT FROM 'revoked'
+       OR EXISTS (SELECT 1 FROM rolebyte.deployment_admin WHERE user_id = v_a)
+       OR NOT EXISTS (SELECT 1 FROM rolebyte.deployment_admin WHERE user_id = v_b)
+       OR (SELECT count(*) FROM rolebyte.deployment_admin) IS DISTINCT FROM 1
+       OR pg_temp.lines('userRevoked', v_a) IS DISTINCT FROM 1
+       OR pg_temp.lines('deploymentAdminRemoved', v_a) IS DISTINCT FROM 1 THEN
+        RAISE EXCEPTION 'one of two active entries revoked: the account revoked, its entry gone, the other kept, one line each';
+    END IF;
+    -- The one that remains is now the last: refused.
+    PERFORM pg_temp.g_refused(v_boss, v_t, v_b, '{}', 'membership:last_deployment_admin',
+        'this person is the last deployment administrator; add another deployment administrator first',
+        'revoking the one that remains');
+
+    -- One active entry; a second active entry is added; then the first is revoked: allowed.
+    v_t := pg_temp.g_fresh();
+    v_boss := pg_temp.g_boss(v_t);
+    v_a := pg_temp.g_member(v_t, 'First One');
+    v_b := pg_temp.g_member(v_t, 'Second One');
+    PERFORM pg_temp.g_list(v_a);
+    PERFORM pg_temp.g_refused(v_boss, v_t, v_a, '{}', 'membership:last_deployment_admin',
+        'this person is the last deployment administrator; add another deployment administrator first',
+        'the only entry before a second is added');
+    PERFORM pg_temp.g_list(v_b);
+    PERFORM pg_temp.g_allowed(v_boss, v_t, v_a, '{}', 'revoking the first after a second was added');
+    IF (SELECT count(*) FROM rolebyte.deployment_admin) IS DISTINCT FROM 1
+       OR NOT EXISTS (SELECT 1 FROM rolebyte.deployment_admin WHERE user_id = v_b) THEN
+        RAISE EXCEPTION 'after the first is revoked the second alone remains';
+    END IF;
+
+    -- The entry being revoked is invited, another is active: allowed.
+    v_t := pg_temp.g_fresh();
+    v_boss := pg_temp.g_boss(v_t);
+    v_a := pg_temp.g_member(v_t, 'Active One');
+    v_i := pg_temp.g_member(v_t, 'Invited One', false);
+    PERFORM pg_temp.g_list(v_a);
+    PERFORM pg_temp.g_list(v_i);
+    PERFORM pg_temp.g_allowed(v_boss, v_t, v_i, '{}', 'revoking an invited entry beside an active one');
+    IF (SELECT status FROM rolebyte.user_account WHERE id = v_i) IS DISTINCT FROM 'revoked'
+       OR EXISTS (SELECT 1 FROM rolebyte.deployment_admin WHERE user_id = v_i)
+       OR NOT EXISTS (SELECT 1 FROM rolebyte.deployment_admin WHERE user_id = v_a) THEN
+        RAISE EXCEPTION 'the invited entry is revoked and gone, the active one stays';
+    END IF;
+
+    -- The only entry on the list is invited: nobody on it is active, so it is allowed, as before.
+    v_t := pg_temp.g_fresh();
+    v_boss := pg_temp.g_boss(v_t);
+    v_i := pg_temp.g_member(v_t, 'Invited One', false);
+    PERFORM pg_temp.g_list(v_i);
+    PERFORM pg_temp.g_allowed(v_boss, v_t, v_i, '{}', 'revoking the only entry when it is invited');
+    IF (SELECT count(*) FROM rolebyte.deployment_admin) IS DISTINCT FROM 0 THEN
+        RAISE EXCEPTION 'the invited entry should be gone';
+    END IF;
+
+    -- The entry being revoked is active and every other entry is invited: refused.
+    v_t := pg_temp.g_fresh();
+    v_boss := pg_temp.g_boss(v_t);
+    v_a := pg_temp.g_member(v_t, 'Active One');
+    v_i := pg_temp.g_member(v_t, 'Invited One', false);
+    PERFORM pg_temp.g_list(v_a);
+    PERFORM pg_temp.g_list(v_i);
+    PERFORM pg_temp.g_refused(v_boss, v_t, v_a, '{}', 'membership:last_deployment_admin',
+        'this person is the last deployment administrator; add another deployment administrator first',
+        'an active entry beside an invited one');
+
+    -- An active member of the deployment's own company who is not on the list, and a member of
+    -- another company, while the list holds one active entry: allowed as before.
+    v_t := pg_temp.g_fresh();
+    v_boss := pg_temp.g_boss(v_t);
+    v_a := pg_temp.g_member(v_t, 'Last One');
+    PERFORM pg_temp.g_list(v_a);
+    v_n := pg_temp.g_member(v_t, 'Not Listed');
+    PERFORM pg_temp.g_allowed(v_boss, v_t, v_n, '{}', 'revoking a member who is not on the list');
+    IF (SELECT status FROM rolebyte.user_account WHERE id = v_n) IS DISTINCT FROM 'revoked'
+       OR NOT EXISTS (SELECT 1 FROM rolebyte.deployment_admin WHERE user_id = v_a) THEN
+        RAISE EXCEPTION 'the unlisted member is revoked and the list is as it was';
+    END IF;
+    v_o := pg_temp.ok('tenant_create', '{"actor":"guard-test","name":"Other Co"}', 'another company')->>'id';
+    v_other := pg_temp.g_member(v_o, 'Other One');
+    PERFORM pg_temp.g_allowed(v_boss, v_o, v_other, '{}', 'revoking a member of another company');
+    IF (SELECT status FROM rolebyte.user_account WHERE id = v_other) IS DISTINCT FROM 'revoked'
+       OR NOT EXISTS (SELECT 1 FROM rolebyte.deployment_admin WHERE user_id = v_a) THEN
+        RAISE EXCEPTION 'the other company''s member is revoked and the list is as it was';
+    END IF;
+    -- Naming the listed account under the other company's id finds no such account: not found, as before.
+    v_lines := (SELECT count(*) FROM rolebyte.event);
+    IF pg_temp.g_revoke(v_boss, v_o, v_a)->>'code' IS DISTINCT FROM 'membership:not_found'
+       OR (SELECT count(*) FROM rolebyte.event) IS DISTINCT FROM v_lines
+       OR NOT EXISTS (SELECT 1 FROM rolebyte.deployment_admin WHERE user_id = v_a) THEN
+        RAISE EXCEPTION 'the listed account named under another company is not found and nothing is written';
+    END IF;
+
+    RAISE NOTICE 'PASS unit.rolebyte_deployment (what stays allowed)';
+END $$;
+
+-- deployment_admin_is_last, itself.
+DO $$
+DECLARE
+    v_t text;
+    v_a text;
+    v_b text;
+    v_i text;
+    v_n text;
+BEGIN
+    v_t := pg_temp.g_fresh();
+    v_a := pg_temp.g_member(v_t, 'Active One');
+    v_n := pg_temp.g_member(v_t, 'Not Listed');
+    v_i := pg_temp.g_member(v_t, 'Invited One', false);
+    -- Nobody is listed: no account is the last one.
+    IF rolebyte.deployment_admin_is_last(v_a) OR rolebyte.deployment_admin_is_last(v_n)
+       OR rolebyte.deployment_admin_is_last('no-such-account') OR rolebyte.deployment_admin_is_last(NULL) THEN
+        RAISE EXCEPTION 'with an empty list nobody is the last one';
+    END IF;
+    -- The only active entry is the last one; an account that is not listed is not.
+    PERFORM pg_temp.g_list(v_a);
+    IF rolebyte.deployment_admin_is_last(v_a) IS DISTINCT FROM true THEN
+        RAISE EXCEPTION 'the only active entry is the last one';
+    END IF;
+    IF rolebyte.deployment_admin_is_last(v_n) IS DISTINCT FROM false THEN
+        RAISE EXCEPTION 'an account that is not on the list is never the last one';
+    END IF;
+    -- Beside an invited entry it is still the last one, and the invited one never is.
+    PERFORM pg_temp.g_list(v_i);
+    IF rolebyte.deployment_admin_is_last(v_a) IS DISTINCT FROM true
+       OR rolebyte.deployment_admin_is_last(v_i) IS DISTINCT FROM false THEN
+        RAISE EXCEPTION 'beside an invited entry the active one is the last, the invited one is not';
+    END IF;
+    -- One of two active entries is not the last one.
+    v_b := pg_temp.g_member(v_t, 'Second One');
+    PERFORM pg_temp.g_list(v_b);
+    IF rolebyte.deployment_admin_is_last(v_a) IS DISTINCT FROM false
+       OR rolebyte.deployment_admin_is_last(v_b) IS DISTINCT FROM false THEN
+        RAISE EXCEPTION 'one of two active entries is not the last one';
+    END IF;
+    -- A revoked account's entry (written as the owner) neither is the last one nor makes another one not.
+    UPDATE rolebyte.user_account SET status = 'revoked' WHERE id = v_b;
+    IF rolebyte.deployment_admin_is_last(v_b) IS DISTINCT FROM false
+       OR rolebyte.deployment_admin_is_last(v_a) IS DISTINCT FROM true THEN
+        RAISE EXCEPTION 'a revoked entry is never the last one and does not count as another';
+    END IF;
+    -- An entry that is invited alone is never the last one.
+    DELETE FROM rolebyte.deployment_admin WHERE user_id <> v_i;
+    IF rolebyte.deployment_admin_is_last(v_i) IS DISTINCT FROM false THEN
+        RAISE EXCEPTION 'an invited entry alone is never the last one';
+    END IF;
+    -- No role may call it.
+    IF has_function_privilege('rolebyte_public', 'rolebyte.deployment_admin_is_last(text)', 'EXECUTE')
+       OR has_function_privilege('public', 'rolebyte.deployment_admin_is_last(text)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'deployment_admin_is_last is granted to nobody';
+    END IF;
+
+    RAISE NOTICE 'PASS unit.rolebyte_deployment (deployment_admin_is_last)';
+END $$;
+
+-- A tripwire for later changes. The acts that take an entry off the deployment
+-- administrators' list, and the acts that set an account's status to revoked, are the
+-- ones that must ask the last-administrator rule; a new one makes this fail until it
+-- is added here on purpose. It reads the routines' own source text, so it catches the
+-- plain case, a routine whose own text deletes from the list or sets an account revoked;
+-- it does not see a routine that calls one of the pinned ones, dynamic SQL, or another
+-- spelling of the same statement, so a new routine is still read by a person.
+DO $$
+DECLARE
+    v_delete text[];
+    v_revoke text[];
+BEGIN
+    SELECT COALESCE(array_agg(p.proname::text ORDER BY p.proname), '{}') INTO v_delete
+      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'rolebyte'
+       AND p.prosrc ~* 'delete\s+from\s+(rolebyte\.)?deployment_admin(\s|;|$)';
+    SELECT COALESCE(array_agg(p.proname::text ORDER BY p.proname), '{}') INTO v_revoke
+      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'rolebyte'
+       AND p.prosrc ~* 'update\s+(rolebyte\.)?user_account\M(?:(?!\mwhere\M)[^;])*\mstatus\s*=\s*''revoked''';
+    IF v_delete IS DISTINCT FROM ARRAY['deployment_admin_remove', 'user_revoke'] THEN
+        RAISE EXCEPTION 'an act that ends an account or takes an entry off the deployment administrators'' list must ask the last-administrator rule; the acts that delete from the list are %, not deployment_admin_remove and user_revoke', v_delete;
+    END IF;
+    IF v_revoke IS DISTINCT FROM ARRAY['product_accounts_follow', 'setup_rows_end', 'user_revoke'] THEN
+        RAISE EXCEPTION 'an act that ends an account or takes an entry off the deployment administrators'' list must ask the last-administrator rule; the acts that set an account revoked are %, not product_accounts_follow, setup_rows_end and user_revoke', v_revoke;
+    END IF;
+    RAISE NOTICE 'PASS unit.rolebyte_deployment (the tripwire)';
+END $$;
+
 -- Everything above was done inside this transaction, tenants emptied included:
 -- the register is left exactly as it was found.
 ROLLBACK;

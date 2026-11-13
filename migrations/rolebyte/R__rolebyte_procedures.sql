@@ -1526,6 +1526,31 @@ $$;
 REVOKE ALL ON PROCEDURE rolebyte.role_revoke(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.role_revoke(jsonb, jsonb) TO rolebyte_public;
 
+-- deployment_admin_is_last — whether this account is the last of the deployment's
+-- administrators: it is on the list, it is active, and no other entry on the list
+-- belongs to an active account. An invited or revoked account is never the last one,
+-- and neither is an account that is not on the list. The ONE home of this rule: every
+-- act that can end a person's access or take an entry off the list asks it, under the
+-- deployment's lock. The acts that end service accounts do not, because an entry on
+-- the list is always a person's account.
+CREATE OR REPLACE FUNCTION rolebyte.deployment_admin_is_last(p_user_id text)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SET search_path = rolebyte, pg_temp
+AS $$
+    SELECT EXISTS (SELECT 1
+                     FROM rolebyte.deployment_admin da
+                     JOIN rolebyte.user_account u ON u.id = da.user_id
+                    WHERE da.user_id = p_user_id AND u.status = 'active')
+       AND NOT EXISTS (SELECT 1
+                         FROM rolebyte.deployment_admin da
+                         JOIN rolebyte.user_account u ON u.id = da.user_id
+                        WHERE da.user_id <> p_user_id AND u.status = 'active');
+$$;
+
+REVOKE ALL ON FUNCTION rolebyte.deployment_admin_is_last(text) FROM PUBLIC;
+
 -- user_revoke — the offboarding switch: the user stops resolving everywhere
 -- at the next session refresh. Assignment rows are left as they stand — the
 -- user-level status gates resolution, and the event stream keeps the truth.
@@ -1537,6 +1562,13 @@ GRANT EXECUTE ON PROCEDURE rolebyte.role_revoke(jsonb, jsonb) TO rolebyte_public
 -- the deployment's list of administrators leaves it in the same act, with its own
 -- line (`deploymentAdminRemoved`, marked `revoked`). Revoking the
 -- tenant's last administrator is refused (administrator_removal_refusal).
+--
+-- The last deployment administrator is refused too: an account that is on the
+-- deployment's list, is active, and is the only active one on it is not revoked
+-- (`membership:last_deployment_admin`), and nothing is written. The input takes an
+-- optional `mode`, `saas` or `local`; absent or null is `saas`, anything else is
+-- refused `membership:invalid`. In `local` the deployment's list is not guarded and the
+-- revoke goes ahead as it always did. The company's own refusal is answered first.
 CREATE OR REPLACE PROCEDURE rolebyte.user_revoke(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1546,6 +1578,7 @@ DECLARE
     v_actor   text;
     v_tenant  text;
     v_user_id text;
+    v_mode    text;
     v_refusal jsonb;
     v_left    text;
     v_note    text;
@@ -1556,6 +1589,17 @@ BEGIN
     IF v_actor IS NULL OR v_tenant IS NULL OR v_user_id IS NULL THEN
         po_data := util.result_error('membership:invalid', 'actor, tenantId and userId are required');
         RETURN;
+    END IF;
+
+    -- The mode: absent or null is `saas`; otherwise exactly `saas` or `local`.
+    IF pi_data ? 'mode' AND jsonb_typeof(pi_data->'mode') <> 'null' THEN
+        IF jsonb_typeof(pi_data->'mode') <> 'string' OR (pi_data->>'mode') NOT IN ('saas', 'local') THEN
+            po_data := util.result_error('membership:invalid', 'mode is saas or local');
+            RETURN;
+        END IF;
+        v_mode := pi_data->>'mode';
+    ELSE
+        v_mode := 'saas';
     END IF;
 
     -- The deployment's lock first, before any account row is locked. The acts that
@@ -1571,6 +1615,18 @@ BEGIN
     v_refusal := rolebyte.administrator_removal_refusal(v_tenant, v_user_id);
     IF v_refusal IS NOT NULL THEN
         po_data := v_refusal;
+        RETURN;
+    END IF;
+
+    -- The last deployment administrator keeps their access: ending it would leave
+    -- the deployment with nobody who can administer it. Checked before the first
+    -- write, so a refusal changes nothing.
+    IF v_mode <> 'local'
+       AND EXISTS (SELECT 1 FROM rolebyte.user_account
+                    WHERE id = v_user_id AND tenant_id = v_tenant)
+       AND rolebyte.deployment_admin_is_last(v_user_id) THEN
+        po_data := util.result_error('membership:last_deployment_admin',
+            'this person is the last deployment administrator; add another deployment administrator first');
         RETURN;
     END IF;
 
@@ -1633,7 +1689,8 @@ GRANT EXECUTE ON PROCEDURE rolebyte.user_revoke(jsonb, jsonb) TO rolebyte_public
 -- subject key answers the memberships it may act under, each with one flat scope
 -- set from what is currently granted there: a service's role as `group:level`,
 -- and each permission a tenant's own role ticks as `service/feature:act`. A
--- stranger resolves to an empty list.
+-- stranger resolves to an empty list. Each membership carries the company's name,
+-- `tenantName`, exactly as stored (an empty name is an empty string).
 --
 -- Its one write, only when the caller says it is issuing the person's access
 -- (`issuing: true`, the identity provider's door): the day each answered
@@ -1723,6 +1780,7 @@ BEGIN
             'tenantId',    u.tenant_id,
             'userId',      u.id,
             'displayName', u.display_name,
+            'tenantName',  t.name,
             -- A setup account's row (a window's, see `setup_scopes`) is answered with
             -- the company's configuration permissions and with nothing else: none of
             -- the branches below is read for it.
@@ -4423,6 +4481,16 @@ GRANT EXECUTE ON PROCEDURE rolebyte.service_declare(jsonb, jsonb) TO rolebyte_pu
 -- one lock, so two calls made at once cannot both mark a company, and `user_revoke`
 -- takes the same lock before it touches an account, so the list and the accounts
 -- are always locked in the same order.
+--
+-- The deployment always keeps an administrator it can sign in as: the last active
+-- account on the list is neither revoked (`user_revoke`, `membership:last_deployment_admin`,
+-- unless the caller says its mode is `local`) nor taken off the list
+-- (`deployment_admin_revoke`, `membership:conflict`). Both ask
+-- `deployment_admin_is_last`, which says what the last one is. This rests on the
+-- acts taking the deployment's lock before they count, and on each statement after the
+-- lock seeing what was committed before it (the default isolation level, READ
+-- COMMITTED); a caller that runs these procedures at a stricter isolation level loses
+-- that.
 -- ===========================================================================
 
 -- The deployment's own company is marked in two ways. The register marks one by

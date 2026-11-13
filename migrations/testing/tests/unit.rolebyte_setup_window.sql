@@ -799,6 +799,7 @@ BEGIN
     PERFORM pg_temp.svc_member(v_c, 'svc:standing', 'active');
     PERFORM pg_temp.must(pg_temp.membership('svc:standing', v_c) = jsonb_build_object(
             'tenantId', v_c, 'userId', (pg_temp.row_of(v_c, 'svc:standing')).id, 'displayName', 'svc:standing',
+            'tenantName', (SELECT t.name FROM rolebyte.tenant t WHERE t.id = v_c),
             'scopes', '[]'::jsonb),
         'a standing service account is answered as before');
     RAISE NOTICE 't: nothing beyond the permissions, the reads';

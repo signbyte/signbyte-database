@@ -1538,8 +1538,9 @@ GRANT EXECUTE ON PROCEDURE rolebyte.deployment_admin_grant(jsonb, jsonb) TO role
 -- deployment_admin_revoke — take an account off the list of the deployment's
 -- administrators. Input {actor, mode, userId}. An account that is not on the list is
 -- `membership:not_found`. The last entry whose account is active cannot be removed
--- (`membership:conflict`, 'the last deployment administrator cannot be removed'): an
--- invited or revoked account does not count as one. Otherwise exactly what
+-- (`membership:conflict`, 'the last deployment administrator cannot be removed'; what
+-- the last one is, `deployment_admin_is_last` says): an invited or revoked account does
+-- not count as one. Otherwise exactly what
 -- `deployment_admin_remove` does. Answers {userId, subjectKey, changed}.
 CREATE OR REPLACE PROCEDURE rolebyte.deployment_admin_revoke(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
@@ -1550,7 +1551,6 @@ DECLARE
     v_actor   text := NULLIF(trim(pi_data->>'actor'), '');
     v_user    text := NULLIF(trim(pi_data->>'userId'), '');
     v_refusal jsonb;
-    v_status  text;
     v_in      jsonb;
     v_out     jsonb;
 BEGIN
@@ -1564,19 +1564,11 @@ BEGIN
         RETURN;
     END IF;
 
-    SELECT u.status INTO v_status
-      FROM rolebyte.deployment_admin da
-      JOIN rolebyte.user_account u ON u.id = da.user_id
-     WHERE da.user_id = v_user;
-    IF NOT FOUND THEN
+    IF NOT EXISTS (SELECT 1 FROM rolebyte.deployment_admin da WHERE da.user_id = v_user) THEN
         po_data := util.result_error('membership:not_found', 'the account is not a deployment administrator');
         RETURN;
     END IF;
-    IF v_status = 'active'
-       AND NOT EXISTS (SELECT 1
-                         FROM rolebyte.deployment_admin da
-                         JOIN rolebyte.user_account u ON u.id = da.user_id
-                        WHERE da.user_id <> v_user AND u.status = 'active') THEN
+    IF rolebyte.deployment_admin_is_last(v_user) THEN
         po_data := util.result_error('membership:conflict', 'the last deployment administrator cannot be removed');
         RETURN;
     END IF;
