@@ -645,7 +645,7 @@ BEGIN
        IS DISTINCT FROM '{"name": "Dalībnieks", "labels": {"en": "Member"}}'::jsonb THEN
         RAISE EXCEPTION 'the Latvian default user type is Dalībnieks, Member beside it';
     END IF;
-    -- The register's own bootstrap path ships them the same way.
+    -- Creating a tenant directly ships them the same way.
     v_tc := pg_temp.ok('tenant_create', '{"actor": "op:test", "name": "Names shipped by create", "language": "lv"}',
         'create in Latvian')->>'id';
     IF (SELECT labels FROM rolebyte.tenant_role WHERE tenant_id = v_tc AND seed = 'worker')

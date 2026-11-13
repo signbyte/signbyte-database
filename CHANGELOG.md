@@ -6,6 +6,18 @@ integrates against the procedures.
 
 ## v0.8.0
 
+### Removed — rolebyte: the procedures `bootstrap_state` and `own_rung_register` are dropped
+
+Migration `rolebyte/V29` drops `rolebyte.bootstrap_state` and `rolebyte.own_rung_register`. The register's one-time
+first-tenant door is gone from the service, and these two were called only by it; no release of the service calls
+either one outside that door. **Apply order:** applied before the service's release without the door, an older service
+whose door is still armed (`BOOTSTRAP_CREDENTIAL_FILE` set) answers a server error on that door from then on, and
+nothing else of it is affected; with the setting unset, or once the release without the door runs, nothing is
+affected at all. No data is touched: what `own_rung_register` wrote earlier stays as it is. The service's role also no
+longer may execute `rolebyte.tenant_create` (the procedure stays, for the location's owner); no release of the service
+calls it outside the removed door. An operator's own scripts that called it as the service's role must run it as the
+location's owner.
+
 ### Changed — rolebyte: a company's row says whether somebody of it has signed in; two refusals changed their reason
 
 No migration. The door's answer for a company (the list, one company, and the `company` in the answer of opening

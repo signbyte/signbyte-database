@@ -161,23 +161,41 @@ END $$;
 
 SELECT 'ROLELEAK: PASS — the register role is table-isolated, its history is append-only at the grant boundary, and no other service role reads the register' AS result;
 
--- The one-time bootstrap door runs as the register's own role and puts the
--- register's own rung on the list — and nothing a caller names with it.
+-- Making a company asks nothing about who calls: the register's role is refused
+-- `tenant_create`, and the refused call made no company and wrote no history line.
 DO $$
 DECLARE
-    v jsonb;
+    before bigint;
 BEGIN
-    SET ROLE rolebyte_public;
-    CALL rolebyte.own_rung_register('{"actor":"door","service":"intruder","group":"intruder","level":"admin"}'::jsonb, v);
-    RESET ROLE;
-    IF v->>'result' IS DISTINCT FROM 'success'
-       OR NOT EXISTS (SELECT 1 FROM rolebyte.role_definition
-                       WHERE service_key = 'rolebyte' AND role_group = 'membership' AND role_level = 'admin')
-       OR EXISTS (SELECT 1 FROM rolebyte.service WHERE key = 'intruder')
-       OR EXISTS (SELECT 1 FROM rolebyte.role_definition WHERE role_group = 'intruder') THEN
-        RAISE EXCEPTION 'ROLE LEAK: own_rung_register wrote more than the register''s own rung: %', v;
+    SELECT (SELECT count(*) FROM rolebyte.tenant) + (SELECT count(*) FROM rolebyte.event) INTO before;
+    IF has_function_privilege('rolebyte_public', 'rolebyte.tenant_create(jsonb, jsonb)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'ROLE LEAK: rolebyte_public may run rolebyte.tenant_create';
     END IF;
-    RAISE NOTICE 'roleleak.rolebyte: the door''s own rung, and nothing else';
+    PERFORM pg_temp.deny('rolebyte_public',
+        'CALL rolebyte.tenant_create(''{"actor":"intruder","name":"Intruder company"}''::jsonb, NULL::jsonb)');
+    IF EXISTS (SELECT 1 FROM rolebyte.tenant WHERE name = 'Intruder company')
+       OR (SELECT (SELECT count(*) FROM rolebyte.tenant) + (SELECT count(*) FROM rolebyte.event)) IS DISTINCT FROM before THEN
+        RAISE EXCEPTION 'ROLE LEAK: a refused tenant_create left a company or a history line';
+    END IF;
+    RAISE NOTICE 'roleleak.rolebyte: the register''s role may not make a company directly';
+END $$;
+
+-- The register's role cannot write the deployment's list of services and their levels
+-- directly: only the declaration procedures below reach those tables for it.
+DO $$
+BEGIN
+    PERFORM pg_temp.deny('rolebyte_public',
+        'INSERT INTO rolebyte.service(key, display_name) VALUES (''intruder'', ''x'')');
+    PERFORM pg_temp.deny('rolebyte_public',
+        'INSERT INTO rolebyte.role_definition(id, service_key, role_group, role_level, description) '
+        || 'VALUES (''x'', ''rolebyte'', ''intruder'', ''admin'', ''x'')');
+    PERFORM pg_temp.deny('rolebyte_public', 'UPDATE rolebyte.service SET display_name = ''x''');
+    PERFORM pg_temp.deny('rolebyte_public', 'DELETE FROM rolebyte.role_definition');
+    IF EXISTS (SELECT 1 FROM rolebyte.service WHERE key = 'intruder')
+       OR EXISTS (SELECT 1 FROM rolebyte.role_definition WHERE role_group = 'intruder') THEN
+        RAISE EXCEPTION 'ROLE LEAK: a refused direct write to the list of services left a row';
+    END IF;
+    RAISE NOTICE 'roleleak.rolebyte: no direct write to the list of services and their levels';
 END $$;
 
 -- A service's declaration runs as the register's own role and writes only the keys

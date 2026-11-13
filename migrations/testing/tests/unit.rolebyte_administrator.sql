@@ -372,3 +372,21 @@ BEGIN
 
     RAISE NOTICE 'unit.rolebyte_administrator: all assertions passed';
 END $$;
+
+-- The two procedures of the register's one-time door are gone: no routine of either
+-- name is left behind, whether the database was migrated empty or upgraded.
+DO $$
+BEGIN
+    IF to_regprocedure('rolebyte.bootstrap_state(jsonb,jsonb)') IS NOT NULL THEN
+        RAISE EXCEPTION 'rolebyte.bootstrap_state(jsonb, jsonb) must not exist';
+    END IF;
+    IF to_regprocedure('rolebyte.own_rung_register(jsonb,jsonb)') IS NOT NULL THEN
+        RAISE EXCEPTION 'rolebyte.own_rung_register(jsonb, jsonb) must not exist';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                WHERE n.nspname = 'rolebyte'
+                  AND p.proname IN ('bootstrap_state', 'own_rung_register')) THEN
+        RAISE EXCEPTION 'no routine named bootstrap_state or own_rung_register may exist in rolebyte';
+    END IF;
+    RAISE NOTICE 'unit.rolebyte_administrator: the one-time door''s procedures are gone';
+END $$;

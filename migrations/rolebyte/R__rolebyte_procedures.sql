@@ -46,7 +46,9 @@ GRANT EXECUTE ON PROCEDURE rolebyte.ping(jsonb, jsonb) TO rolebyte_public;
 
 -- tenant_create — register the paying organisation, with the roles every new
 -- tenant starts with (see seed_roles). Emits `tenantCreated` and a
--- `tenantRoleSeeded` per role.
+-- `tenantRoleSeeded` per role. It checks nothing about who asks, so only the
+-- location's owner may call it; the register's service role may not, and the
+-- procedures that make a company for a request write the company themselves.
 CREATE OR REPLACE PROCEDURE rolebyte.tenant_create(IN pi_data jsonb, INOUT po_data jsonb)
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -95,7 +97,8 @@ END;
 $$;
 
 REVOKE ALL ON PROCEDURE rolebyte.tenant_create(jsonb, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON PROCEDURE rolebyte.tenant_create(jsonb, jsonb) TO rolebyte_public;
+-- An explicit revoke, so a database that granted it earlier loses the grant when this file is applied again.
+REVOKE EXECUTE ON PROCEDURE rolebyte.tenant_create(jsonb, jsonb) FROM rolebyte_public;
 
 -- service_register — a consumer service is registered (idempotent upsert), by
 -- whoever runs the deployment. Emits `serviceRegistered` only when the row is new.
@@ -1170,7 +1173,8 @@ REVOKE ALL ON FUNCTION rolebyte.is_administrator(text) FROM PUBLIC;
 
 -- administrator_lock — serialise every change to who administers a tenant.
 -- Transaction-scoped, so it is released when the calling procedure's
--- transaction ends. A key pair of its own, apart from the bootstrap lock.
+-- transaction ends. A key pair of its own, apart from the first-company lock
+-- (`hashtext('rolebyte.bootstrap')`) that `deployment_admin_apply` takes.
 CREATE OR REPLACE FUNCTION rolebyte.administrator_lock(p_tenant text)
 RETURNS void
 LANGUAGE sql
@@ -1224,7 +1228,7 @@ REVOKE ALL ON FUNCTION rolebyte.administrator_removal_refusal(text, text) FROM P
 
 -- administrator_rung — the rung's role definition, created with this
 -- service's registration when the deployment never had them (a tenant opened
--- by the operator before anyone used the bootstrap door). Each creation is the
+-- by the operator before any first administrator was set). Each creation is the
 -- same event the defining procedures write. Returns the definition's id.
 CREATE OR REPLACE FUNCTION rolebyte.administrator_rung(p_actor text)
 RETURNS text
@@ -1262,38 +1266,6 @@ END;
 $$;
 
 REVOKE ALL ON FUNCTION rolebyte.administrator_rung(text) FROM PUBLIC;
-
--- own_rung_register — the register's own service and its administrator rung put
--- on the deployment's list, for the one-time bootstrap door, which runs as the
--- register's own role. It names nothing a caller chooses: the service and the
--- rung are fixed, so the register's role can add nothing else to the list
--- through it. Idempotent.
-CREATE OR REPLACE PROCEDURE rolebyte.own_rung_register(IN pi_data jsonb, INOUT po_data jsonb)
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = rolebyte, util, pg_temp
-AS $$
-DECLARE
-    v_actor text := NULLIF(trim(pi_data->>'actor'), '');
-BEGIN
-    IF v_actor IS NULL THEN
-        po_data := util.result_error('membership:invalid', 'actor is required');
-        RETURN;
-    END IF;
-
-    PERFORM rolebyte.administrator_rung(v_actor);
-    po_data := util.result_success(jsonb_build_object(
-        'service', 'rolebyte', 'group', 'membership', 'level', 'admin'));
-EXCEPTION
-    WHEN sqlstate 'P0001' THEN
-        RAISE;
-    WHEN OTHERS THEN
-        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
-END;
-$$;
-
-REVOKE ALL ON PROCEDURE rolebyte.own_rung_register(jsonb, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON PROCEDURE rolebyte.own_rung_register(jsonb, jsonb) TO rolebyte_public;
 
 -- invited_member_add — add someone who is not yet a member of the tenant, invited,
 -- under the tenant's default user type, holding no role. Writes the account and
@@ -2261,42 +2233,6 @@ $$;
 
 REVOKE ALL ON PROCEDURE rolebyte.history(jsonb, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON PROCEDURE rolebyte.history(jsonb, jsonb) TO rolebyte_public;
-
--- bootstrap_state — whether the one-time bootstrap door is spent: true once
--- any non-revoked user holds a granted `membership:admin` assignment. Takes a
--- transaction-scoped advisory lock so concurrent bootstrap attempts serialize
--- on it: the caller runs this FIRST inside its bootstrap transaction, and the
--- second attempt blocks until the first commits, then sees bootstrapped=true.
-CREATE OR REPLACE PROCEDURE rolebyte.bootstrap_state(IN pi_data jsonb, INOUT po_data jsonb)
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = rolebyte, util, pg_temp
-AS $$
-BEGIN
-    PERFORM pg_advisory_xact_lock(hashtext('rolebyte.bootstrap'));
-
-    po_data := util.result_success(jsonb_build_object(
-        'bootstrapped', EXISTS (
-            SELECT 1
-            FROM rolebyte.assignment a
-            JOIN rolebyte.role_definition rd ON rd.id = a.role_definition_id
-            JOIN rolebyte.user_account u ON u.id = a.user_id
-            WHERE rd.role_group = 'membership'
-              AND rd.role_level = 'admin'
-              AND a.state = 'granted'
-              AND u.status <> 'revoked'
-        )
-    ));
-EXCEPTION
-    WHEN sqlstate 'P0001' THEN
-        RAISE;
-    WHEN OTHERS THEN
-        RAISE EXCEPTION '%', util.result_error('membership:error', sqlerrm) USING errcode = 'P0001';
-END;
-$$;
-
-REVOKE ALL ON PROCEDURE rolebyte.bootstrap_state(jsonb, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON PROCEDURE rolebyte.bootstrap_state(jsonb, jsonb) TO rolebyte_public;
 
 -- ---------------------------------------------------------------------------
 -- Tenant roles. A tenant's own roles, each made of ticks over the permissions
@@ -4870,12 +4806,12 @@ REVOKE EXECUTE ON PROCEDURE rolebyte.deployment_admin_list(jsonb, jsonb) FROM ro
 --                  is written (a company that had to be marked first stays marked);
 --   noCompany      none is marked and several exist: nothing is written.
 --
--- The deployment's lock is taken first, then, when no company is marked, the lock
--- `bootstrap_state` takes (so that the one-time bootstrap door and this procedure
--- cannot both make a first company), then the company's administrators' lock, then
--- the account's row, the order `user_revoke` documents. `bootstrap_state` takes its
--- lock and nothing after it, so no procedure takes the two in the other order. The
--- deployment's own
+-- The deployment's lock is taken first, then, when no company is marked, the
+-- first-company lock (`hashtext('rolebyte.bootstrap')`, so that two concurrent calls
+-- of this procedure cannot both make a first company), then the company's
+-- administrators' lock, then the account's row, the order `user_revoke` documents.
+-- This is the only procedure that takes the first-company lock, so no procedure takes
+-- the locks in the other order. The deployment's own
 -- company is the marked one; with none marked and exactly one company, that one is
 -- marked as `deployment_company_mark` marks it. With no company at all (a fresh
 -- deployment) and a name, one transaction makes a company with an empty name (its
@@ -4935,8 +4871,7 @@ BEGIN
       FROM rolebyte.deployment;
 
     IF v_company IS NULL THEN
-        -- The one-time bootstrap door's lock, so the door and this procedure cannot
-        -- both make a first company.
+        -- The first-company lock, so two concurrent calls cannot both make a first company.
         PERFORM pg_advisory_xact_lock(hashtext('rolebyte.bootstrap'));
 
         SELECT count(*), min(id) INTO v_count, v_company FROM rolebyte.tenant;
