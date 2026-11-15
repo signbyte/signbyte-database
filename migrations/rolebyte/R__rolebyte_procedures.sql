@@ -1693,15 +1693,18 @@ GRANT EXECUTE ON PROCEDURE rolebyte.user_revoke(jsonb, jsonb) TO rolebyte_public
 -- `tenantName`, exactly as stored (an empty name is an empty string).
 --
 -- Its one write, only when the caller says it is issuing the person's access
--- (`issuing: true`, the identity provider's door): the day each answered
--- membership was given access, at most once a day. The register's own checks of
--- who may administer what read the same answer without it, so using the register
--- is never taken for signing in. A later answer the same day finds the date
--- already there and writes nothing, and a row another session holds locked is
--- skipped rather than waited for, so the hot path never queues behind a write.
--- The day is UTC's. A person in two tenants is dated in both, because the
--- register answers every tenant at once and which one the sign-in picks is
--- decided after it.
+-- (`issuing: true`, the identity provider's door): the day the membership the
+-- access is issued for was given access, at most once a day. The register's own
+-- checks of who may administer what read the same answer without it, so using
+-- the register is never taken for signing in. A later answer the same day finds
+-- the date already there and writes nothing, and a row another session holds
+-- locked is skipped rather than waited for, so the hot path never queues behind
+-- a write. The day is UTC's. The answer lists every membership; the date is
+-- written for one: the company the caller names in `issuingTenant` (text; any
+-- other kind of value is taken as absent), or, when it names none, the person's
+-- only active membership. A person in several companies who has not chosen is
+-- dated nowhere until they do, and one who names a company they are not an
+-- active member of is dated nowhere.
 --
 -- Both kinds feed ONE distinct aggregate, so a person who holds no tenant role
 -- resolves exactly as before tenant roles existed, and a box ticked by two roles
@@ -1744,6 +1747,8 @@ DECLARE
     v_subject     text;
     v_memberships jsonb;
     v_today       date := (now() AT TIME ZONE 'UTC')::date;
+    v_for_tenant  text;
+    v_active      bigint;
 BEGIN
     v_subject := NULLIF(trim(pi_data->>'subjectKey'), '');
     IF v_subject IS NULL THEN
@@ -1751,21 +1756,36 @@ BEGIN
         RETURN;
     END IF;
 
-    -- The day each membership answered below was last given access, when this
-    -- answer issues it. Only a date older than today is written, so the second
-    -- answer of a day changes nothing.
+    -- The day the membership this answer issues access for was last given
+    -- access. Only a date older than today is written, so the second answer of a
+    -- day changes nothing. The company is the one named; with none named, the
+    -- person's only active membership.
     IF pi_data->'issuing' = 'true'::jsonb THEN
-        UPDATE rolebyte.user_account u
-           SET last_signed_in_on = v_today
-         WHERE u.id IN (
-               SELECT a.id
-                 FROM rolebyte.user_account a
-                 JOIN rolebyte.tenant t ON t.id = a.tenant_id
-                WHERE a.subject_key = v_subject
-                  AND a.status = 'active'
-                  AND t.status = 'active'
-                  AND (a.last_signed_in_on IS NULL OR a.last_signed_in_on < v_today)
-                  FOR UPDATE OF a SKIP LOCKED);
+        IF jsonb_typeof(pi_data->'issuingTenant') = 'string' THEN
+            v_for_tenant := NULLIF(trim(pi_data->>'issuingTenant'), '');
+        END IF;
+        IF v_for_tenant IS NULL THEN
+            SELECT count(*) INTO v_active
+              FROM rolebyte.user_account a
+              JOIN rolebyte.tenant t ON t.id = a.tenant_id
+             WHERE a.subject_key = v_subject
+               AND a.status = 'active'
+               AND t.status = 'active';
+        END IF;
+        IF v_for_tenant IS NOT NULL OR v_active = 1 THEN
+            UPDATE rolebyte.user_account u
+               SET last_signed_in_on = v_today
+             WHERE u.id IN (
+                   SELECT a.id
+                     FROM rolebyte.user_account a
+                     JOIN rolebyte.tenant t ON t.id = a.tenant_id
+                    WHERE a.subject_key = v_subject
+                      AND a.status = 'active'
+                      AND t.status = 'active'
+                      AND (v_for_tenant IS NULL OR a.tenant_id = v_for_tenant)
+                      AND (a.last_signed_in_on IS NULL OR a.last_signed_in_on < v_today)
+                      FOR UPDATE OF a SKIP LOCKED);
+        END IF;
     END IF;
 
     -- Matching is plain equality on the stored key: a person's key is their
